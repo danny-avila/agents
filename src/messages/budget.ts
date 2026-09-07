@@ -1,32 +1,271 @@
+import type {
+  AIMessage,
+  BaseMessage,
+  ChatMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
+import { apportionTokenCounts } from '@/utils/tokens';
+import { emitAgentLog } from '@/utils/events';
 
-/**
- * Reconciles a context-usage breakdown's instruction/available/message fields
- * from the pruner's budget metrics. `messageTokens` and `availableForMessages`
- * are DERIVED from `contextBudget` / `effectiveInstructionTokens` /
- * `remainingContextTokens` rather than summed from the index map — that map is
- * keyed by pre-prune indices, so summing it over the kept context would missum.
- * Shared by the live snapshot path (`Graph.createCallModel`) and the pre-send
- * projection (`AgentContext.projectContextUsage`) so both yield identical numbers.
- */
-export function syncBudgetDerivedFields(usage: t.ContextUsageEvent): void {
+type NamedToolCall = {
+  id?: string;
+  name?: string;
+  function?: { name?: string };
+};
+
+/** Inline tool-call content: an Anthropic `tool_use` block, the v1 standard
+ *  `tool_call` block (`{ id, name }` at top level, which `@langchain/aws`
+ *  serializes to a Converse toolUse), and this repo's `ToolCallContent`
+ *  (`{ tool_call: { id, name } }`). */
+type InlineToolCallBlock = {
+  id?: string;
+  name?: string;
+  tool_call?: { id?: string; name?: string };
+};
+
+/** Rejects counts a subset claim cannot be derived from. Callers must degrade
+ *  rather than propagate: this runs on the live pre-invoke path. */
+function safeCount(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError('Invalid tool context token count');
+  }
+  return value;
+}
+
+let warnedUnavailableToolShare = false;
+
+/** Warns once per process: an unusable counter is a permanent host-integration
+ *  fault, while the share is dropped on every affected call regardless. The
+ *  latch is spent only when a config can carry the event, so a config-less
+ *  caller (the pre-send projection) cannot swallow the live path's one warning. */
+function warnUnavailableToolShare(
+  config: RunnableConfig | undefined,
+  error: unknown
+): void {
+  if (warnedUnavailableToolShare || config == null) {
+    return;
+  }
+  warnedUnavailableToolShare = true;
+  emitAgentLog(
+    config,
+    'warn',
+    'budget',
+    'Tool-message context share unavailable: the token counter must return safe, non-negative integers',
+    { error: error instanceof Error ? error.message : String(error) }
+  );
+}
+
+/** A `ChatMessage` carrying `role: 'assistant'` reports its type as `generic`,
+ *  a shape the OpenAI role converter and the default token counter both accept. */
+function isAssistantMessage(message: BaseMessage, type: string): boolean {
+  if (type === 'ai') {
+    return true;
+  }
+  return type === 'generic' && (message as ChatMessage).role === 'assistant';
+}
+
+/** Counts retained tool exchanges without serializing arguments or result content.
+ * Mixed text/reasoning/media assistant messages remain in the conversation share. */
+function computeToolMessageUsage(
+  context: readonly BaseMessage[],
+  tokenCounter: t.TokenCounter,
+  calibrationRatio = 1
+): Pick<
+  t.TokenBudgetBreakdown,
+  'toolMessageTokens' | 'toolMessageTokenCounts'
+> {
+  const names = new Map<string, string>();
+  const counts: Record<string, number> = Object.create(null);
+  let legacyName: string | undefined;
+  let total = 0;
+  let resultTotal = 0;
+  const rememberCall = (call: NamedToolCall): void => {
+    const name =
+      call.name != null && call.name.length > 0
+        ? call.name
+        : call.function?.name;
+    if (
+      typeof call.id === 'string' &&
+      typeof name === 'string' &&
+      name.length > 0
+    ) {
+      names.set(call.id, name);
+    }
+  };
+  const rememberInlineCall = (block: InlineToolCallBlock): void => {
+    const nested = block.tool_call;
+    const id = nested?.id ?? block.id;
+    if (typeof id !== 'string' || names.has(id)) {
+      return;
+    }
+    rememberCall({ id, name: nested?.name ?? block.name });
+  };
+
+  for (const message of context) {
+    const type = message.getType();
+    const isResult = type === 'tool' || type === 'function';
+    if (isAssistantMessage(message, type)) {
+      const ai = message as AIMessage;
+      const calls = ai.tool_calls;
+      const rawCalls = ai.additional_kwargs.tool_calls;
+      if (rawCalls != null) {
+        for (const call of rawCalls) {
+          rememberCall(call);
+        }
+      }
+      if (calls != null) {
+        for (const call of calls) {
+          rememberCall(call);
+        }
+      }
+      legacyName = ai.additional_kwargs.function_call?.name;
+      let hasCalls =
+        (calls?.length ?? 0) > 0 ||
+        (rawCalls?.length ?? 0) > 0 ||
+        (legacyName != null && legacyName.length > 0);
+      let toolOnly = true;
+      if (typeof ai.content === 'string') {
+        toolOnly = !/\S/u.test(ai.content);
+      } else {
+        const content: ReadonlyArray<
+          string | Exclude<AIMessage['content'], string>[number]
+        > = ai.content;
+        for (const part of content) {
+          if (typeof part === 'string') {
+            toolOnly &&= !/\S/u.test(part);
+          } else if (part.type === 'tool_use' || part.type === 'tool_call') {
+            hasCalls = true;
+            rememberInlineCall(part as InlineToolCallBlock);
+          } else {
+            toolOnly &&=
+              part.type === 'text' &&
+              typeof part.text === 'string' &&
+              !/\S/u.test(part.text);
+          }
+        }
+      }
+      if (!hasCalls || !toolOnly) {
+        continue;
+      }
+    } else if (!isResult) {
+      legacyName = undefined;
+      continue;
+    }
+
+    const tokens = safeCount(tokenCounter(message));
+    total = safeCount(total + tokens);
+    if (!isResult) {
+      continue;
+    }
+    const id =
+      type === 'tool' ? (message as ToolMessage).tool_call_id : undefined;
+    const pendingName =
+      type === 'function' && legacyName != null && legacyName.length > 0
+        ? legacyName
+        : undefined;
+    const name =
+      (id != null ? names.get(id) : undefined) ??
+      (message.name != null && message.name.length > 0
+        ? message.name
+        : pendingName) ??
+      'unknown_tool';
+    if (type === 'function') {
+      legacyName = undefined;
+    }
+    if (tokens > 0) {
+      counts[name] = safeCount((counts[name] ?? 0) + tokens);
+      resultTotal = safeCount(resultTotal + tokens);
+    }
+  }
+
+  const ratio =
+    Number.isFinite(calibrationRatio) && calibrationRatio > 0
+      ? calibrationRatio
+      : 1;
+  const toolMessageTokens = safeCount(Math.round(total * ratio));
+  const resultTokens = Math.min(
+    toolMessageTokens,
+    safeCount(Math.round(resultTotal * ratio))
+  );
+  return {
+    toolMessageTokens,
+    toolMessageTokenCounts:
+      resultTotal > 0 && resultTokens > 0
+        ? apportionTokenCounts(counts, ratio, resultTokens)
+        : undefined,
+  };
+}
+
+/** Applies the retained tool share and clamps it to the conversation total it
+ * is a subset of. Throws when a count cannot support that claim. */
+function syncToolMessageShare(
+  usage: t.ContextUsageEvent,
+  context?: readonly BaseMessage[],
+  tokenCounter?: t.TokenCounter
+): void {
+  const { breakdown } = usage;
+  if (context != null && tokenCounter != null) {
+    Object.assign(
+      breakdown,
+      computeToolMessageUsage(context, tokenCounter, usage.calibrationRatio)
+    );
+  }
+  if (breakdown.toolMessageTokens == null) {
+    return;
+  }
+  const total = safeCount(breakdown.toolMessageTokens);
+  const clamped = Math.min(total, safeCount(breakdown.messageTokens));
+  if (clamped !== total && breakdown.toolMessageTokenCounts != null) {
+    let resultTotal = 0;
+    for (const count of Object.values(breakdown.toolMessageTokenCounts)) {
+      resultTotal = safeCount(resultTotal + safeCount(count));
+    }
+    const factor = total > 0 ? clamped / total : 0;
+    const target = Math.min(clamped, Math.round(resultTotal * factor));
+    breakdown.toolMessageTokenCounts =
+      target > 0
+        ? apportionTokenCounts(breakdown.toolMessageTokenCounts, factor, target)
+        : undefined;
+  }
+  breakdown.toolMessageTokens = clamped;
+}
+
+/** Reconciles derived budget fields and, when supplied, the retained tool share.
+ * The index map is keyed before pruning, so it cannot index the retained context.
+ * Callers may pass the existing exact token cache's counter, never a stale index lookup.
+ * Runs on the live pre-invoke path, so an unusable count drops the tool share
+ * (warned once) instead of failing the model call it only measures. */
+export function syncBudgetDerivedFields(
+  usage: t.ContextUsageEvent,
+  context?: readonly BaseMessage[],
+  tokenCounter?: t.TokenCounter,
+  config?: RunnableConfig
+): void {
   const { breakdown, contextBudget, effectiveInstructionTokens } = usage;
-  if (effectiveInstructionTokens == null) {
-    return;
+  if (effectiveInstructionTokens != null) {
+    breakdown.instructionTokens = effectiveInstructionTokens;
+    if (contextBudget != null) {
+      breakdown.availableForMessages = Math.max(
+        0,
+        contextBudget - effectiveInstructionTokens
+      );
+      if (usage.remainingContextTokens != null) {
+        breakdown.messageTokens = Math.max(
+          0,
+          contextBudget -
+            effectiveInstructionTokens -
+            usage.remainingContextTokens
+        );
+      }
+    }
   }
-  breakdown.instructionTokens = effectiveInstructionTokens;
-  if (contextBudget == null) {
-    return;
+  try {
+    syncToolMessageShare(usage, context, tokenCounter);
+  } catch (error) {
+    warnUnavailableToolShare(config, error);
+    delete breakdown.toolMessageTokens;
+    delete breakdown.toolMessageTokenCounts;
   }
-  breakdown.availableForMessages = Math.max(
-    0,
-    contextBudget - effectiveInstructionTokens
-  );
-  if (usage.remainingContextTokens == null) {
-    return;
-  }
-  breakdown.messageTokens = Math.max(
-    0,
-    contextBudget - effectiveInstructionTokens - usage.remainingContextTokens
-  );
 }
