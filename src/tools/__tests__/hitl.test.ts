@@ -38,9 +38,6 @@ import type {
   UserPromptSubmitHookOutput,
 } from '@/hooks';
 import type * as t from '@/types';
-import { Constants, Providers as providers, GraphEvents } from '@/common';
-import { getProviderMessageProvenance } from '@/messages/provenance';
-import { getRunStepResumeState } from '@/tools/runStepResume';
 import {
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
   createToolApprovalReviewEvidence,
@@ -49,6 +46,10 @@ import {
   SUBAGENT_REPLAY_CONTROLLER,
   type ReplayableSubagentTool,
 } from '@/tools/subagent/SubagentReplay';
+import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import { Constants, Providers as providers, GraphEvents } from '@/common';
+import { getProviderMessageProvenance } from '@/messages/provenance';
+import { getRunStepResumeState } from '@/tools/runStepResume';
 import { HookRegistry, createToolPolicyHook } from '@/hooks';
 import * as events from '@/utils/events';
 import { askUserQuestion } from '@/hitl';
@@ -3380,6 +3381,175 @@ describe('Codex review fixes', () => {
       ).toBe(true);
     }
   );
+
+  it('fails closed for a direct sibling missing from restored review evidence', async () => {
+    const executed: string[] = [];
+    const tools = ['first_direct', 'second_direct'].map(
+      (name) =>
+        tool(
+          async (): Promise<string> => {
+            executed.push(name);
+            return 'ran';
+          },
+          {
+            name,
+            description: `${name} test tool`,
+            schema: z.object({ command: z.string() }),
+          }
+        ) as unknown as StructuredToolInterface
+    );
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review direct command',
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools,
+      eventDrivenMode: true,
+      directToolNames: new Set(tools.map((entry) => entry.name)),
+      agentId: 'a',
+      toolCallStepIds: new Map([
+        ['call_1', 'step_1'],
+        ['call_2', 'step_2'],
+      ]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'first_direct', args: { command: 'first' } },
+      { id: 'call_2', name: 'second_direct', args: { command: 'second' } },
+    ]);
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'parallel-reviewed-directs',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+    const config = {
+      configurable: { thread_id: 'parallel-reviewed-directs' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, config);
+    const interrupt = run.getInterrupt();
+    const reviewedName =
+      interrupt?.payload.type === 'tool_approval'
+        ? interrupt.payload.action_requests[0]?.name
+        : undefined;
+    expect(reviewedName).toBeDefined();
+    (node as unknown as { hookRegistry?: HookRegistry }).hookRegistry =
+      undefined;
+
+    await run.resume([{ type: 'approve' }], config);
+
+    expect(executed).toEqual([reviewedName]);
+  });
+
+  it('executes the exact resolved direct arguments that were reviewed', async () => {
+    const executedCommands: string[] = [];
+    const directTool = tool(
+      async ({ command }): Promise<string> => {
+        executedCommands.push(command);
+        return 'ran';
+      },
+      {
+        name: 'reference_direct',
+        description: 'reference test tool',
+        schema: z.object({ command: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const registry = makeHookRegistry('ask', 'review resolved command');
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      directToolNames: new Set(['reference_direct']),
+      agentId: 'a',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+      toolOutputReferences: { enabled: true },
+    });
+    const referenceRegistry = (
+      node as unknown as {
+        toolOutputRegistry?: ToolOutputReferenceRegistry;
+      }
+    ).toolOutputRegistry;
+    referenceRegistry?.set(
+      'reviewed-reference-direct',
+      'tool0turn0',
+      'resolved-value'
+    );
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_1',
+        name: 'reference_direct',
+        args: { command: 'echo {{tool0turn0}}' },
+      },
+    ]);
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'reviewed-reference-direct',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+      toolOutputReferences: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+    const config = {
+      configurable: {
+        thread_id: 'reviewed-reference-direct',
+        run_id: 'reviewed-reference-direct',
+      },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, config);
+    const interrupt = run.getInterrupt();
+    const reviewedArguments =
+      interrupt?.payload.type === 'tool_approval'
+        ? interrupt.payload.action_requests[0]?.arguments
+        : undefined;
+    expect(reviewedArguments).toEqual({
+      command: 'echo resolved-value',
+    });
+    (
+      node as unknown as {
+        toolOutputRegistry?: ToolOutputReferenceRegistry;
+      }
+    ).toolOutputRegistry = new ToolOutputReferenceRegistry();
+
+    await run.resume([{ type: 'approve' }], config);
+
+    expect(executedCommands).toEqual(['echo resolved-value']);
+  });
 
   it('Run.resume fails closed when a reusable hook changes the reviewed arguments', async () => {
     let dispatchCalls = 0;

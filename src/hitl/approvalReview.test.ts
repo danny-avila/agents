@@ -30,6 +30,16 @@ describe('approval review evidence', () => {
     });
   });
 
+  it('preserves an empty allowlist as fail-closed review evidence', () => {
+    expect(
+      createToolApprovalReviewEvidence('interrupt_1', {
+        type: 'tool_approval',
+        action_requests: [request],
+        review_configs: [{ ...reviewConfig, allowed_decisions: [] }],
+      })
+    ).toBeDefined();
+  });
+
   it.each([
     {
       label: 'null request',

@@ -1964,6 +1964,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const replayController = (
       this.toolMap.get(call.name) as ReplayableSubagentTool | undefined
     )?.[SUBAGENT_REPLAY_CONTROLLER];
+    const isTrustedSubagentReviewHop =
+      call.name === Constants.SUBAGENT && replayController != null;
     const replayConfig =
       replayController == null
         ? config
@@ -2075,6 +2077,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       !hasPreHook &&
       pendingApproval == null &&
       reviewedApproval == null &&
+      approvalReviewEvidence == null &&
       !hasPostHook &&
       !hasFailureHook
     ) {
@@ -2129,27 +2132,39 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // value the PreToolUse hook observes matches the value the
     // (later-awaited) `runTool` will actually run with — both are
     // anchored to the pre-batch registry state.
-    let resolvedArgs = call.args as Record<string, unknown>;
     const hookResolveOptions = {
       substituteIntentKey: this.toolDeclaresBusinessIntent(call.name),
     };
-    if (batchContext.preBatchSnapshot != null) {
-      const { resolved } = batchContext.preBatchSnapshot.resolve(
-        call.args,
-        hookResolveOptions
-      );
-      resolvedArgs = resolved as Record<string, unknown>;
-    } else if (this.toolOutputRegistry != null) {
-      const { resolved } = this.toolOutputRegistry.resolve(
-        registryRunId,
-        call.args,
-        hookResolveOptions
-      );
-      resolvedArgs = resolved as Record<string, unknown>;
-    }
+    const resolveDirectArgs = (
+      args: Record<string, unknown>
+    ): Record<string, unknown> => {
+      if (batchContext.preBatchSnapshot != null) {
+        return batchContext.preBatchSnapshot.resolve(args, hookResolveOptions)
+          .resolved as Record<string, unknown>;
+      }
+      if (this.toolOutputRegistry != null) {
+        return this.toolOutputRegistry.resolve(
+          registryRunId,
+          args,
+          hookResolveOptions
+        ).resolved as Record<string, unknown>;
+      }
+      return args;
+    };
+    /** Review evidence contains the exact resolved arguments shown to the
+     * user. Reuse those on resume so a rebuilt registry cannot turn an
+     * approved `{{tool…}}` value into an unresolved or different input. */
+    let resolvedArgs =
+      reviewedApproval?.request.arguments ??
+      resolveDirectArgs(call.args as Record<string, unknown>);
 
     let effectiveCall = call;
-    if (hasPreHook || pendingApproval != null || reviewedApproval != null) {
+    if (
+      hasPreHook ||
+      pendingApproval != null ||
+      reviewedApproval != null ||
+      approvalReviewEvidence != null
+    ) {
       const preResult: AggregatedHookResult | undefined =
         hookRegistry == null
           ? {
@@ -2192,9 +2207,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // a valid combination (one matcher sanitises args, another asks
         // for approval); the reviewer should see the sanitised args.
         if (preResult.updatedInput != null) {
+          resolvedArgs = resolveDirectArgs(
+            preResult.updatedInput as Record<string, unknown>
+          );
           effectiveCall = {
             ...call,
-            args: preResult.updatedInput as Record<string, unknown>,
+            args: resolvedArgs,
           };
         }
 
@@ -2209,6 +2227,29 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               threadId,
             }),
             effectiveCall.args as Record<string, unknown>
+          );
+        }
+
+        /** A sibling absent from restored evidence may have raised a parallel
+         * approval that LangGraph did not preserve. A current hook can ask
+         * again; otherwise never let that unreviewed sibling execute. */
+        if (
+          approvalReviewEvidence != null &&
+          reviewedApproval == null &&
+          !isTrustedSubagentReviewHop &&
+          preResult.decision !== 'ask'
+        ) {
+          return persistOutput(
+            this.blockDirectCall({
+              call,
+              resolvedArgs,
+              reason:
+                'Tool call was not included in the restored approval batch — failing closed',
+              hookRegistry,
+              runId,
+              threadId,
+            }),
+            resolvedArgs
           );
         }
 
@@ -2271,6 +2312,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             preResult.decision === 'ask'
               ? preResult.reason
               : reviewedApproval?.request.description;
+          if (effectiveCall === call) {
+            effectiveCall = { ...call, args: resolvedArgs };
+          }
           const askEntry: AskEntry = {
             entry: {
               call: effectiveCall,

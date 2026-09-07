@@ -60,7 +60,6 @@ function hasValidApprovalShape(payload: ToolApprovalInterruptPayload): boolean {
       reviewConfig.tool_call_id !== toolCallId ||
       reviewConfig.action_name !== toolName ||
       !Array.isArray(allowedDecisions) ||
-      allowedDecisions.length === 0 ||
       !allowedDecisions.every(
         (decision) =>
           typeof decision === 'string' && APPROVAL_DECISIONS.has(decision)
