@@ -20,7 +20,7 @@ import {
 } from './toolResultTypes';
 import { getProviderMessageProvenance } from './provenance';
 import { apportionTokenCounts } from '@/utils/tokens';
-import { isReasoningContentBlock } from './core';
+import { isReasoningContentBlock } from './reasoningTypes';
 import { emitAgentLog } from '@/utils/events';
 import { ContentTypes } from '@/common';
 
@@ -74,13 +74,6 @@ function warnUnavailableToolShare(
     'Tool-message context share unavailable: the token counter must return finite, non-negative counts within the safe range',
     { error: error instanceof Error ? error.message : String(error) }
   );
-}
-
-/** `isReasoningContentBlock` matches every provider reasoning block by prefix
- *  but deliberately excludes LibreChat's `think`, which this gauge must treat
- *  the same way: reasoning attached to the turn, not visible conversation. */
-function isReasoningPart(part: MessageContentComplex): boolean {
-  return part.type === ContentTypes.THINK || isReasoningContentBlock(part);
 }
 
 function isBlankTextPart(part: string | MessageContentComplex): boolean {
@@ -191,7 +184,7 @@ function scanInvocation(
       continue;
     }
     previousPart = part;
-    if (isReasoningPart(part)) {
+    if (isReasoningContentBlock(part)) {
       continue;
     }
     toolOnly &&= isBlankTextPart(part);

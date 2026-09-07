@@ -39,6 +39,7 @@ import {
   serializeStructuredValueBounded,
 } from '@/utils/toolContent';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { isReasoningContentBlock } from '@/messages/reasoningTypes';
 import { Constants } from '@/common';
 
 type StandardTextBlock = Data.StandardTextBlock;
@@ -656,7 +657,6 @@ function _formatContent(message: BaseMessage) {
    * cross-provider handoff (e.g. Bedrock → Anthropic) we drop them rather than
    * forwarding an unusable block. The receiving model produces its own thinking.
    */
-  const foreignReasoningTypes = ['reasoning_content', 'reasoning', 'think'];
   /**
    * Google server-side tool blocks (`toolCall`/`toolResponse` parts from e.g.
    * URL context or Google Search). Only Google can execute these and validate
@@ -1049,7 +1049,7 @@ function _formatContent(message: BaseMessage) {
         };
       } else if (
         isAIMessage(message) &&
-        foreignReasoningTypes.some((t) => t === contentPart.type)
+        isReasoningContentBlock(contentPart)
       ) {
         // Foreign reasoning on an ASSISTANT turn (Bedrock `reasoning_content`,
         // Google `reasoning`, LibreChat `think`) carries provider-specific
@@ -1240,12 +1240,6 @@ function messagesHaveCacheControl(
   );
 }
 
-/** Anthropic rejects cache_control on these reasoning blocks. */
-const NON_CACHEABLE_PAYLOAD_BLOCK_TYPES = new Set([
-  'thinking',
-  'redacted_thinking',
-]);
-
 /**
  * Place one ephemeral `cache_control` on the last cacheable block of the final
  * message of an already-converted Anthropic payload. Used to re-anchor the tail
@@ -1287,8 +1281,9 @@ function reanchorTailCacheControl(
 
   let anchor = -1;
   for (let i = 0; i < content.length; i++) {
-    const type = (content[i] as { type?: string }).type;
-    if (type == null || NON_CACHEABLE_PAYLOAD_BLOCK_TYPES.has(type)) {
+    const block = content[i] as { type?: string };
+    const type = block.type;
+    if (type == null || isReasoningContentBlock(block)) {
       continue;
     }
     if (

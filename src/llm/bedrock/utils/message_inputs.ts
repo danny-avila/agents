@@ -30,6 +30,7 @@ import type {
 } from '../types';
 import { serializeStructuredValueBounded } from '@/utils/toolContent';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { isReasoningContentBlock } from '@/messages/reasoningTypes';
 
 /**
  * Reasoning blocks from other providers, relative to Bedrock. Bedrock's native
@@ -37,13 +38,6 @@ import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
  * signatures Bedrock cannot validate, so they are dropped on a cross-provider
  * handoff (e.g. Anthropic → Bedrock) rather than crashing the conversion.
  */
-const FOREIGN_REASONING_TYPES = [
-  'thinking',
-  'redacted_thinking',
-  'reasoning',
-  'think',
-];
-
 /**
  * Google server-side tool blocks (`toolCall`/`toolResponse` parts from e.g.
  * URL context or Google Search). Only Google can execute these and validate
@@ -797,7 +791,7 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
           contentBlocks.push({
             cachePoint,
           } as BedrockContentBlock);
-        } else if (FOREIGN_REASONING_TYPES.some((t) => t === block.type)) {
+        } else if (isReasoningContentBlock(block)) {
           // Reasoning from another provider (Anthropic `thinking`/
           // `redacted_thinking`, Google `reasoning`, LibreChat `think`).
           // Bedrock's native reasoning is `reasoning_content` (handled above); a

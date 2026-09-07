@@ -31,6 +31,7 @@ import {
 } from './provenance';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { stripAnthropicCacheControl } from './cache';
+import { isReasoningContentBlock } from './reasoningTypes';
 import { ContentTypes, Providers } from '@/common';
 import { toLangChainContent } from './langchain';
 
@@ -227,8 +228,7 @@ function getAdditionalReasoningContent(
 /**
  * True when a content block is a provider reasoning block: Anthropic
  * `thinking` / `redacted_thinking`, Google `reasoning`, Bedrock
- * `reasoning_content`, and the streamed delta variants that prefix each of
- * those names.
+ * `reasoning_content`, LibreChat `think`, and their known streamed variants.
  *
  * Shared rather than re-derived because two very different readers must agree
  * on the same answer: the stream classifier, which decides what the host has
@@ -236,38 +236,18 @@ function getAdditionalReasoningContent(
  * holds anything worth keeping. A turn the host renders as thinking-only must
  * never look like a visible answer to the gate.
  *
- * Prefix matching, not equality, because providers stream these as suffixed
- * delta types. `reasoning_content` needs no clause of its own — it already
- * carries the `reasoning` prefix.
+ * Exact matching prevents unrelated custom block types that happen to share a
+ * prefix from being silently classified as hidden reasoning.
  */
-export function isReasoningContentBlock(block: { type?: string }): boolean {
-  const type = block.type;
-  if (type == null) {
-    return false;
-  }
-  return (
-    type.startsWith(ContentTypes.THINKING) ||
-    type.startsWith(ContentTypes.REASONING) ||
-    type === 'redacted_thinking'
-  );
-}
+export { isReasoningContentBlock } from './reasoningTypes';
 
 function hasReasoningContent(content: BaseMessage['content']): boolean {
   if (!Array.isArray(content)) {
     return false;
   }
-  return content.some((item) => {
-    if (typeof item !== 'object' || !('type' in item)) {
-      return false;
-    }
-    return (
-      item.type === ContentTypes.THINK ||
-      item.type === ContentTypes.THINKING ||
-      item.type === ContentTypes.REASONING ||
-      item.type === ContentTypes.REASONING_CONTENT ||
-      item.type === 'redacted_thinking'
-    );
-  });
+  return content.some(
+    (item) => typeof item === 'object' && isReasoningContentBlock(item)
+  );
 }
 
 export function modifyDeltaProperties(
