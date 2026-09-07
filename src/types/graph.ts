@@ -84,7 +84,8 @@ export type BaseGraphState = {
   /**
    * The summary a summarize-only run produced. Kept in state because such a
    * run has no assistant reply: trace roots report it as the run's output
-   * instead of the retained tail or the raw state.
+   * instead of the retained tail or the raw state. Empty once any later run
+   * on the same checkpointed thread starts, so it never outlives its run.
    */
   manualSummary?: string;
 };

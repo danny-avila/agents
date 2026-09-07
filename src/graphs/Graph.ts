@@ -3148,6 +3148,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentId: agentId || agentContext.agentId,
           reason: 'manual',
         },
+        /** A checkpointed thread may still hold the previous compaction's
+         *  summary; only the one this run produces may be reported. */
+        manualSummary: '',
       };
     }
     if (contextUsage != null) {
@@ -3215,18 +3218,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * `processStream` call starts clean.
        */
       if (this.preemptHaltReason != null) {
-        return { messages: [] };
-      }
-
-      /**
-       * A summarize-only run ends at the agent that summarizes. A chained or
-       * fanned-out successor entered through the workflow's static routing
-       * must not spend a model call on the compacted history.
-       */
-      if (
-        this.summarizeOnlyAgentId != null &&
-        this.summarizeOnlyAgentId !== agentId
-      ) {
         return { messages: [] };
       }
 
@@ -5251,7 +5242,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.config = config;
       this.restoreRunStepResumeState(state.runStepState);
       const result = await invoke();
-      return { ...result, runStepState: this.createRunStepResumeState() };
+      /** An ordinary run on a checkpointed thread inherits the last
+       *  compaction's summary in state; it is not this run's output. */
+      const clearsManualSummary =
+        this.summarizeOnlyAgentId == null &&
+        typeof state.manualSummary === 'string' &&
+        state.manualSummary.length > 0;
+      return {
+        ...result,
+        ...(clearsManualSummary ? { manualSummary: '' } : {}),
+        runStepState: this.createRunStepResumeState(),
+      };
     };
 
     const routeMessage = (

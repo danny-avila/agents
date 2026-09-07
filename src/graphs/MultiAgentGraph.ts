@@ -1286,14 +1286,29 @@ export class MultiAgentGraph extends StandardGraph {
       builder.addEdge(source, destination);
     };
 
+    /**
+     * A summarize-only run compiles to the opted-in agent alone: no other
+     * node, no handoff or direct edge, START → agent → END. Anything else
+     * would run the summarizer twice (once from START, once through its
+     * predecessor) or append routing prompts to the checkpoint it just
+     * produced.
+     */
+    const summarizeOnlyAgentId = this.summarizeOnlyAgentId;
+    const agentIds =
+      summarizeOnlyAgentId != null
+        ? [summarizeOnlyAgentId]
+        : [...this.agentContexts.keys()];
+    const handoffEdges = summarizeOnlyAgentId != null ? [] : this.handoffEdges;
+    const directEdges = summarizeOnlyAgentId != null ? [] : this.directEdges;
+
     // Add all agents as complete subgraphs
-    for (const [agentId] of this.agentContexts) {
+    for (const agentId of agentIds) {
       // Get all possible destinations for this agent
       const handoffDestinations = new Set<string>();
       const directDestinations = new Set<string>();
 
       // Check handoff edges for destinations
-      for (const edge of this.handoffEdges) {
+      for (const edge of handoffEdges) {
         const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
         if (sources.includes(agentId) === true) {
           const dests = Array.isArray(edge.to) ? edge.to : [edge.to];
@@ -1302,7 +1317,7 @@ export class MultiAgentGraph extends StandardGraph {
       }
 
       // Check direct edges for destinations
-      for (const edge of this.directEdges) {
+      for (const edge of directEdges) {
         const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
         if (sources.includes(agentId) === true) {
           const dests = Array.isArray(edge.to) ? edge.to : [edge.to];
@@ -1565,15 +1580,8 @@ export class MultiAgentGraph extends StandardGraph {
       });
     }
 
-    /** A summarize-only run also starts at the agent that opted in: one
-     *  reachable only through a handoff would otherwise never run, since its
-     *  predecessors are no-ops. The workflow's own entry points stay, as the
-     *  graph must keep every node reachable; they end without a model call. */
     const startingNodes =
-      this.summarizeOnlyAgentId != null &&
-      !this.startingNodes.has(this.summarizeOnlyAgentId)
-        ? [...this.startingNodes, this.summarizeOnlyAgentId]
-        : this.startingNodes;
+      summarizeOnlyAgentId != null ? [summarizeOnlyAgentId] : this.startingNodes;
     for (const startNode of startingNodes) {
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       /** @ts-ignore */
@@ -1586,7 +1594,7 @@ export class MultiAgentGraph extends StandardGraph {
      */
     const edgesByDestination = new Map<string, t.GraphEdge[]>();
 
-    for (const edge of this.directEdges) {
+    for (const edge of directEdges) {
       const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
       for (const destination of destinations) {
         if (!edgesByDestination.has(destination)) {

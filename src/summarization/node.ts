@@ -1331,7 +1331,10 @@ export function createSummarizeNode({
           threadId,
           agentId: request.agentId,
           messagesBeforeCount: messagesToRefine.length,
-          trigger: agentContext.summarizationConfig?.trigger?.type ?? 'default',
+          trigger:
+            request.reason === 'manual'
+              ? 'manual'
+              : (agentContext.summarizationConfig?.trigger?.type ?? 'default'),
         },
         sessionId,
       }).catch(() => {

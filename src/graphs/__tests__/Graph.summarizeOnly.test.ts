@@ -1,4 +1,5 @@
 import { Runnable } from '@langchain/core/runnables';
+import { MemorySaver } from '@langchain/langgraph';
 import { describe, expect, it, jest } from '@jest/globals';
 import {
   AIMessageChunk,
@@ -6,8 +7,14 @@ import {
   AIMessage,
 } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
+import type {
+  HookCallback,
+  PreCompactHookInput,
+  PreCompactHookOutput,
+} from '@/hooks/types';
 import type * as t from '@/types';
 import { ManualSummarizationSkippedError } from '@/summarization';
+import { HookRegistry } from '@/hooks/HookRegistry';
 import { GraphEvents, Providers } from '@/common';
 import * as init from '@/llm/init';
 import { Run } from '@/run';
@@ -69,6 +76,9 @@ interface HarnessOptions {
   summarizerFailure?: Error;
   /** Two agents, `first` and `second`; which one opted in and how they connect. */
   multiAgent?: { summarizer: 'first' | 'second'; edgeType: 'direct' | 'handoff' };
+  /** Shared across harnesses to replay a checkpointed thread. */
+  checkpointer?: MemorySaver;
+  hooks?: HookRegistry;
 }
 
 async function createHarness(options: HarnessOptions): Promise<Harness> {
@@ -118,9 +128,13 @@ async function createHarness(options: HarnessOptions): Promise<Harness> {
         llmConfig,
         ...agentFields,
       };
+  if (options.checkpointer != null) {
+    graphConfig.compileOptions = { checkpointer: options.checkpointer };
+  }
   const run = await Run.create<t.IState>({
     runId: options.runId,
     graphConfig,
+    hooks: options.hooks,
     returnContent: true,
     skipCleanup: true,
     ...(withBudget ? { tokenCounter } : {}),
@@ -339,6 +353,90 @@ describe('summarize-only runs', () => {
       expect(harness.agentModel.calls).toHaveLength(0);
     } finally {
       harness.restore();
+    }
+  });
+
+  it('compiles a direct-edge target to the summarizer alone', async () => {
+    /** With the ordinary routing kept, the target would run once from START
+     *  and again when its predecessor completed. */
+    const harness = await createHarness({
+      runId: 'summarize-only-direct-target',
+      multiAgent: { summarizer: 'second', edgeType: 'direct' },
+    });
+    try {
+      await harness.run.processStream({ messages: buildHistory(2) }, streamConfig);
+
+      expect(harness.summarizer.calls).toHaveLength(1);
+      expect(harness.completions).toHaveLength(1);
+      expect(harness.snapshots).toHaveLength(1);
+      expect(harness.agentModel.calls).toHaveLength(0);
+    } finally {
+      harness.restore();
+    }
+  });
+
+  it('reports a manual trigger to PreCompact hooks', async () => {
+    const hooks = new HookRegistry();
+    let captured: PreCompactHookInput | undefined;
+    const hook: HookCallback<'PreCompact'> = async (input): Promise<PreCompactHookOutput> => {
+      captured = input;
+      return {};
+    };
+    hooks.register('PreCompact', { hooks: [hook] });
+    const harness = await createHarness({ runId: 'summarize-only-hook', hooks });
+    try {
+      await harness.run.processStream({ messages: buildHistory(2) }, streamConfig);
+
+      expect(captured?.trigger).toBe('manual');
+      expect(captured?.messagesBeforeCount).toBe(4);
+    } finally {
+      harness.restore();
+    }
+  });
+
+  it('clears a checkpointed summary once a later run starts', async () => {
+    /** The state channel outlives the run on a checkpointed thread, and a
+     *  later ordinary run or a failed compaction must not report it. */
+    const checkpointer = new MemorySaver();
+    const summaryOf = async (): Promise<string | undefined> => {
+      const tuple = await checkpointer.getTuple(streamConfig);
+      return tuple?.checkpoint.channel_values.manualSummary as string | undefined;
+    };
+    const compaction = await createHarness({ runId: 'summarize-only-ckpt-a', checkpointer });
+    try {
+      await compaction.run.processStream({ messages: buildHistory(2) }, streamConfig);
+      expect(await summaryOf()).toBe('CHECKPOINT: everything so far');
+    } finally {
+      compaction.restore();
+    }
+
+    const ordinary = await createHarness({
+      runId: 'summarize-only-ckpt-b',
+      summarizeOnly: false,
+      checkpointer,
+    });
+    try {
+      await ordinary.run.processStream(
+        { messages: [new HumanMessage('a later question')] },
+        streamConfig
+      );
+      expect(ordinary.agentModel.calls).toHaveLength(1);
+      expect(await summaryOf()).toBe('');
+    } finally {
+      ordinary.restore();
+    }
+
+    const failing = await createHarness({
+      runId: 'summarize-only-ckpt-c',
+      checkpointer,
+      summarizerFailure: new Error('503 summarizer unavailable'),
+    });
+    try {
+      await failing.run.processStream({ messages: buildHistory(1) }, streamConfig);
+      expect(failing.completions[0].error).toMatch(/preserved/);
+      expect(await summaryOf()).toBe('');
+    } finally {
+      failing.restore();
     }
   });
 
