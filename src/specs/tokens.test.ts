@@ -371,6 +371,33 @@ describe('getTokenCountForMessage', () => {
     ).toBeGreaterThan(5_000);
   });
 
+  test('counts raw OpenAI custom tool inputs', () => {
+    const message = new AIMessage('');
+    Reflect.set(message.additional_kwargs, 'tool_calls', [
+      {
+        id: 'custom-call',
+        type: 'custom',
+        custom: {
+          name: 'shell',
+          input: 'x'.repeat(5_000),
+        },
+      },
+    ]);
+
+    expect(
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toBeGreaterThan(5_000);
+  });
+
+  test('rejects raw tool-call arrays beyond the traversal limit', () => {
+    const message = new AIMessage('');
+    message.additional_kwargs.tool_calls = new Array(10_001);
+
+    expect(() =>
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toThrow(UnsafeTokenMeasurementError);
+  });
+
   test('counts inherited raw OpenAI tool calls', () => {
     const message = new AIMessage('');
     Object.setPrototypeOf(message.additional_kwargs, {

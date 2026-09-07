@@ -3563,7 +3563,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         beforeToolInputProjection,
         projectToolMessagesForProvider(
           beforeToolInputProjection,
-          calculateMaxToolCallInputChars(agentContext.maxContextTokens)
+          calculateMaxToolCallInputChars(agentContext.maxContextTokens),
+          agentContext.provider
         )
       );
 

@@ -16,6 +16,7 @@ export type UnsafeTokenMeasurementReason =
   | 'content_proxy'
   | 'metadata_proxy'
   | 'metadata_accessor'
+  | 'metadata_limit'
   | 'invalid_count';
 
 export class UnsafeTokenMeasurementError extends Error {
@@ -121,6 +122,7 @@ const MAX_STRUCTURED_TOKENIZATION_CHARS = 200_000;
 /** One UTF-16 character can encode to several tokenizer pieces. */
 const MAX_TOKENS_PER_OMITTED_STRUCTURED_CHAR = 4;
 const MAX_STRUCTURED_SAFETY_INSPECTION_WORK = 10_000;
+const MAX_RAW_TOOL_CALLS = MAX_STRUCTURED_SAFETY_INSPECTION_WORK;
 /** Bounds BPE work per plain-text segment without omitting any text. */
 const MAX_TEXT_TOKENIZATION_CHARS = 8_192;
 /** Covers tokenizer segmentation changes on both sides of a chunk boundary. */
@@ -1265,6 +1267,12 @@ export function getTokenCountForMessage(
           path: 'additional_kwargs.tool_calls',
         });
       }
+      if (rawCalls.length > MAX_RAW_TOOL_CALLS) {
+        throw new UnsafeTokenMeasurementError({
+          reason: 'metadata_limit',
+          path: 'additional_kwargs.tool_calls',
+        });
+      }
       for (let i = 0; i < rawCalls.length; i++) {
         const rawCall = readTokenMetadataProperty(
           rawCalls,
@@ -1303,6 +1311,11 @@ export function getTokenCountForMessage(
           'function',
           `${callPath}.function`
         );
+        const rawCustom = readTokenMetadataProperty(
+          rawCall,
+          'custom',
+          `${callPath}.custom`
+        );
         let projectedFunction = rawFunction;
         if (rawFunction != null && typeof rawFunction === 'object') {
           if (hasUnsafeStructuredSerialization(rawFunction)) {
@@ -1323,11 +1336,36 @@ export function getTokenCountForMessage(
           );
           projectedFunction = { name, arguments: args };
         }
+        let projectedCustom = rawCustom;
+        if (rawCustom != null && typeof rawCustom === 'object') {
+          if (hasUnsafeStructuredSerialization(rawCustom)) {
+            throw new UnsafeTokenMeasurementError({
+              reason: 'metadata_accessor',
+              path: `${callPath}.custom`,
+            });
+          }
+          const name = readTokenMetadataProperty(
+            rawCustom,
+            'name',
+            `${callPath}.custom.name`
+          );
+          const input = readTokenMetadataProperty(
+            rawCustom,
+            'input',
+            `${callPath}.custom.input`
+          );
+          projectedCustom = { name, input };
+        }
         if (typeof callId === 'string' && representedToolCallIds.has(callId)) {
           continue;
         }
         numTokens += getBoundedStructuredTokenCount(
-          { id: callId, type: callType, function: projectedFunction },
+          {
+            id: callId,
+            type: callType,
+            custom: projectedCustom,
+            function: projectedFunction,
+          },
           countText
         );
       }

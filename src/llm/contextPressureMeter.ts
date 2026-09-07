@@ -175,7 +175,7 @@ function getStableTokenSurface(
     const toolCalls = resolvedToolCallsProperty.value;
     if (
       toolCalls != null &&
-      (!Array.isArray(toolCalls) || isProxy(toolCalls) || toolCalls.length > 0)
+      (isProxy(toolCalls) || !Array.isArray(toolCalls) || toolCalls.length > 0)
     ) {
       return undefined;
     }

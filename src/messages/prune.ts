@@ -2104,7 +2104,8 @@ function projectToolCallInputsInternal(
   messages: BaseMessage[],
   maxInputChars: number,
   dropIncompleteStreamContent: boolean,
-  fromIndex = 0
+  fromIndex = 0,
+  retainRawOpenAIToolCalls = true
 ): BaseMessage[] {
   const normalizedMaxInputChars = normalizeToolInputLimit(maxInputChars);
   let projectedMessages: BaseMessage[] | undefined;
@@ -2191,15 +2192,20 @@ function projectToolCallInputsInternal(
       }
     }
 
-    const additionalKwargsChanges: Record<string, unknown> =
-      rawAdditionalToolCallsProperty.accessor ? { tool_calls: undefined } : {};
-    const rawToolCalls = projectRawOpenAIToolCalls(
-      rawAdditionalToolCalls,
-      normalizedMaxInputChars,
-      canonicalArguments
-    );
-    if (rawToolCalls.changed) {
-      additionalKwargsChanges.tool_calls = rawToolCalls.value;
+    const additionalKwargsChanges: Record<string, unknown> = {};
+    if (!retainRawOpenAIToolCalls && rawAdditionalToolCallsProperty.found) {
+      additionalKwargsChanges.tool_calls = undefined;
+    } else if (rawAdditionalToolCallsProperty.accessor) {
+      additionalKwargsChanges.tool_calls = undefined;
+    } else {
+      const rawToolCalls = projectRawOpenAIToolCalls(
+        rawAdditionalToolCalls,
+        normalizedMaxInputChars,
+        canonicalArguments
+      );
+      if (rawToolCalls.changed) {
+        additionalKwargsChanges.tool_calls = rawToolCalls.value;
+      }
     }
     const legacyFunctionCall = projectLegacyFunctionCall(
       readPropertyWithoutAccessors(
@@ -2292,9 +2298,22 @@ export function projectToolCallInputs(
  */
 export function projectToolMessagesForProvider(
   messages: BaseMessage[],
-  maxInputChars: number
+  maxInputChars: number,
+  provider?: ProviderName
 ): BaseMessage[] {
-  return projectToolCallInputsInternal(messages, maxInputChars, true);
+  const providerFamily =
+    provider == null ? undefined : getProviderFamily(provider);
+  const retainRawOpenAIToolCalls =
+    provider == null ||
+    provider === Providers.OPENAI ||
+    providerFamily === 'openai';
+  return projectToolCallInputsInternal(
+    messages,
+    maxInputChars,
+    true,
+    0,
+    retainRawOpenAIToolCalls
+  );
 }
 
 function applyToolCallInputCaps(params: {

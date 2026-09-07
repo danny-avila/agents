@@ -256,6 +256,22 @@ describe('createContextPressureMeter', () => {
     expect(tokenCounter).toHaveBeenCalledTimes(2);
   });
 
+  it('recounts inherited revoked parsed tool-call proxies safely', () => {
+    const message = new AIMessage('answer');
+    const tokenCounter = jest.fn(contentLength);
+    const cache = createExactTokenCountCache(tokenCounter);
+    const { proxy, revoke } = Proxy.revocable([], {});
+    const inherited = Object.create(Object.getPrototypeOf(message));
+    Object.defineProperty(inherited, 'tool_calls', { value: proxy });
+    delete message.tool_calls;
+    Object.setPrototypeOf(message, inherited);
+    revoke();
+
+    expect(() => cache.count(message)).not.toThrow();
+    expect(() => cache.count(message)).not.toThrow();
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
+  });
+
   it('matches forced recounts across append, replace, reorder, and mutation', () => {
     const first = new HumanMessage({ id: 'first', content: 'one' });
     const second = new HumanMessage({ id: 'second', content: 'two' });

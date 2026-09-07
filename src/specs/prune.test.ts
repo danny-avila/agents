@@ -113,7 +113,6 @@ function getMessagesWithinTokenLimit({
 } {
   // Every reply is primed with <|start|>assistant<|message|>, so we
   // start with 3 tokens for the label after all messages have been counted.
-  let summaryIndex = -1;
   let currentTokenCount = 3;
   const instructions =
     _messages[0]?.getType() === 'system' ? _messages[0] : undefined;
@@ -169,7 +168,7 @@ function getMessagesWithinTokenLimit({
   }
 
   const prunedMemory = messages;
-  summaryIndex = prunedMemory.length - 1;
+  const summaryIndex = prunedMemory.length - 1;
   remainingContextTokens -= currentTokenCount;
 
   return {
@@ -1486,6 +1485,35 @@ describe('Prune Messages Tests', () => {
       ];
 
       expect(projectToolMessagesForProvider(messages, 200)).toBe(messages);
+    });
+
+    it('removes raw OpenAI calls from non-OpenAI provider projections', () => {
+      const message = new AIMessage('');
+      message.additional_kwargs.tool_calls = [
+        {
+          id: 'raw-call',
+          type: 'function',
+          function: {
+            name: 'lookup',
+            arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+          },
+        },
+      ];
+
+      const [anthropicMessage] = projectToolMessagesForProvider(
+        [message],
+        200,
+        Providers.ANTHROPIC
+      );
+      const [openAIMessage] = projectToolMessagesForProvider(
+        [message],
+        200,
+        Providers.OPENAI
+      );
+
+      expect(anthropicMessage.additional_kwargs.tool_calls).toBeUndefined();
+      expect(openAIMessage.additional_kwargs.tool_calls).toBeDefined();
+      expect(message.additional_kwargs.tool_calls).toBeDefined();
     });
 
     it('uses the shared 15%-of-context cap with a 200K ceiling', () => {
