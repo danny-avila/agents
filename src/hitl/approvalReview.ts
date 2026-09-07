@@ -26,6 +26,11 @@ export interface ReviewedToolApproval {
 
 const APPROVAL_DECISIONS = new Set(['approve', 'reject', 'edit', 'respond']);
 
+/** Detach approval payloads from host- or transport-owned object graphs. */
+export function cloneToolApprovalInterruptPayload<T>(payload: T): T {
+  return isToolApprovalInterrupt(payload) ? structuredClone(payload) : payload;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -85,7 +90,10 @@ export function createToolApprovalReviewEvidence(
   ) {
     return undefined;
   }
-  return { interruptId, payload };
+  return {
+    interruptId,
+    payload: cloneToolApprovalInterruptPayload(payload),
+  };
 }
 
 /** Read only well-shaped evidence from a ToolNode's runnable config. */

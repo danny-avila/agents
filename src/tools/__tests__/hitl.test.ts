@@ -1,10 +1,6 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import {
-  AIMessage,
-  HumanMessage,
-  ToolMessage,
-} from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import {
   describe,
   it,
@@ -110,10 +106,7 @@ async function stripStopContinuationExecutionIds(
     checkpointer.storage[threadId] ?? {}
   )) {
     for (const stored of Object.values(checkpoints)) {
-      const checkpoint = await checkpointer.serde.loadsTyped(
-        'json',
-        stored[0]
-      );
+      const checkpoint = await checkpointer.serde.loadsTyped('json', stored[0]);
       const runStepState = (
         checkpoint as {
           channel_values?: { runStepState?: t.RunStepResumeState };
@@ -3462,6 +3455,118 @@ describe('Codex review fixes', () => {
     expect(executed).toEqual([reviewedName]);
   });
 
+  it('reuses a settled direct sibling when a later event tool interrupts', async () => {
+    let directExecutions = 0;
+    const completedCallIds: string[] = [];
+    const dispatchedEventNames: string[] = [];
+    const directTool = tool(
+      async (): Promise<string> => {
+        directExecutions += 1;
+        return 'direct-result';
+      },
+      {
+        name: 'local_direct',
+        description: 'local direct test tool',
+        schema: z.object({ command: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          const completed = data as {
+            result?: { tool_call?: { id?: string } };
+          };
+          const id = completed.result?.tool_call?.id;
+          if (id != null) {
+            completedCallIds.push(id);
+          }
+          return;
+        }
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (results: t.ToolExecuteResult[]) => void;
+        };
+        dispatchedEventNames.push(
+          ...request.toolCalls.map((call) => call.name)
+        );
+        request.resolve(
+          request.toolCalls.map((call) => ({
+            toolCallId: call.id,
+            content: 'event-result',
+            status: 'success' as const,
+          }))
+        );
+      });
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> =>
+          input.toolName === 'remote_event'
+            ? { decision: 'ask', reason: 'review event tool' }
+            : { decision: 'allow' },
+      ],
+    });
+    const node = new ToolNode({
+      tools: [directTool, createSchemaStub('remote_event')],
+      toolMap: new Map([
+        ['local_direct', directTool],
+        ['remote_event', createSchemaStub('remote_event')],
+      ]),
+      eventDrivenMode: true,
+      directToolNames: new Set(['local_direct']),
+      agentId: 'a',
+      toolCallStepIds: new Map([
+        ['call_direct', 'step_direct'],
+        ['call_event', 'step_event'],
+      ]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_direct',
+        name: 'local_direct',
+        args: { command: 'local' },
+      },
+      {
+        id: 'call_event',
+        name: 'remote_event',
+        args: { command: 'remote' },
+      },
+    ]);
+    const config = { configurable: { thread_id: 'mixed-direct-event-replay' } };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    expect(directExecutions).toBe(1);
+    expect(completedCallIds.filter((id) => id === 'call_direct')).toHaveLength(
+      1
+    );
+
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'approve' }],
+      config
+    )) as { messages: BaseMessage[] };
+
+    expect(directExecutions).toBe(1);
+    expect(completedCallIds.filter((id) => id === 'call_direct')).toHaveLength(
+      1
+    );
+    expect(dispatchedEventNames).toEqual(['remote_event']);
+    const directResult = resumed.messages.find(
+      (message): message is ToolMessage =>
+        message._getType() === 'tool' &&
+        (message as ToolMessage).tool_call_id === 'call_direct'
+    );
+    expect(directResult?.status).not.toBe('error');
+    expect(directResult?.content).toBe('direct-result');
+  });
+
   it('executes the exact resolved direct arguments that were reviewed', async () => {
     const executedCommands: string[] = [];
     const directTool = tool(
@@ -3549,6 +3654,152 @@ describe('Codex review fixes', () => {
     await run.resume([{ type: 'approve' }], config);
 
     expect(executedCommands).toEqual(['echo resolved-value']);
+  });
+
+  it('replays a direct hook rewrite from the original arguments', async () => {
+    const hookInputs: string[] = [];
+    const executedCommands: string[] = [];
+    const directTool = tool(
+      async ({ command }): Promise<string> => {
+        executedCommands.push(command);
+        return 'ran';
+      },
+      {
+        name: 'rewritten_direct',
+        description: 'rewrite replay test tool',
+        schema: z.object({ command: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => {
+          const command = String(input.toolInput.command);
+          hookInputs.push(command);
+          return {
+            decision: 'ask',
+            reason: 'review rewritten command',
+            updatedInput: { command: `safe:${command}` },
+          };
+        },
+      ],
+    });
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      directToolNames: new Set(['rewritten_direct']),
+      agentId: 'a',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_1',
+        name: 'rewritten_direct',
+        args: { command: 'original' },
+      },
+    ]);
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'direct-rewrite-replay',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: {
+              modelName: 'gpt-4o-mini',
+              apiKey: 'test-key',
+            },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+    const config = {
+      configurable: { thread_id: 'direct-rewrite-replay' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, config);
+    await run.resume([{ type: 'approve' }], config);
+
+    expect(hookInputs).toEqual(['original', 'original']);
+    expect(executedCommands).toEqual(['safe:original']);
+  });
+
+  it('does not let a host mutation change the reviewed direct proposal', async () => {
+    const executedCommands: string[] = [];
+    const directTool = tool(
+      async ({ command }): Promise<string> => {
+        executedCommands.push(command);
+        return 'ran';
+      },
+      {
+        name: 'immutable_direct',
+        description: 'immutable proposal test tool',
+        schema: z.object({ command: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const registry = makeHookRegistry('ask', 'review immutable command');
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      directToolNames: new Set(['immutable_direct']),
+      agentId: 'a',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_1',
+        name: 'immutable_direct',
+        args: { command: 'reviewed' },
+      },
+    ]);
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'immutable-direct-proposal',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: {
+              modelName: 'gpt-4o-mini',
+              apiKey: 'test-key',
+            },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+    const config = {
+      configurable: { thread_id: 'immutable-direct-proposal' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, config);
+    const exposed = run.getInterrupt();
+    if (exposed?.payload.type !== 'tool_approval') {
+      throw new Error('expected tool approval');
+    }
+    exposed.payload.action_requests[0].arguments.command = 'mutated';
+    await run.resume([{ type: 'approve' }], config);
+
+    expect(executedCommands).toEqual(['reviewed']);
   });
 
   it('Run.resume fails closed when a reusable hook changes the reviewed arguments', async () => {
@@ -3816,7 +4067,8 @@ describe('Codex review fixes', () => {
   );
 
   it('forwards review evidence only through the trusted built-in subagent hop', async () => {
-    const receivedConfigurables: Array<Record<string, unknown> | undefined> = [];
+    const receivedConfigurables: Array<Record<string, unknown> | undefined> =
+      [];
     const subagentTool = tool(
       async (_input, config): Promise<string> => {
         receivedConfigurables.push(config.configurable);

@@ -70,6 +70,7 @@ import {
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import {
+  cloneToolApprovalInterruptPayload,
   createToolApprovalReviewEvidence,
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
 } from '@/hitl/approvalReview';
@@ -173,9 +174,7 @@ function materializeStopContinuation(
   return messages;
 }
 
-function advanceCheckpointCursor(
-  config: t.RunStreamConfig
-): t.RunStreamConfig {
+function advanceCheckpointCursor(config: t.RunStreamConfig): t.RunStreamConfig {
   const configurable = { ...config.configurable };
   delete configurable.checkpoint_id;
   delete configurable.checkpoint_map;
@@ -190,9 +189,7 @@ function assertFinalAdmissionSucceeded(result: AggregatedHookResult): void {
     result.errors.length > 0
       ? result.errors.join('; ')
       : 'one or more internal finalizers failed';
-  throw new Error(
-    `StopFinalize terminal admission failed: ${detail}`
-  );
+  throw new Error(`StopFinalize terminal admission failed: ${detail}`);
 }
 
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
@@ -427,7 +424,7 @@ function overwriteResumeRunStepState(
   const update = Array.isArray(command.update)
     ? [
       ...command.update.filter(([key]) => key !== 'runStepState'),
-      ['runStepState', overwrite] as [string, unknown],
+        ['runStepState', overwrite] as [string, unknown],
     ]
     : { ...(command.update ?? {}), runStepState: overwrite };
   const resumed = new Command({
@@ -1529,7 +1526,7 @@ export class Run<_T extends t.BaseGraphState> {
               this._interrupt = {
                 interruptId: first.id ?? '',
                 threadId,
-                payload: first.value,
+                payload: cloneToolApprovalInterruptPayload(first.value),
               };
             }
           }
@@ -1573,7 +1570,8 @@ export class Run<_T extends t.BaseGraphState> {
           stopReason = OUTPUT_TRUNCATED_HALT_REASON;
         }
 
-        const stopMessages = graph.getRunMessages() ?? stateInputs?.messages ?? [];
+        const stopMessages =
+          graph.getRunMessages() ?? stateInputs?.messages ?? [];
         const stopContinuationCount = graph.getStopContinuationCount();
         const continuationBudgetRemaining = Math.max(
           0,
@@ -1896,8 +1894,10 @@ export class Run<_T extends t.BaseGraphState> {
     }
     return {
       ...this._interrupt,
-      payload: stripSubagentResumeManifest(
-        stripRunStepResumeState(this._interrupt.payload)
+      payload: cloneToolApprovalInterruptPayload(
+        stripSubagentResumeManifest(
+          stripRunStepResumeState(this._interrupt.payload)
+        )
       ),
     } as t.RunInterruptResult<TPayload>;
   }
@@ -2156,7 +2156,7 @@ export class Run<_T extends t.BaseGraphState> {
     const threadId = callerConfig.configurable?.thread_id;
     this._interrupt = {
       interruptId: persistedInterrupt.id,
-      payload: persistedInterrupt.value,
+      payload: cloneToolApprovalInterruptPayload(persistedInterrupt.value),
       ...(typeof threadId === 'string' ? { threadId } : {}),
       ...(typeof checkpointId === 'string' ? { checkpointId } : {}),
       ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
