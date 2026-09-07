@@ -86,6 +86,7 @@ async function createCompactingRun(
       summarizationEnabled: true,
       summarizationConfig: {
         provider: Providers.OPENAI,
+        maxContextTokens: 32_000,
         retainRecent,
       },
     },

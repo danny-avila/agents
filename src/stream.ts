@@ -1456,6 +1456,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       const { result } = data as unknown as {
         result:
           | t.ToolEndEvent
+          | (t.SummaryFailed & { id: string; index: number })
           | (t.SummaryCompleted & { id: string; index: number });
       };
 
@@ -1469,6 +1470,12 @@ export function createContentAggregator(): t.ContentAggregatorResult {
 
       if (result.type === ContentTypes.SUMMARY && 'summary' in result) {
         contentParts[runStep.index] = result.summary as t.MessageContentComplex;
+      } else if (result.type === 'summary_error' && 'error' in result) {
+        contentParts[runStep.index] = {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]:
+            `Summarization failed; conversation history was preserved. ${result.error}`,
+        } as t.MessageContentComplex;
       } else if ('tool_call' in result) {
         const contentPart: t.MessageContentComplex = {
           type: ContentTypes.TOOL_CALL,

@@ -150,4 +150,40 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
 
     consoleSpy.mockRestore();
   });
+
+  it('renders summary failure completion without creating a durable summary', () => {
+    const { aggregateContent, contentParts } = createContentAggregator();
+    const runStep: t.RunStep = {
+      stepIndex: 0,
+      id: 'step_sum_failed',
+      type: StepTypes.MESSAGE_CREATION,
+      index: 0,
+      stepDetails: {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: { message_id: 'step_sum_failed' },
+      },
+      summary: { type: ContentTypes.SUMMARY },
+      usage: null,
+    };
+    aggregateContent({ event: GraphEvents.ON_RUN_STEP, data: runStep });
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_COMPLETED,
+      data: {
+        result: {
+          id: 'step_sum_failed',
+          index: 0,
+          type: 'summary_error',
+          error: 'chunk failed',
+        },
+      } as never,
+    });
+
+    const failure = contentParts[0] as {
+      type: ContentTypes.ERROR;
+      error: string;
+    };
+    expect(failure.type).toBe(ContentTypes.ERROR);
+    expect(failure.error).toContain('conversation history was preserved');
+  });
 });

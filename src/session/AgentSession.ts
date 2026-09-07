@@ -519,7 +519,7 @@ function createAgentInputFromGraphConfig(
   const summarizationConfig: t.SummarizationConfig = {
     ...(agent.summarizationConfig ?? {}),
     ...(instructions != null && instructions !== ''
-      ? { prompt: instructions }
+      ? { prompt: instructions, updatePrompt: instructions }
       : {}),
     retainRecent: {
       ...(agent.summarizationConfig?.retainRecent ?? {}),
@@ -540,12 +540,14 @@ function createManualCompactGraph(params: {
 }): {
   graph: Parameters<typeof createSummarizeNode>[0]['graph'];
   completedSummary?: t.SummaryContentBlock;
+  summaryError?: string;
 } {
   const contentData: t.RunStep[] = [];
   const contentIndexMap = new Map<string, number>();
   const result: {
     graph: Parameters<typeof createSummarizeNode>[0]['graph'];
     completedSummary?: t.SummaryContentBlock;
+    summaryError?: string;
   } = {
     graph: {
       contentData,
@@ -570,6 +572,8 @@ function createManualCompactGraph(params: {
         };
         if (completed.type === 'summary') {
           result.completedSummary = completed.summary;
+        } else if (completed.type === 'summary_error') {
+          result.summaryError = completed.error;
         }
         await params.customHandlers?.[
           GraphEvents.ON_RUN_STEP_COMPLETED
@@ -1182,13 +1186,11 @@ export class AgentSession {
         metadata: { run_id: compactRunId },
       }
     );
-    const completedSummaryText = getSummaryText(graph.completedSummary);
-    const contextSummaryText = agentContext.getSummaryText();
-    let summaryText = completedSummaryText;
-    if (summaryText === '' && contextSummaryText != null) {
-      summaryText = contextSummaryText;
+    if (graph.summaryError != null || graph.completedSummary == null) {
+      return undefined;
     }
-    if (summaryText === '') {
+    const completedSummaryText = getSummaryText(graph.completedSummary);
+    if (completedSummaryText === '') {
       return undefined;
     }
     const retainedMessages = filterRemoveMessages(
@@ -1205,7 +1207,7 @@ export class AgentSession {
       (entry) => !retainedEntryIdSet.has(entry.id)
     );
     const summary = await store.appendEntryForCompaction({
-      text: summaryText,
+      text: completedSummaryText,
       tokenCount: getSummaryTokenCount(graph.completedSummary),
       retainedEntryIds,
       summarizedEntryIds: summarized.map((entry) => entry.id),

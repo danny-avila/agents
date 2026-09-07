@@ -180,6 +180,7 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
         summarizationEnabled: true,
         summarizationConfig: {
           provider: Providers.OPENAI,
+          maxContextTokens: 32_000,
         },
         initialSummary: opts.initialSummary,
       },

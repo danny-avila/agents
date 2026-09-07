@@ -62,29 +62,30 @@ All budget comparisons multiply raw counts by `calibrationRatio` to approximate 
 
 5. **Summarization trigger**: If `messagesToRefine` is non-empty, `shouldTriggerSummarization` evaluates the configured trigger (or defaults to "any pruned messages"). `shouldSkipSummarization` only blocks when the message count hasn't changed since the last summary (prevents re-summarizing identical content). If triggered: **full compaction** fires.
 
-### Full Compaction
+### Bounded Compaction
 
 When summarization fires:
 
-- The **entire conversation** (un-masked originals from the snapshot) is sent to the summarizer — not just the dropped messages.
-- The summarizer produces a structured checkpoint covering the full conversation history.
-- Graph state is wiped completely (`createRemoveAllMessage()`) — no surviving messages.
+- The older conversation head uses the un-masked originals from the snapshot; the configured recent user-led turns remain verbatim.
+- Before invocation, the runtime subtracts instruction/tool-schema overhead and an output reserve from the selected summarizer model's context window. A dedicated summarizer can declare `summarizationConfig.maxContextTokens`; otherwise the agent context window is used.
+- If the full head fits, one full-compaction request produces the checkpoint. If it does not fit, the runtime partitions it at complete message and tool-call/result boundaries, summarizes at most eight bounded chunks, and sends their bounded summaries through one synthesis request.
+- An open tool call is never detached from later messages. The synthesis prompt preserves the original objective, exact identifiers, tool outcomes, and unfinished work while the recent unconsumed tail remains in graph state.
+- Graph state is replaced with `createRemoveAllMessage()` plus the retained recent tail only after a usable checkpoint succeeds.
 - The summary is stored on `AgentContext` but **not** injected into the system prompt (doesn't inflate `instructionTokens`).
 
 ### Post-Compaction Clean Slate
 
-After compaction, the message array is empty. On the next agent node turn:
+After compaction, the older head is removed and the recent tail may remain. On the next agent node turn:
 
-- The system runnable detects `messages.length === 0` with a mid-run summary present.
-- It injects `[SystemMessage(instructions), HumanMessage(summary)]`.
+- The system runnable injects the checkpoint before the retained recent messages.
 - The model reads the checkpoint as a user message and continues naturally — making tool calls or responding.
 - The summary competes for message budget rather than permanently reducing the instruction ceiling.
 
 ### Summarization Invocation
 
-Raw conversation messages are sent to the LLM via `attemptInvoke` with the summarization instruction appended as the final HumanMessage. Tools are bound so providers that require tool definitions (e.g. Bedrock) accept the messages. This preserves the original message format and enables cache hits on the system prompt + tool definitions prefix.
+Raw conversation messages are sent to the LLM via `attemptInvoke` with the summarization instruction appended as the final HumanMessage. Tools are bound so providers that require tool definitions (e.g. Bedrock) accept the messages. This preserves the original message format and enables cache hits on the system prompt + tool definitions prefix. Oversized inputs use intermediate chunk checkpoints and a final synthesis call instead of sending an over-limit request.
 
-If the primary call fails, fallback providers are attempted (via `tryFallbackProviders`). If all providers fail, a metadata stub is generated mechanically — no LLM call, just tool names and message counts.
+If the primary call fails, at most two fallback providers are attempted via `tryFallbackProviders`. If a chunk, synthesis, primary, or fallback attempt fails, the original history is preserved and `ON_SUMMARIZE_COMPLETE` reports a recoverable error; a structural metadata stub is never committed as the conversation replacement. Structured logs record full versus staged mode, estimated and provider-reported token counts, chunk/call counts, and the fallback outcome.
 
 ### Summarization Prompt
 

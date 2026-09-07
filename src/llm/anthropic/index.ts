@@ -27,8 +27,24 @@ const MAX_STREAM_QUEUE_CHUNKS = 256;
 const MAX_STREAM_QUEUE_TEXT_CHARS = 8192;
 const STREAM_CHUNK_MIN_SIZE = 4;
 const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
+const defaultOutputTokensByModel = new Map<string, number>();
 
 type StreamTokenType = 'string' | 'input' | 'content';
+
+export function getAnthropicDefaultMaxOutputTokens(model?: string): number {
+  const cacheKey = model ?? '';
+  const cached = defaultOutputTokensByModel.get(cacheKey);
+  if (cached != null) {
+    return cached;
+  }
+  const resolver = new ChatAnthropicMessages({
+    model,
+    apiKey: 'output-budget-resolution-only',
+  });
+  const resolved = resolver.maxTokens;
+  defaultOutputTokensByModel.set(cacheKey, resolved);
+  return resolved;
+}
 
 const ANTHROPIC_TOOL_BETAS: Partial<Record<string, AnthropicBeta>> = {
   tool_search_tool_regex_20251119: 'advanced-tool-use-2025-11-20',
