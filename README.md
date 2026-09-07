@@ -156,26 +156,6 @@ const customHandlers = composeEventHandlers(
 );
 ```
 
-## Context Usage Accounting
-
-`ON_CONTEXT_USAGE` snapshots and `projectAgentContextUsage` projections expose
-optional retained-tool estimates on `TokenBudgetBreakdown`:
-
-- `toolMessageTokens` includes retained tool/function results and assistant
-  messages containing only tool invocations and whitespace. It is a **subset
-  of `messageTokens`**, not an additional context-budget category.
-- `toolMessageTokenCounts` attributes only result-message tokens by tool name;
-  assistant invocation overhead is not assigned to individual tools.
-- `toolTokenCounts` continues to describe tool **schemas**, not tool results.
-
-These counts are calibrated estimates, not provider-reported per-tool billing.
-Provider prompt usage reconciles the overall context total; hosts that reconcile
-that total should proportionally rescale the tool share rather than add it.
-With a counter, no retained tool exchange produces a known zero total. Without
-a counter, the optional fields remain absent. Assistant text, reasoning, and
-media remain in the conversation share. Pre-send projection does not mutate the
-supplied message history.
-
 ## Development
 
 ```bash
