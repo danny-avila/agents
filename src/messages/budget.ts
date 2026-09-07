@@ -1,6 +1,7 @@
 import type {
   AIMessage,
   BaseMessage,
+  ChatMessage,
   ToolMessage,
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
@@ -36,12 +37,14 @@ function safeCount(value: number): number {
 let warnedUnavailableToolShare = false;
 
 /** Warns once per process: an unusable counter is a permanent host-integration
- *  fault, while the share is dropped on every affected call regardless. */
+ *  fault, while the share is dropped on every affected call regardless. The
+ *  latch is spent only when a config can carry the event, so a config-less
+ *  caller (the pre-send projection) cannot swallow the live path's one warning. */
 function warnUnavailableToolShare(
   config: RunnableConfig | undefined,
   error: unknown
 ): void {
-  if (warnedUnavailableToolShare) {
+  if (warnedUnavailableToolShare || config == null) {
     return;
   }
   warnedUnavailableToolShare = true;
@@ -52,6 +55,15 @@ function warnUnavailableToolShare(
     'Tool-message context share unavailable: the token counter must return safe, non-negative integers',
     { error: error instanceof Error ? error.message : String(error) }
   );
+}
+
+/** A `ChatMessage` carrying `role: 'assistant'` reports its type as `generic`,
+ *  a shape the OpenAI role converter and the default token counter both accept. */
+function isAssistantMessage(message: BaseMessage, type: string): boolean {
+  if (type === 'ai') {
+    return true;
+  }
+  return type === 'generic' && (message as ChatMessage).role === 'assistant';
 }
 
 /** Counts retained tool exchanges without serializing arguments or result content.
@@ -94,7 +106,7 @@ function computeToolMessageUsage(
   for (const message of context) {
     const type = message.getType();
     const isResult = type === 'tool' || type === 'function';
-    if (type === 'ai') {
+    if (isAssistantMessage(message, type)) {
       const ai = message as AIMessage;
       const calls = ai.tool_calls;
       const rawCalls = ai.additional_kwargs.tool_calls;

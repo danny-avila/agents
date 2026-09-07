@@ -2,6 +2,7 @@ import { RunnableLambda } from '@langchain/core/runnables';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import {
   AIMessage,
+  ChatMessage,
   FunctionMessage,
   HumanMessage,
   ToolMessage,
@@ -176,6 +177,37 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({
       structured_name: 10,
     });
+  });
+
+  it('counts generic assistant messages carrying a legacy call', () => {
+    const usage = snapshot();
+    const invocation = new ChatMessage({
+      role: 'assistant',
+      content: '',
+      additional_kwargs: {
+        function_call: { name: 'legacy_lookup', arguments: '{}' },
+      },
+    });
+
+    syncBudgetDerivedFields(
+      usage,
+      [invocation, new FunctionMessage({ content: 'result', name: '' })],
+      () => 10
+    );
+
+    expect(usage.breakdown.toolMessageTokens).toBe(20);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({
+      legacy_lookup: 10,
+    });
+  });
+
+  it('leaves non-assistant generic messages in the conversation share', () => {
+    const usage = snapshot();
+    const bystander = new ChatMessage({ role: 'user', content: 'aside' });
+
+    syncBudgetDerivedFields(usage, [bystander, toolResult('a')], () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(10);
   });
 
   it('attributes structured, raw, inline, and legacy results with explicit precedence', () => {
@@ -355,6 +387,14 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
         }
       },
     });
+
+    /** A config-less caller (the pre-send projection) has no channel to warn
+     *  through, so it must not consume the live path's one warning. */
+    const projected = snapshot();
+    expect(() =>
+      syncBudgetDerivedFields(projected, [toolResult('a')], () => Number.NaN)
+    ).not.toThrow();
+    expect(projected.breakdown.toolMessageTokens).toBeUndefined();
 
     await RunnableLambda.from(
       (_input: unknown, config?: RunnableConfig): void => {
