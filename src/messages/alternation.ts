@@ -4,10 +4,10 @@ import type { BaseMessage, MessageContent } from '@langchain/core/messages';
 import type { ProviderMessageProvenancePart } from './provenance';
 import type { ProviderToolCallIndex } from './toolResultTypes';
 import {
+  appendProviderMessageToolCalls,
   appendProviderToolCallDescriptor,
   consumeProviderToolResultPair,
   getBoundedProviderPairingArrayProperty,
-  getProviderAIMessageToolCallDescriptor,
   getProviderToolCallPartDescriptor,
   getProviderToolResultPartDescriptor,
 } from './toolResultTypes';
@@ -42,24 +42,11 @@ export const strictAlternationProviders: ReadonlySet<Providers> = new Set([
  */
 function collectProviderToolCalls(message: BaseMessage): ProviderToolCallIndex {
   const calls: ProviderToolCallIndex = new Map();
+  appendProviderMessageToolCalls(message, calls);
   const content = getBoundedProviderPairingArrayProperty(message, 'content');
   if (content != null) {
     for (let index = 0; index < content.length; index++) {
       const descriptor = getProviderToolCallPartDescriptor(content[index]);
-      if (descriptor != null) {
-        appendProviderToolCallDescriptor(calls, descriptor);
-      }
-    }
-  }
-  const toolCalls = getBoundedProviderPairingArrayProperty(
-    message,
-    'tool_calls'
-  );
-  if (toolCalls != null) {
-    for (let index = 0; index < toolCalls.length; index++) {
-      const descriptor = getProviderAIMessageToolCallDescriptor(
-        toolCalls[index]
-      );
       if (descriptor != null) {
         appendProviderToolCallDescriptor(calls, descriptor);
       }

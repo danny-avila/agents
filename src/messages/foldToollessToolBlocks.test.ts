@@ -12,6 +12,64 @@ import {
   isSyntheticProviderContextMessage,
 } from './format';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { toLangChainContent } from './langchain';
+
+test('folds computer actions as model calls rather than tool results', () => {
+  const [folded] = foldToolBlocksForToollessAgent([
+    new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          {
+            type: 'computer_call',
+            id: 'item',
+            call_id: 'call',
+            action: { type: 'click', x: 10, y: 20 },
+          },
+        ],
+      },
+    }),
+  ]);
+  expect(getTextContent(folded)).toContain(
+    '[tool_call] computer({"type":"click","x":10,"y":20})'
+  );
+  expect(getTextContent(folded)).not.toContain('server_tool_output');
+  expect(folded.additional_kwargs.provenance).toEqual({
+    version: 1,
+    parts: [{ attribution: 'synthetic' }, { attribution: 'model' }],
+  });
+});
+
+test('retains a generated-image sidecar alongside a distinct native tool call', () => {
+  const message = new AIMessage({
+    content: [
+      { type: 'text', text: 'drawing' },
+      { type: 'tool_use', id: 'lookup', name: 'lookup', input: {} },
+    ],
+    additional_kwargs: {
+      tool_outputs: [
+        {
+          type: 'image_generation_call',
+          id: 'image-1',
+          status: 'completed',
+          result: '/9j/AA==',
+        },
+      ],
+    },
+  });
+  const [folded] = foldToolBlocksForToollessAgent([message]);
+  expect(folded.content).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        type: 'image',
+        mimeType: 'image/jpeg',
+        data: '/9j/AA==',
+      }),
+    ])
+  );
+  expect(getTextContent(folded)).toContain('lookup');
+  expect(getTextContent(folded)).not.toContain('/9j/AA==');
+});
 
 /** Concatenated text across a message's content (string or structured array). */
 function getTextContent(msg: {
@@ -210,34 +268,35 @@ describe('foldToolBlocksForToollessAgent', () => {
       'malformed legacy lineage',
       { sourceMessageIds: { 0: 'forged', length: 1 } },
     ],
-  ])('preserves %s invalidity when folding retained bytes', (_, additional_kwargs) => {
-    const sourceProvenance = (additional_kwargs as { provenance?: unknown })
-      .provenance;
-    const result = foldToolBlocksForToollessAgent([
-      new AIMessage({
-        content: '',
-        tool_calls: [
-          { id: 'call', name: 'lookup', args: {}, type: 'tool_call' },
-        ],
-      }),
-      new ToolMessage({
-        content: 'untrusted tool bytes',
-        tool_call_id: 'call',
-        additional_kwargs,
-      }),
-    ]);
+  ])(
+    'preserves %s invalidity when folding retained bytes',
+    (_, additional_kwargs) => {
+      const sourceProvenance = (additional_kwargs as { provenance?: unknown })
+        .provenance;
+      const result = foldToolBlocksForToollessAgent([
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'call', name: 'lookup', args: {}, type: 'tool_call' },
+          ],
+        }),
+        new ToolMessage({
+          content: 'untrusted tool bytes',
+          tool_call_id: 'call',
+          additional_kwargs,
+        }),
+      ]);
 
-    expect(result[0].additional_kwargs.provenance).toEqual({
-      version: 1,
-      parts: null,
-    });
-    expect(result[0].additional_kwargs.provenance).not.toBe(
-      sourceProvenance
-    );
-    expect(result[0].lc_kwargs.additional_kwargs).toBe(
-      result[0].additional_kwargs
-    );
-  });
+      expect(result[0].additional_kwargs.provenance).toEqual({
+        version: 1,
+        parts: null,
+      });
+      expect(result[0].additional_kwargs.provenance).not.toBe(sourceProvenance);
+      expect(result[0].lc_kwargs.additional_kwargs).toBe(
+        result[0].additional_kwargs
+      );
+    }
+  );
 
   test('folds historical tool content that precedes the last human turn (the reported bug)', () => {
     const messages = [
@@ -397,6 +456,436 @@ describe('foldToolBlocksForToollessAgent', () => {
 
     expect(hasResidualToolContent(result)).toBe(false);
     expect(result.map(getTextContent).join('\n')).toContain('Found roadmap.md');
+  });
+
+  test('folds Anthropic server-search blocks for a tool-less destination', () => {
+    const messages = [
+      new AIMessage({
+        content: toLangChainContent([
+          {
+            type: 'server_tool_use',
+            id: 'srvtoolu_1',
+            name: 'web_search',
+            input: { query: 'retained' },
+          },
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_1',
+            content: {
+              type: 'web_search_tool_result_error',
+              error_code: 'max_uses_exceeded',
+            },
+          },
+        ]),
+        tool_calls: [
+          {
+            id: 'srvtoolu_1',
+            name: 'web_search',
+            args: { query: 'retained' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(result).not.toBe(messages);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toBeInstanceOf(HumanMessage);
+    expect(isSyntheticProviderContextMessage(result[0])).toBe(true);
+    expect(getTextContent(result[0])).toContain('server_tool_use');
+    expect(getTextContent(result[0])).toContain('web_search_tool_result');
+    expect(getTextContent(result[0])).not.toContain('[tool_call]');
+  });
+
+  test('preserves authorship in mixed server-tool assistant turns', () => {
+    const messages = [
+      new AIMessage({
+        content: toLangChainContent([
+          { type: 'text', text: 'I found the answer.' },
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_1',
+            content: [],
+          },
+        ]),
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+    const text = getTextContent(folded);
+
+    expect(text).toContain('AI: I found the answer.');
+    expect(text).toContain('Tool: [web_search_tool_result]');
+    expect(text).not.toContain('Tool: I found the answer.');
+  });
+
+  test('folds standalone Google executable-code blocks', () => {
+    const messages = [
+      new AIMessage({
+        content: [
+          {
+            type: 'executableCode',
+            executableCode: { language: 'PYTHON', code: 'print(2 + 2)' },
+          },
+        ],
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(result).not.toBe(messages);
+    expect(getTextContent(result[0])).toContain('AI: [executableCode]');
+  });
+
+  test('folds oversized standard tool-result arrays', () => {
+    const content = Array.from({ length: 257 }, (_, index) => ({
+      type: 'text',
+      text: `result-${index}`,
+    }));
+    const messages = [
+      new HumanMessage({
+        content: [{ type: 'tool_result', tool_use_id: 'call-1', content }],
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(result).not.toBe(messages);
+    expect(result[0]).toBeInstanceOf(HumanMessage);
+    expect(isSyntheticProviderContextMessage(result[0])).toBe(true);
+  });
+
+  test('preserves native OpenAI server-tool turns without bound client tools', () => {
+    const messages = [
+      new AIMessage({
+        content: [
+          {
+            type: 'server_tool_call',
+            id: 'server-1',
+            name: 'code_interpreter',
+            args: { code: 'print(2 + 2)' },
+          },
+          {
+            type: 'server_tool_call_result',
+            toolCallId: 'server-1',
+            status: 'success',
+            output: { stdout: '4' },
+          },
+          { type: 'text', text: 'The result is 4.' },
+        ],
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages, undefined, true);
+
+    expect(result).toBe(messages);
+  });
+
+  test('folds authoritative Responses v0 output in source order', () => {
+    const messages = [
+      new AIMessage({
+        content: 'The calculation completed.',
+        response_metadata: {
+          model_provider: 'openai',
+          output: [
+            {
+              id: 'server-1',
+              type: 'code_interpreter_call',
+              status: 'completed',
+              code: 'print(2 + 2)',
+              outputs: [{ type: 'logs', logs: '4' }],
+            },
+            {
+              id: 'message-1',
+              type: 'message',
+              role: 'assistant',
+              content: [
+                {
+                  type: 'output_text',
+                  text: 'The calculation completed.',
+                },
+              ],
+            },
+            {
+              id: 'function-1',
+              type: 'function_call',
+              name: 'lookup',
+              arguments: '{}',
+            },
+          ],
+        },
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(result).not.toBe(messages);
+    expect(getTextContent(result[0])).toContain('server_tool_output');
+    expect(getTextContent(result[0])).toContain('code_interpreter_call');
+    expect(getTextContent(result[0])).toContain('The calculation completed.');
+    const text = getTextContent(result[0]);
+    expect(text).toContain('The calculation completed.');
+    expect(text).toContain('[tool_call] lookup({})');
+    expect(text.indexOf('code_interpreter_call')).toBeLessThan(
+      text.indexOf('The calculation completed.')
+    );
+    expect(text.indexOf('The calculation completed.')).toBeLessThan(
+      text.indexOf('[tool_call] lookup')
+    );
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model' },
+        { attribution: 'tool' },
+      ],
+    });
+  });
+
+  test('folds Responses custom tool calls from authoritative output', () => {
+    const messages = [
+      new AIMessage({
+        content: 'Running the custom tool.',
+        response_metadata: {
+          output: [
+            {
+              id: 'message-1',
+              type: 'message',
+              role: 'assistant',
+              content: [
+                { type: 'output_text', text: 'Running the custom tool.' },
+              ],
+            },
+            {
+              id: 'custom-1',
+              call_id: 'call-1',
+              type: 'custom_tool_call',
+              name: 'execute',
+              input: 'print(2 + 2)',
+            },
+          ],
+        },
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+    const text = getTextContent(folded);
+
+    expect(text).toContain('[tool_call] execute(');
+    expect(text).toContain('execute');
+    expect(text).toContain('print(2 + 2)');
+  });
+
+  test('folds streamed Responses MCP approval requests', () => {
+    const messages = [
+      new AIMessage({
+        content: [],
+        additional_kwargs: {
+          tool_outputs: [
+            {
+              id: 'approval-1',
+              type: 'mcp_approval_request',
+              name: 'delete_file',
+              arguments: '{"path":"draft.txt"}',
+            },
+          ],
+        },
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+
+    expect(getTextContent(folded)).toContain('mcp_approval_request');
+    expect(getTextContent(folded)).toContain('delete_file');
+  });
+
+  test('preserves generated images from ordered Responses output', () => {
+    const messages = [
+      new AIMessage({
+        content: [],
+        response_metadata: {
+          output: [
+            {
+              id: 'image-1',
+              type: 'image_generation_call',
+              status: 'completed',
+              result: 'base64ImageData',
+            },
+          ],
+        },
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+
+    expect(folded.content).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'image',
+          mimeType: 'image/png',
+          data: 'base64ImageData',
+          id: 'image-1',
+        }),
+      ])
+    );
+  });
+
+  test('caps ordered Responses function-call arguments per block', () => {
+    const messages = [
+      new AIMessage({
+        content: 'Done.',
+        response_metadata: {
+          output: [
+            { type: 'web_search_call', status: 'completed' },
+            {
+              type: 'function_call',
+              name: 'lookup',
+              arguments: 'x'.repeat(20_000),
+            },
+            {
+              type: 'message',
+              content: [{ type: 'output_text', text: 'Done.' }],
+            },
+          ],
+        },
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+    const text = getTextContent(folded);
+
+    expect(text).toContain('[tool_call] lookup(');
+    expect(text).toContain('Done.');
+    expect(text.length).toBeLessThan(10_000);
+  });
+
+  test('bounds nested ordered Responses message content', () => {
+    const messages = [
+      new AIMessage({
+        content: [],
+        response_metadata: {
+          output: [
+            {
+              type: 'message',
+              content: Array.from({ length: 100_005 }, () => ({
+                type: 'output_text',
+                text: '',
+              })),
+            },
+            { type: 'web_search_call', status: 'completed' },
+          ],
+        },
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+
+    expect(getTextContent(folded)).toContain(
+      'additional folded context omitted'
+    );
+  });
+
+  test('preserves parsed calls alongside Gemini executable code', () => {
+    const messages = [
+      new AIMessage({
+        content: [
+          {
+            type: 'executableCode',
+            executableCode: { language: 'PYTHON', code: 'print(2 + 2)' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'function-1',
+            name: 'lookup',
+            args: { query: 'roadmap' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+    const text = getTextContent(folded);
+
+    expect(text).toContain('[executableCode]');
+    expect(text).toContain('[tool_call] lookup({"query":"roadmap"})');
+  });
+
+  test.each([
+    'apply_patch_call_output',
+    'local_shell_call_output',
+    'mcp_list_tools',
+    'program_output',
+    'shell_call_output',
+    'tool_search_output',
+  ])('folds replayable Responses output type %s', (type) => {
+    const messages = [
+      new AIMessage({
+        content: [],
+        additional_kwargs: {
+          tool_outputs: [{ type, output: 'result', result: 'result' }],
+        },
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+
+    expect(getTextContent(folded)).toContain('server_tool_output');
+    expect(getTextContent(folded)).toContain(type);
+  });
+
+  test('preserves parsed calls alongside authoritative Responses output', () => {
+    const messages = [
+      new AIMessage({
+        content: [{ type: 'text', text: 'I will use both tools.' }],
+        tool_calls: [
+          {
+            id: 'function-1',
+            name: 'lookup',
+            args: { query: 'roadmap' },
+            type: 'tool_call',
+          },
+        ],
+        additional_kwargs: {
+          tool_outputs: [
+            {
+              id: 'server-1',
+              type: 'code_interpreter_call',
+              status: 'completed',
+              outputs: [{ type: 'logs', logs: '4' }],
+            },
+          ],
+        },
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+    const text = getTextContent(folded);
+
+    expect(text).toContain('server_tool_output');
+    expect(text).toContain('code_interpreter_call');
+    expect(text).toContain('[tool_call] lookup({"query":"roadmap"})');
+  });
+
+  test('preserves user authorship in mixed tool-result turns', () => {
+    const messages = [
+      new HumanMessage({
+        content: [
+          { type: 'tool_result', tool_use_id: 'call-1', content: 'result' },
+          { type: 'text', text: 'Please continue carefully.' },
+        ],
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+    const text = getTextContent(folded);
+
+    expect(text).toContain('Tool: [tool_result] result');
+    expect(text).toContain('User: Please continue carefully.');
+    expect(text).not.toContain('Tool: Please continue carefully.');
   });
 
   test('detects v1 standard-content tool_call blocks (no AIMessage.tool_calls)', () => {
@@ -662,44 +1151,40 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(foldedText).toContain('additional folded context omitted');
   });
 
-  test(
-    'folds a 150k-block tool result without call-argument spreading',
-    () => {
-      const blockCount = 150_000;
-      const repeatedBlock = { type: 'text', text: 'x' } as const;
-      const largeContent = new Array(blockCount).fill(repeatedBlock);
-      const toolMessage = new ToolMessage({
-        content: largeContent,
-        tool_call_id: 'large-result',
-        additional_kwargs: { sourceMessageId: 'large-tool-row' },
-      });
-      const messages = [
-        new HumanMessage('Run'),
-        new AIMessage({
-          content: '',
-          tool_calls: [
-            {
-              id: 'large-result',
-              name: 'query',
-              args: {},
-              type: 'tool_call',
-            },
-          ],
-        }),
-        toolMessage,
-      ];
+  test('folds a 150k-block tool result without call-argument spreading', () => {
+    const blockCount = 150_000;
+    const repeatedBlock = { type: 'text', text: 'x' } as const;
+    const largeContent = new Array(blockCount).fill(repeatedBlock);
+    const toolMessage = new ToolMessage({
+      content: largeContent,
+      tool_call_id: 'large-result',
+      additional_kwargs: { sourceMessageId: 'large-tool-row' },
+    });
+    const messages = [
+      new HumanMessage('Run'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'large-result',
+            name: 'query',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      toolMessage,
+    ];
 
-      const result = foldToolBlocksForToollessAgent(messages);
-      const folded = result.find(isSyntheticProviderContextMessage)!;
+    const result = foldToolBlocksForToollessAgent(messages);
+    const folded = result.find(isSyntheticProviderContextMessage)!;
 
-      expect(folded).toBeInstanceOf(HumanMessage);
-      expect(getTextContent(folded).length).toBeLessThanOrEqual(
-        HARD_MAX_TOOL_RESULT_CHARS
-      );
-      expect(toolMessage.content).toBe(largeContent);
-    },
-    30_000
-  );
+    expect(folded).toBeInstanceOf(HumanMessage);
+    expect(getTextContent(folded).length).toBeLessThanOrEqual(
+      HARD_MAX_TOOL_RESULT_CHARS
+    );
+    expect(toolMessage.content).toBe(largeContent);
+  }, 30_000);
 
   test('omits source rows whose bytes do not survive the shared fold cap', () => {
     const messages = [
@@ -966,10 +1451,7 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(folded.additional_kwargs.sourceMessageIds).toBeUndefined();
     expect(folded.additional_kwargs.provenance).toEqual({
       version: 1,
-      parts: [
-        { attribution: 'synthetic' },
-        { attribution: 'model' },
-      ],
+      parts: [{ attribution: 'synthetic' }, { attribution: 'model' }],
     });
   });
 

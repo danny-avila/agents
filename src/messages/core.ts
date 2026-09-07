@@ -11,6 +11,11 @@ import type { ContentBlock as LangChainContentBlock } from '@langchain/core/mess
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { ProviderMessageProvenancePart } from './provenance';
 import type * as t from '@/types';
+import type {
+  ResponsesReplayPosition,
+  ToolHistoryPreparation,
+  OrderedToolHistoryProjection,
+} from './toolHistoryProjection';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -34,6 +39,13 @@ import { stripAnthropicCacheControl } from './cache';
 import { isReasoningContentBlock } from './reasoningTypes';
 import { ContentTypes, Providers } from '@/common';
 import { toLangChainContent } from './langchain';
+import {
+  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
+  createToolHistoryPreparation,
+  getGeneratedImageMimeType,
+  getResponsesHistorySource,
+  isResponsesReplayPosition,
+} from './toolHistoryProjection';
 
 type ReasoningSummary = { summary?: Array<{ text?: string }> };
 type ReasoningDetail = { type?: string; text?: string };
@@ -836,19 +848,13 @@ function hasReplayableEncryptedReasoning(reasoning: unknown): boolean {
 
 type ResponsesReplayProjection = 'fallback' | 'native';
 
-export const OPENAI_RESPONSES_REPLAY_POSITIONS_KEY =
-  '__openai_responses_replay_positions__';
+export { OPENAI_RESPONSES_REPLAY_POSITIONS_KEY } from './toolHistoryProjection';
 
 /** Reasoning item currently streaming, so a terminal ciphertext seals against its own id. */
 export const OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY =
   '__openai_responses_active_reasoning_id__';
 
-export type ResponsesReplayPosition = {
-  contentIndex?: number;
-  itemId: string;
-  kind: 'message' | 'output' | 'reasoning' | 'text';
-  outputIndex: number;
-};
+export type { ResponsesReplayPosition } from './toolHistoryProjection';
 
 type CompletedGeneratedImages = {
   blocks: PositionedResponsesReplayBlock[];
@@ -1277,56 +1283,7 @@ function projectPreemptedResponsesV1Content(
 }
 
 function getAuthoritativeResponsesOutput(message: AIMessage): unknown[] {
-  const responseOutput = message.response_metadata.output;
-  const toolOutputs = message.additional_kwargs.tool_outputs;
-  if (Array.isArray(responseOutput) && responseOutput.length > 0) {
-    return responseOutput;
-  }
-  return Array.isArray(toolOutputs) ? toolOutputs : [];
-}
-
-function isResponsesReplayPosition(
-  value: unknown
-): value is ResponsesReplayPosition {
-  if (value == null || typeof value !== 'object') {
-    return false;
-  }
-  const position = value as Partial<ResponsesReplayPosition>;
-  return (
-    (position.kind === 'message' ||
-      position.kind === 'output' ||
-      position.kind === 'reasoning' ||
-      position.kind === 'text') &&
-    typeof position.itemId === 'string' &&
-    position.itemId.length > 0 &&
-    typeof position.outputIndex === 'number' &&
-    Number.isSafeInteger(position.outputIndex) &&
-    position.outputIndex >= 0 &&
-    (position.contentIndex == null ||
-      (typeof position.contentIndex === 'number' &&
-        Number.isSafeInteger(position.contentIndex) &&
-        position.contentIndex >= 0))
-  );
-}
-
-function getGeneratedImageMimeType(data: string): string {
-  const bytes = Buffer.from(data.slice(0, 16), 'base64');
-  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-    return 'image/jpeg';
-  }
-  if (
-    bytes[0] === 0x52 &&
-    bytes[1] === 0x49 &&
-    bytes[2] === 0x46 &&
-    bytes[3] === 0x46 &&
-    bytes[8] === 0x57 &&
-    bytes[9] === 0x45 &&
-    bytes[10] === 0x42 &&
-    bytes[11] === 0x50
-  ) {
-    return 'image/webp';
-  }
-  return 'image/png';
+  return getResponsesHistorySource(message)?.items ?? [];
 }
 
 function getResponsesReplayItemKey(
@@ -1362,7 +1319,8 @@ function getResponsesReplayArtifacts(
   output: readonly unknown[],
   maxChars: number,
   replayProjection: ResponsesReplayProjection,
-  replayPositionValue?: unknown
+  replayPositionValue?: unknown,
+  history?: OrderedToolHistoryProjection
 ): ResponsesReplayArtifacts {
   const blocks: PositionedResponsesReplayBlock[] = [];
   const data = new Set<string>();
@@ -1421,7 +1379,11 @@ function getResponsesReplayArtifacts(
       kind: 'message',
       outputIndex,
     });
-    if (!('content' in item) || !Array.isArray(item.content)) {
+    if (
+      history != null ||
+      !('content' in item) ||
+      !Array.isArray(item.content)
+    ) {
       continue;
     }
     for (
@@ -1451,6 +1413,24 @@ function getResponsesReplayArtifacts(
         kind: 'text',
         outputIndex,
       });
+    }
+  }
+  if (history?.source.coverage === 'complete-output') {
+    for (const contribution of history.contributions) {
+      if (contribution.kind !== 'text') {
+        continue;
+      }
+      const itemId =
+        contribution.itemId ?? `message-${contribution.outputIndex}`;
+      textPositionsByKey.set(
+        `${itemId}:${contribution.outputIndex}:${contribution.contentIndex ?? 0}`,
+        {
+          itemId,
+          kind: 'text',
+          outputIndex: contribution.outputIndex,
+          contentIndex: contribution.contentIndex,
+        }
+      );
     }
   }
   if (hasAuthoritativeMessage) {
@@ -1898,7 +1878,8 @@ function isPreemptedOpenAIResponsesMessage(message: AIMessage): boolean {
 function projectPreemptedOpenAIResponsesMessage(
   message: AIMessage,
   maxChars: number,
-  replayProjection: ResponsesReplayProjection
+  replayProjection: ResponsesReplayProjection,
+  preparation: ToolHistoryPreparation = createToolHistoryPreparation()
 ): AIMessage {
   if (!isPreemptedOpenAIResponsesMessage(message)) {
     return message;
@@ -1909,7 +1890,9 @@ function projectPreemptedOpenAIResponsesMessage(
   const retainsEncryptedReasoning =
     replayProjection === 'native' &&
     hasReplayableEncryptedReasoning(additionalKwargs.reasoning);
-  const authoritativeOutput = getAuthoritativeResponsesOutput(message);
+  const history = preparation.get(message);
+  const authoritativeOutput =
+    history?.source.items ?? getAuthoritativeResponsesOutput(message);
   const {
     generatedImages,
     messagePositions,
@@ -1921,7 +1904,8 @@ function projectPreemptedOpenAIResponsesMessage(
     authoritativeOutput,
     maxChars,
     replayProjection,
-    additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
+    additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY],
+    history
   );
   const reasoningItemId =
     retainsEncryptedReasoning &&
@@ -2023,7 +2007,8 @@ function projectPreemptedOpenAIResponsesMessage(
 export function projectToolStreamContentForProvider(
   messages: BaseMessage[],
   responsesReplayProjection?: ResponsesReplayProjection,
-  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS,
+  preparation: ToolHistoryPreparation = createToolHistoryPreparation()
 ): BaseMessage[] {
   let projected: BaseMessage[] | undefined;
   for (let i = 0; i < messages.length; i++) {
@@ -2039,7 +2024,8 @@ export function projectToolStreamContentForProvider(
       const replaySafeMessage = projectPreemptedOpenAIResponsesMessage(
         assistantMessage,
         maxChars,
-        responsesReplayProjection
+        responsesReplayProjection,
+        preparation
       );
       if (replaySafeMessage !== assistantMessage) {
         projected ??= [...messages];
@@ -2778,14 +2764,18 @@ export function findLastIndex<T>(
 function readOwnDataProperty(target: object, key: PropertyKey): unknown {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(target, key);
-    return descriptor != null && 'value' in descriptor ? descriptor.value : undefined;
+    return descriptor != null && 'value' in descriptor
+      ? descriptor.value
+      : undefined;
   } catch {
     return undefined;
   }
 }
 
 /** Whether message content carries non-whitespace text in any text block. */
-export function hasNonEmptyTextContent(content: BaseMessage['content']): boolean {
+export function hasNonEmptyTextContent(
+  content: BaseMessage['content']
+): boolean {
   if (typeof content === 'string') {
     return content.trim() !== '';
   }
