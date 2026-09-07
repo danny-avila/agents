@@ -432,6 +432,46 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(getTextContent(result[0])).toContain('web_search_tool_result');
   });
 
+  test('preserves authorship in mixed server-tool assistant turns', () => {
+    const messages = [
+      new AIMessage({
+        content: toLangChainContent([
+          { type: 'text', text: 'I found the answer.' },
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_1',
+            content: [],
+          },
+        ]),
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+    const text = getTextContent(folded);
+
+    expect(text).toContain('AI: I found the answer.');
+    expect(text).toContain('Tool: [web_search_tool_result]');
+    expect(text).not.toContain('Tool: I found the answer.');
+  });
+
+  test('folds standalone Google executable-code blocks', () => {
+    const messages = [
+      new AIMessage({
+        content: [
+          {
+            type: 'executableCode',
+            executableCode: { language: 'PYTHON', code: 'print(2 + 2)' },
+          },
+        ],
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(result).not.toBe(messages);
+    expect(getTextContent(result[0])).toContain('AI: [executableCode]');
+  });
+
   test('detects v1 standard-content tool_call blocks (no AIMessage.tool_calls)', () => {
     const messages = [
       new HumanMessage('Search'),

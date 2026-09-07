@@ -44,6 +44,7 @@ import {
   getProviderToolCallPartDescriptor,
   getProviderToolResultPartDescriptor,
   hasStructurallyValidAnthropicWebSearchResultContent,
+  isExecutableCodePart,
 } from './toolResultTypes';
 import {
   hasBijectiveProviderContentPartMapping,
@@ -3827,6 +3828,8 @@ function appendMessageContent(
     const blockTypeValue = readFoldedDataProperty(block, 'type');
     const blockType =
       typeof blockTypeValue === 'string' ? blockTypeValue : undefined;
+    const blockRole =
+      getProviderToolResultPartDescriptor(block) != null ? 'Tool' : role;
 
     if (
       blockType !== 'tool_use' &&
@@ -3838,7 +3841,7 @@ function appendMessageContent(
         const blockChars = getToolContentCharLength([block]);
         if (blockChars > budget.remainingChars) {
           appendFoldedLine(textChunks, budget, [
-            `${role}: [${blockType ?? 'media'} omitted: folded context limit]`,
+            `${blockRole}: [${blockType ?? 'media'} omitted: folded context limit]`,
           ]);
           markBlockRetained();
           continue;
@@ -3848,7 +3851,7 @@ function appendMessageContent(
         budget.remainingChars -= blockChars;
       } else {
         appendFoldedLine(textChunks, budget, [
-          `${role}: [${blockType ?? 'media'}] `,
+          `${blockRole}: [${blockType ?? 'media'}] `,
           serializeFoldedValue(block),
         ]);
       }
@@ -3915,7 +3918,7 @@ function appendMessageContent(
       if (typeof inner === 'string') {
         if (inner) {
           appendFoldedLine(textChunks, budget, [
-            `${role}: [tool_result] `,
+            'Tool: [tool_result] ',
             inner,
           ]);
         }
@@ -3929,7 +3932,7 @@ function appendMessageContent(
           if (typeof innerBlock === 'string') {
             if (innerBlock) {
               appendFoldedLine(textChunks, budget, [
-                `${role}: [tool_result] `,
+                'Tool: [tool_result] ',
                 innerBlock,
               ]);
             }
@@ -3948,7 +3951,7 @@ function appendMessageContent(
                 budget.remainingChars -= blockChars;
               } else {
                 appendFoldedLine(textChunks, budget, [
-                  `${role}: [${innerType ?? 'media'} omitted: folded context limit]`,
+                  `Tool: [${innerType ?? 'media'} omitted: folded context limit]`,
                 ]);
               }
             } else {
@@ -3956,7 +3959,7 @@ function appendMessageContent(
               const inputValue = readFoldedDataProperty(innerBlock, 'input');
               const innerText = textValue ?? inputValue;
               appendFoldedLine(textChunks, budget, [
-                `${role}: [tool_result] `,
+                'Tool: [tool_result] ',
                 typeof innerText === 'string' && innerText
                   ? innerText
                   : serializeFoldedValue(innerBlock),
@@ -3966,7 +3969,7 @@ function appendMessageContent(
         }
       } else if (inner != null) {
         appendFoldedLine(textChunks, budget, [
-          `${role}: [tool_result] `,
+          'Tool: [tool_result] ',
           serializeFoldedValue(inner),
         ]);
       }
@@ -3986,7 +3989,7 @@ function appendMessageContent(
     // Fallback: serialize unrecognized block types to preserve context
     if (blockType != null && blockType !== '') {
       appendFoldedLine(textChunks, budget, [
-        `${role}: [${blockType}] `,
+        `${blockRole}: [${blockType}] `,
         serializeFoldedValue(block),
       ]);
     }
@@ -4317,6 +4320,7 @@ function messageHasToolContent(msg: BaseMessage): boolean {
         typeof block === 'object' &&
         (getProviderToolCallPartDescriptor(block) != null ||
           getProviderToolResultPartDescriptor(block) != null ||
+          isExecutableCodePart(block) ||
           readFoldedDataProperty(block, 'tool_call') != null)
       ) {
         return true;
@@ -4343,6 +4347,20 @@ function isToolResultMessage(msg: BaseMessage): boolean {
     );
   }
   return false;
+}
+
+function getFoldedMessageRole(msg: BaseMessage): 'AI' | 'Tool' {
+  if (isToolMessage(msg)) {
+    return 'Tool';
+  }
+  if (
+    msg instanceof AIMessage ||
+    msg instanceof AIMessageChunk ||
+    ('role' in msg && msg.role === 'assistant')
+  ) {
+    return 'AI';
+  }
+  return isToolResultMessage(msg) ? 'Tool' : 'AI';
 }
 
 /**
@@ -4393,7 +4411,7 @@ export function foldToolBlocksForToollessAgent(
     appendFoldedLine(textChunks, foldBudget, ['[Previous tool interaction]']);
     const initialSource = appendMessageContent(
       msg,
-      isToolResultMessage(msg) ? 'Tool' : 'AI',
+      getFoldedMessageRole(msg),
       textChunks,
       parts,
       foldBudget
@@ -4407,7 +4425,7 @@ export function foldToolBlocksForToollessAgent(
     while (j < messages.length && isToolResultMessage(messages[j])) {
       const toolSource = appendMessageContent(
         messages[j],
-        'Tool',
+        getFoldedMessageRole(messages[j]),
         textChunks,
         parts,
         foldBudget
