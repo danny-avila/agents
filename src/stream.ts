@@ -1014,18 +1014,6 @@ function pruneEagerToolCallChunkStates(args: {
   }
 }
 
-function isEagerToolChunkStateComplete(
-  state: t.EagerEventToolCallChunkState
-): boolean {
-  return (
-    state.id != null &&
-    state.id !== '' &&
-    state.name != null &&
-    state.name !== '' &&
-    coerceRecordArgs(state.argsText) != null
-  );
-}
-
 function mergeToolCallArgsText(existing: string, incoming: string): string {
   if (incoming === '') {
     return existing;
@@ -1180,6 +1168,7 @@ function getStreamedReadyToolCalls(args: {
     key: string;
     state: t.EagerEventToolCallChunkState;
     sealedByAdapter: boolean;
+    parsedArgs: ToolCall['args'];
   }> = [];
 
   for (const [key, state] of graph.eagerEventToolCallChunks) {
@@ -1190,7 +1179,12 @@ function getStreamedReadyToolCalls(args: {
       graph.eagerEventToolCallChunks.delete(key);
       continue;
     }
-    if (!isEagerToolChunkStateComplete(state)) {
+    if (
+      state.id == null ||
+      state.id === '' ||
+      state.name == null ||
+      state.name === ''
+    ) {
       continue;
     }
     const isSealedByLaterChunk =
@@ -1209,10 +1203,15 @@ function getStreamedReadyToolCalls(args: {
       isSealedByLaterChunk ||
       isSealedExplicitly
     ) {
+      const parsedArgs = coerceRecordArgs(state.argsText);
+      if (parsedArgs == null) {
+        continue;
+      }
       readyEntries.push({
         key,
         state,
         sealedByAdapter: isSealedExplicitly || seal?.kind === 'all',
+        parsedArgs,
       });
     }
   }
@@ -1232,11 +1231,7 @@ function getStreamedReadyToolCalls(args: {
 
   return readyEntries
     .sort((left, right) => (left.state.index ?? 0) - (right.state.index ?? 0))
-    .flatMap(({ state, sealedByAdapter }) => {
-      const args = coerceRecordArgs(state.argsText);
-      if (args == null) {
-        return [];
-      }
+    .flatMap(({ state, sealedByAdapter, parsedArgs }) => {
       // The final request's args come from LangChain's canonical verbatim
       // concatenation of fragments, while `argsText` reconciles provider
       // quirks with lossy heuristics that can also swallow legitimately
@@ -1267,7 +1262,7 @@ function getStreamedReadyToolCalls(args: {
         {
           id: state.id,
           name: state.name ?? '',
-          args,
+          args: parsedArgs,
         },
       ];
     });

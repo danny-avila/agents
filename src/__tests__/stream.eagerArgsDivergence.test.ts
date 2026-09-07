@@ -47,6 +47,7 @@ import { ChatModelStreamHandler } from '@/stream';
 import { ToolNode } from '@/tools/ToolNode';
 import { HandlerRegistry } from '@/events';
 import * as events from '@/utils/events';
+import * as eagerArgs from '@/tools/eagerEventExecution';
 
 function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
   const runSteps = new Map<string, t.RunStep>();
@@ -135,7 +136,7 @@ function createDummyTool(name: string): StructuredToolInterface {
 
 function installToolExecuteResponder(): {
   toolExecuteCalls: t.ToolExecuteBatchRequest[];
-  } {
+} {
   const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
   jest
     .spyOn(events, 'safeDispatchCustomEvent')
@@ -259,6 +260,93 @@ function canonicalToolCall(
 }
 
 describe('eager args divergence (LibreChat#14371)', () => {
+  it('defers readiness parsing until a seal and reuses the parsed request', async () => {
+    const graph = createGraph();
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const parse = jest.spyOn(eagerArgs, 'coerceRecordArgs');
+    await streamChunks({
+      handler,
+      graph,
+      metadata,
+      toolCallChunks: toToolCallChunks('call_1', 'db_query', [
+        '{"sql":',
+        '"select 1"}',
+      ]),
+    });
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(parse).not.toHaveBeenCalled();
+    await streamNextToolIndex({ handler, graph, metadata, callId: 'call_2' });
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls[0].args).toEqual({ sql: 'select 1' });
+    expect(
+      parse.mock.calls.filter(([value]) => typeof value === 'string')
+    ).toEqual([['{"sql":"select 1"}']]);
+  });
+
+  const benchmark = process.env.BENCH_EAGER_READINESS === '1' ? it : it.skip;
+  benchmark(
+    'benchmarks tool stream handling with deterministic arguments',
+    async () => {
+      installToolExecuteResponder();
+      for (const size of [128, 8192, 49152]) {
+        const payload = JSON.stringify({
+          sql: Array.from(
+            { length: Math.ceil(size / 16) },
+            (_, i) => `column_${i.toString(16).padStart(8, '0')} `
+          )
+            .join('')
+            .slice(0, size),
+        });
+        for (const chunkSize of [64, 256]) {
+          const fragments: string[] = [];
+          for (let i = 0; i < payload.length; i += chunkSize) {
+            fragments.push(payload.slice(i, i + chunkSize));
+          }
+          const samples: number[] = [];
+          const cpuSamples: number[] = [];
+          for (let round = 0; round < 9; round++) {
+            const graph = createGraph();
+            const handler = new ChatModelStreamHandler();
+            const metadata = { langgraph_node: 'agent' };
+            const chunks = toToolCallChunks('call_1', 'db_query', fragments);
+            const cpuStart = process.cpuUsage();
+            const start = performance.now();
+            await streamChunks({
+              handler,
+              graph,
+              metadata,
+              toolCallChunks: chunks,
+            });
+            await streamNextToolIndex({
+              handler,
+              graph,
+              metadata,
+              callId: 'call_2',
+            });
+            const elapsed = performance.now() - start;
+            const cpu = process.cpuUsage(cpuStart);
+            if (round >= 2) {
+              samples.push(elapsed);
+              cpuSamples.push((cpu.user + cpu.system) / 1000);
+            }
+            expect(graph.eagerEventToolExecutions.has('call_1')).toBe(true);
+            jest.clearAllMocks();
+          }
+          process.stdout.write(
+            JSON.stringify({
+              size,
+              chunkSize,
+              elapsedMs: samples.sort((a, b) => a - b)[3],
+              cpuMs: cpuSamples.sort((a, b) => a - b)[3],
+            }) + '\n'
+          );
+        }
+      }
+    }
+  );
+
   afterEach(() => {
     jest.restoreAllMocks();
   });
@@ -511,7 +599,9 @@ describe('eager args divergence (LibreChat#14371)', () => {
       {
         chunk: {
           content: '',
-          tool_calls: [{ id: 'call_1', name: 'db_query', args: { sql: 'SELECT 1;' } }],
+          tool_calls: [
+            { id: 'call_1', name: 'db_query', args: { sql: 'SELECT 1;' } },
+          ],
           response_metadata: { finish_reason: 'tool_calls' },
         } as unknown as t.StreamChunk,
       },
