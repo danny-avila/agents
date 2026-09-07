@@ -1520,6 +1520,7 @@ export class MultiAgentGraph extends StandardGraph {
         } else {
           result = await agentSubgraph.invoke(state, memberConfig);
         }
+        result = this.propagateManualCompaction(result);
 
         if (this.resultAgentId === agentId) {
           result = {

@@ -169,8 +169,8 @@ import {
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
+import { createRemoveAllMessage, messagesStateReducer  } from '@/messages/reducer';
 import { getTruncationStopReason } from '@/llm/truncation';
-import { messagesStateReducer } from '@/messages/reducer';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -1585,7 +1585,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.agentContexts.set(agentConfig.agentId, agentContext);
     }
 
-    this.defaultAgentId = agents[0].agentId;
+    /** The run's agent: root trace identity and Langfuse routing follow it,
+     *  so a summarize-only run is attributed to the agent that summarizes. */
+    this.defaultAgentId = this.summarizeOnlyAgentId ?? agents[0].agentId;
+  }
+
+  /**
+   * A compaction applies its remove-all inside the agent subgraph, so the
+   * subgraph's result carries only the retained tail, and an outer reducer
+   * would merge that tail back into the history it already holds. Re-issuing
+   * the remove-all across the boundary keeps a checkpointed outer state as
+   * compacted as the subgraph's. A run that produced no summary changed
+   * nothing and passes through.
+   */
+  protected propagateManualCompaction<
+    S extends { messages: BaseMessage[]; manualSummary?: string },
+  >(result: S): S {
+    if (
+      this.summarizeOnlyAgentId == null ||
+      result.manualSummary == null ||
+      result.manualSummary.length === 0
+    ) {
+      return result;
+    }
+    return { ...result, messages: [createRemoveAllMessage(), ...result.messages] };
   }
 
   /** Rotates the Langfuse identities that must never cross fresh executions. */
@@ -5534,13 +5557,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }),
       runStepState: this.createRunStepStateAnnotation(),
     });
+    const compactingAgentNode = async (
+      state: t.AgentSubgraphState,
+      config?: RunnableConfig
+    ): Promise<Partial<t.AgentSubgraphState>> =>
+      this.propagateManualCompaction(await agentNode.invoke(state, config));
     const workflow = new StateGraph(StateAnnotation)
       .addNode(
         this.defaultAgentId,
-        agentNode as Runnable<
-          t.AgentSubgraphState,
-          Partial<t.AgentSubgraphState>
-        >,
+        this.summarizeOnlyAgentId != null
+          ? compactingAgentNode
+          : (agentNode as Runnable<
+              t.AgentSubgraphState,
+              Partial<t.AgentSubgraphState>
+            >),
         { ends: [END] }
       )
       .addEdge(START, this.defaultAgentId);

@@ -11,6 +11,7 @@ import type {
   HookCallback,
   PreCompactHookInput,
   PreCompactHookOutput,
+  StopHookOutput,
 } from '@/hooks/types';
 import type * as t from '@/types';
 import { ManualSummarizationSkippedError } from '@/summarization';
@@ -351,6 +352,8 @@ describe('summarize-only runs', () => {
       expect(harness.completions).toHaveLength(1);
       expect(harness.completions[0].agentId).toBe('second');
       expect(harness.agentModel.calls).toHaveLength(0);
+      /** Root trace identity and Langfuse routing follow the run's agent. */
+      expect(harness.run.Graph?.defaultAgentId).toBe('second');
     } finally {
       harness.restore();
     }
@@ -398,14 +401,26 @@ describe('summarize-only runs', () => {
     /** The state channel outlives the run on a checkpointed thread, and a
      *  later ordinary run or a failed compaction must not report it. */
     const checkpointer = new MemorySaver();
-    const summaryOf = async (): Promise<string | undefined> => {
+    const channelsOf = async (): Promise<{
+      manualSummary?: string;
+      messages?: BaseMessage[];
+    }> => {
       const tuple = await checkpointer.getTuple(streamConfig);
-      return tuple?.checkpoint.channel_values.manualSummary as string | undefined;
+      return (tuple?.checkpoint.channel_values ?? {}) as {
+        manualSummary?: string;
+        messages?: BaseMessage[];
+      };
     };
+    const summaryOf = async (): Promise<string | undefined> =>
+      (await channelsOf()).manualSummary;
     const compaction = await createHarness({ runId: 'summarize-only-ckpt-a', checkpointer });
     try {
       await compaction.run.processStream({ messages: buildHistory(2) }, streamConfig);
-      expect(await summaryOf()).toBe('CHECKPOINT: everything so far');
+      const channels = await channelsOf();
+      expect(channels.manualSummary).toBe('CHECKPOINT: everything so far');
+      /** The outer state is as compacted as the subgraph's: the remove-all
+       *  crossed the node boundary instead of merging the tail back. */
+      expect(channels.messages).toHaveLength(0);
     } finally {
       compaction.restore();
     }
@@ -421,6 +436,8 @@ describe('summarize-only runs', () => {
         streamConfig
       );
       expect(ordinary.agentModel.calls).toHaveLength(1);
+      /** The model sees the compacted thread, not the summarized head. */
+      expect(ordinary.agentModel.calls[0]).toHaveLength(1);
       expect(await summaryOf()).toBe('');
     } finally {
       ordinary.restore();
@@ -437,6 +454,30 @@ describe('summarize-only runs', () => {
       expect(await summaryOf()).toBe('');
     } finally {
       failing.restore();
+    }
+  });
+
+  it('admits no stop continuation once the summary exists', async () => {
+    /** A blocking Stop hook would otherwise start another graph segment,
+     *  which has no claim left to spend and ends without a model call,
+     *  until the continuation budget turns the compaction into an error. */
+    const hooks = new HookRegistry();
+    let stops = 0;
+    const hook: HookCallback<'Stop'> = async (): Promise<StopHookOutput> => {
+      stops += 1;
+      return { decision: 'block', additionalContext: 'Answer the user now.' };
+    };
+    hooks.register('Stop', { hooks: [hook] });
+    const harness = await createHarness({ runId: 'summarize-only-stop-hook', hooks });
+    try {
+      await harness.run.processStream({ messages: buildHistory(2) }, streamConfig);
+
+      expect(stops).toBe(1);
+      expect(harness.summarizer.calls).toHaveLength(1);
+      expect(harness.completions).toHaveLength(1);
+      expect(harness.agentModel.calls).toHaveLength(0);
+    } finally {
+      harness.restore();
     }
   });
 
