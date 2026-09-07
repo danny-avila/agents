@@ -41,6 +41,14 @@ import type * as t from '@/types';
 import { Constants, Providers as providers, GraphEvents } from '@/common';
 import { getProviderMessageProvenance } from '@/messages/provenance';
 import { getRunStepResumeState } from '@/tools/runStepResume';
+import {
+  TOOL_APPROVAL_REVIEW_CONFIG_KEY,
+  createToolApprovalReviewEvidence,
+} from '@/hitl/approvalReview';
+import {
+  SUBAGENT_REPLAY_CONTROLLER,
+  type ReplayableSubagentTool,
+} from '@/tools/subagent/SubagentReplay';
 import { HookRegistry, createToolPolicyHook } from '@/hooks';
 import * as events from '@/utils/events';
 import { askUserQuestion } from '@/hitl';
@@ -3530,6 +3538,177 @@ describe('Codex review fixes', () => {
 
     expect(hookCalls).toBe(2);
     expect(executedCommands).toEqual([]);
+  });
+
+  it.each([
+    { label: 'event-dispatched', direct: false },
+    { label: 'direct', direct: true },
+  ])(
+    'Run.resume honors a reviewed rejection for a $label tool after its hook registry is removed',
+    async ({ direct }) => {
+      let executions = 0;
+      const echoTool = tool(
+        async (): Promise<string> => {
+          executions += 1;
+          return 'ran';
+        },
+        {
+          name: 'echo',
+          description: 'test tool',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+      if (!direct) {
+        jest
+          .spyOn(events, 'safeDispatchCustomEvent')
+          .mockImplementation(async (event, data) => {
+            if (event !== 'on_tool_execute') {
+              return;
+            }
+            executions += 1;
+            const request = data as {
+              toolCalls: t.ToolCallRequest[];
+              resolve: (results: t.ToolExecuteResult[]) => void;
+            };
+            request.resolve(
+              request.toolCalls.map((call) => ({
+                toolCallId: call.id,
+                content: 'ran',
+                status: 'success' as const,
+              }))
+            );
+          });
+      }
+
+      let hookCalls = 0;
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => {
+            hookCalls += 1;
+            return { decision: 'ask', reason: 'review this command' };
+          },
+        ],
+      });
+      const node = new ToolNode({
+        tools: [echoTool],
+        eventDrivenMode: true,
+        ...(direct ? { directToolNames: new Set(['echo']) } : {}),
+        agentId: 'a',
+        toolCallStepIds: new Map([['call_1', 'step_1']]),
+        hookRegistry: registry,
+        humanInTheLoop: { enabled: true },
+      });
+      const graph = buildHITLGraph(node, [
+        { id: 'call_1', name: 'echo', args: { command: 'reviewed' } },
+      ]);
+      const { Run } = await import('@/run');
+      const run = await Run.create<t.IState>({
+        runId: `removed-hook-registry-${direct ? 'direct' : 'event'}`,
+        graphConfig: {
+          type: 'standard',
+          agents: [
+            {
+              agentId: 'a',
+              provider: providers.OPENAI,
+              clientOptions: {
+                modelName: 'gpt-4o-mini',
+                apiKey: 'test-key',
+              },
+              instructions: 'noop',
+              maxContextTokens: 8000,
+            },
+          ],
+        },
+        hooks: registry,
+        humanInTheLoop: { enabled: true },
+      });
+      run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+      const config = {
+        configurable: {
+          thread_id: `removed-hook-registry-${direct ? 'direct' : 'event'}`,
+        },
+        version: 'v2' as const,
+      };
+
+      await run.processStream({ messages: [] }, config);
+      expect(run.getInterrupt()?.payload).toMatchObject({
+        type: 'tool_approval',
+      });
+      (node as unknown as { hookRegistry?: HookRegistry }).hookRegistry =
+        undefined;
+
+      await run.resume([{ type: 'reject', reason: 'not approved' }], config);
+
+      expect(hookCalls).toBe(1);
+      expect(executions).toBe(0);
+    }
+  );
+
+  it('forwards review evidence only through the trusted built-in subagent hop', async () => {
+    const receivedConfigurables: Array<Record<string, unknown> | undefined> = [];
+    const subagentTool = tool(
+      async (_input, config): Promise<string> => {
+        receivedConfigurables.push(config.configurable);
+        return 'child result';
+      },
+      {
+        name: Constants.SUBAGENT,
+        description: 'execute a child agent',
+        schema: z.object({
+          description: z.string(),
+          subagent_type: z.string(),
+        }),
+      }
+    ) as unknown as StructuredToolInterface & ReplayableSubagentTool;
+    subagentTool[SUBAGENT_REPLAY_CONTROLLER] = {
+      getSettledOutput: async () => undefined,
+      persistSettledOutput: async () => undefined,
+    };
+    const node = new ToolNode({
+      tools: [subagentTool],
+      directToolNames: new Set([Constants.SUBAGENT]),
+    });
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'parent_call',
+        name: Constants.SUBAGENT,
+        args: { description: 'inspect logs', subagent_type: 'researcher' },
+      },
+    ]);
+    const reviewEvidence = createToolApprovalReviewEvidence('interrupt_1', {
+      type: 'tool_approval',
+      action_requests: [
+        {
+          tool_call_id: 'child_call',
+          name: 'bash',
+          arguments: { command: 'git status' },
+        },
+      ],
+      review_configs: [
+        {
+          tool_call_id: 'child_call',
+          action_name: 'bash',
+          allowed_decisions: ['approve', 'reject'],
+        },
+      ],
+    });
+    expect(reviewEvidence).toBeDefined();
+
+    await graph.invoke(
+      { messages: [] },
+      {
+        configurable: {
+          thread_id: 'nested-review-evidence',
+          [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: reviewEvidence,
+        },
+      }
+    );
+
+    expect(receivedConfigurables).toHaveLength(1);
+    expect(receivedConfigurables[0]?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY]).toBe(
+      reviewEvidence
+    );
   });
 
   it('captures interrupt even when payload is null (custom node calling interrupt(null))', async () => {

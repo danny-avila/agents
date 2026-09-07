@@ -24,11 +24,53 @@ export interface ReviewedToolApproval {
   reviewConfig: ToolApprovalReviewConfig;
 }
 
+const APPROVAL_DECISIONS = new Set(['approve', 'reject', 'edit', 'respond']);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
 function hasValidApprovalShape(payload: ToolApprovalInterruptPayload): boolean {
-  return (
-    Array.isArray(payload.action_requests) &&
-    Array.isArray(payload.review_configs)
-  );
+  if (
+    !Array.isArray(payload.action_requests) ||
+    !Array.isArray(payload.review_configs) ||
+    payload.action_requests.length !== payload.review_configs.length
+  ) {
+    return false;
+  }
+
+  const toolCallIds = new Set<string>();
+  return payload.action_requests.every((request, index) => {
+    const reviewConfig = payload.review_configs[index];
+    if (!isRecord(request) || !isRecord(reviewConfig)) {
+      return false;
+    }
+    const toolCallId = request.tool_call_id;
+    const toolName = request.name;
+    const allowedDecisions = reviewConfig.allowed_decisions;
+    if (
+      typeof toolCallId !== 'string' ||
+      toolCallId.length === 0 ||
+      toolCallIds.has(toolCallId) ||
+      typeof toolName !== 'string' ||
+      toolName.length === 0 ||
+      !isRecord(request.arguments) ||
+      (request.description != null &&
+        typeof request.description !== 'string') ||
+      reviewConfig.tool_call_id !== toolCallId ||
+      reviewConfig.action_name !== toolName ||
+      !Array.isArray(allowedDecisions) ||
+      allowedDecisions.length === 0 ||
+      !allowedDecisions.every(
+        (decision) =>
+          typeof decision === 'string' && APPROVAL_DECISIONS.has(decision)
+      )
+    ) {
+      return false;
+    }
+    toolCallIds.add(toolCallId);
+    return true;
+  });
 }
 
 /** Build trusted review evidence from the interrupt restored by `Run`. */
