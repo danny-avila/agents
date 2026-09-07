@@ -34,13 +34,13 @@ import type {
   UserPromptSubmitHookOutput,
 } from '@/hooks';
 import type * as t from '@/types';
+import type { ReplayableSubagentTool } from '@/tools/subagent/SubagentReplay';
 import {
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
   createToolApprovalReviewEvidence,
 } from '@/hitl/approvalReview';
 import {
   SUBAGENT_REPLAY_CONTROLLER,
-  type ReplayableSubagentTool,
 } from '@/tools/subagent/SubagentReplay';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { Constants, Providers as providers, GraphEvents } from '@/common';
@@ -3502,8 +3502,9 @@ describe('Codex review fixes', () => {
   });
 
   it.each([
-    { fresh: false, mutate: false }, { fresh: true, mutate: false }, { fresh: true, mutate: true },
-  ])('reuses a settled direct sibling when a later event tool interrupts (fresh=$fresh, mutate=$mutate)', async ({ fresh, mutate }) => {
+    { fresh: false, mutate: false, append: false }, { fresh: true, mutate: false, append: false }, { fresh: true, mutate: true, append: false },
+    { fresh: true, mutate: false, append: true },
+  ])('reuses a settled direct sibling when a later event tool interrupts (fresh=$fresh, mutate=$mutate, append=$append)', async ({ fresh, mutate, append }) => {
     let directExecutions = 0;
     const completedCallIds: string[] = [];
     const dispatchedEventNames: string[] = [];
@@ -3623,12 +3624,13 @@ describe('Codex review fixes', () => {
             id: original?.id, content: '', tool_calls: calls.map((call) => call.id === 'call_direct' ?
               { ...call, args: { command: 'different operation' } } : call),
           })] },
-        })).rejects.toThrow('Cannot change an already completed tool call');
+        })).rejects.toThrow('Tool batch proposal changed before approval replay');
         expect(directExecutions).toBe(1);
         expect(dispatchedEventNames).toEqual([]);
         return;
       }
-      await restoredRun.resume([{ type: 'approve' }], { ...config, version: 'v2' });
+      await restoredRun.resume([{ type: 'approve' }], { ...config, version: 'v2' }, undefined,
+        append ? { update: { messages: [new HumanMessage('Additional instructions during approval')] } } : undefined);
       await restoredRun.resume([{ type: 'approve' }], { ...config, version: 'v2' });
       const state = await restoredGraph.getState?.(config);
       resumed = (state as { values: { messages: BaseMessage[] } }).values;
@@ -4149,9 +4151,12 @@ describe('Codex review fixes', () => {
     }
   );
 
-  it.each([true, false])(
-    'restores a rewritten approval with fresh Run and ToolNode instances (direct=%s)',
-    async (direct) => {
+  it.each([
+    { direct: true, changedOwner: false }, { direct: false, changedOwner: false },
+    { direct: true, changedOwner: true }, { direct: false, changedOwner: true },
+  ])(
+    'restores a rewritten approval with fresh instances (direct=$direct, changedOwner=$changedOwner)',
+    async ({ direct, changedOwner }) => {
       const checkpointer = new MemorySaver();
       const executed: string[] = [];
       const echo = tool(async ({ command }) => {
@@ -4183,12 +4188,12 @@ describe('Codex review fixes', () => {
         hooks: [async () => ({ decision: 'ask', updatedInput: { command: 'reviewed' } })],
       });
       const { Run } = await import('@/run');
-      const create = async (hooks?: HookRegistry) => {
+      const create = async (hooks?: HookRegistry, agentId = 'a') => {
         const node = new ToolNode({
           tools: [echo],
           eventDrivenMode: true,
           ...(direct ? { directToolNames: new Set(['echo']) } : {}),
-          agentId: 'a',
+          agentId,
           toolCallStepIds: new Map([['call_1', 'step_1']]),
           hookRegistry: hooks,
           humanInTheLoop: { enabled: true },
@@ -4219,7 +4224,12 @@ describe('Codex review fixes', () => {
         action_requests: [{ arguments: { command: 'reviewed' } }],
       });
       expect(executed).toEqual([]);
-      const restored = await create();
+      const restored = await create(undefined, changedOwner ? 'different-agent' : 'a');
+      if (changedOwner) {
+        await expect(restored.resume([{ type: 'reject' }], config)).rejects.toThrow('Tool approval execution owner changed');
+        expect(executed).toEqual([]);
+        return;
+      }
       await restored.resume([{ type: 'approve' }], config);
       expect(executed).toEqual(['reviewed']);
     }

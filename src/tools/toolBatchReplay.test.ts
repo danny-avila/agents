@@ -10,6 +10,7 @@ import {
   restoreToolReplayConfig,
   getToolBatchReplayScope,
   getPublicToolInterruptPayload,
+  rebindToolBatchReplayPayload,
 } from './toolBatchReplay';
 
 const approval = {
@@ -25,28 +26,140 @@ const approval = {
 };
 
 describe('checkpoint-owned tool batch replay', () => {
+  it('durably rebinds only the proven owner across consecutive unconsumed forks', async () => {
+    const owner = JSON.stringify(['source', '', 'agent']);
+    const batch = JSON.stringify(['source', 'assistant', 'proposal']);
+    const unrelated = JSON.stringify(['other-child', '', 'agent']);
+    const original = await attachToolBatchReplayState(
+      approval,
+      owner,
+      new Map([[batch, new Map()]])
+    );
+    const wrapped = await attachToolBatchReplayState(
+      original,
+      unrelated,
+      new Map([[JSON.stringify(['other-child', 'assistant']), new Map()]])
+    );
+    const first = rebindToolBatchReplayPayload(wrapped, 'source', 'fork-1');
+    const second = rebindToolBatchReplayPayload(
+      JSON.parse(JSON.stringify(first)),
+      'fork-1',
+      'fork-2'
+    );
+    const state = getToolBatchReplayState(second);
+    expect(state?.approvalOwner).toBe(JSON.stringify(['fork-2', '', 'agent']));
+    expect(state?.records.map(({ owner, batch }) => [owner, batch])).toEqual([
+      [
+        JSON.stringify(['fork-2', '', 'agent']),
+        JSON.stringify(['fork-2', 'assistant', 'proposal']),
+      ],
+      [unrelated, JSON.stringify(['other-child', 'assistant'])],
+    ]);
+    expect(getToolBatchReplayState(wrapped)?.approvalOwner).toBe(owner);
+    expect(getPublicToolInterruptPayload(second)).toEqual(approval);
+  });
+
+  it('rejects corrupt reference counters instead of restarting numbering', async () => {
+    const wrapped = await attachToolBatchReplayState(
+      approval,
+      'owner',
+      new Map([['batch', new Map()]])
+    );
+    const state = getToolBatchReplayState(wrapped)!;
+    state.records[0].referenceState = {
+      entries: [],
+      turnCounter: -1,
+      warnedNonStringTools: [],
+    };
+    expect(() =>
+      getToolBatchReplayState({ [TOOL_BATCH_REPLAY_KEY]: state })
+    ).toThrow('Invalid tool batch replay checkpoint');
+  });
+
   it.each([undefined, '', 0])('does not cache a missing scope %j', (scope) => {
-    expect(getToolBatchReplayScope({ configurable: { thread_id: scope } })).toBeUndefined();
+    expect(
+      getToolBatchReplayScope({ configurable: { thread_id: scope } })
+    ).toBeUndefined();
   });
   it('preserves objects resembling the primitive wrapper', async () => {
-    const payload = { __librechat_tool_batch_wrapper: 1, __librechat_tool_batch_payload: 'user data' };
-    const wrapped = await attachToolBatchReplayState(payload, 'owner', new Map([['batch', new Map()]]));
-    expect(getPublicToolInterruptPayload(JSON.parse(JSON.stringify(wrapped)))).toEqual(payload);
+    const payload = {
+      __librechat_tool_batch_wrapper: 1,
+      __librechat_tool_batch_payload: 'user data',
+    };
+    const wrapped = await attachToolBatchReplayState(
+      payload,
+      'owner',
+      new Map([['batch', new Map()]])
+    );
+    expect(
+      getPublicToolInterruptPayload(JSON.parse(JSON.stringify(wrapped)))
+    ).toEqual(payload);
   });
-  it.each([undefined, {}, { name: 'echo' }])('rejects a missing or incomplete proposal %j', async (proposal) => {
-    const wrapped = await attachToolBatchReplayState(approval, 'owner', new Map([['batch', new Map([['call', {
-      proposal, output: new ToolMessage({ content: 'done', tool_call_id: 'call' }), additionalContexts: [],
-    }]])]]));
-    await expect(restoreToolBatchReplayState({ configurable: { [TOOL_BATCH_REPLAY_KEY]: getToolBatchReplayState(wrapped) } }, 'owner'))
-      .rejects.toThrow('Invalid settled tool batch results');
-  });
-  it.each([null, 'confirm', ['one', 'two']])('preserves custom interrupt payload %j with settled results', async (payload) => {
-    const wrapped = await attachToolBatchReplayState(payload, 'owner', new Map([['batch', new Map([['call', {
-      output: new ToolMessage({ content: 'done', tool_call_id: 'call' }), additionalContexts: [],
-    }]])]]));
-    expect(getToolBatchReplayState(wrapped)?.records).toHaveLength(1);
-    expect(stripToolBatchReplayState(wrapped)).toEqual(payload);
-  });
+  it.each([undefined, {}, { name: 'echo' }])(
+    'rejects a missing or incomplete proposal %j',
+    async (proposal) => {
+      const wrapped = await attachToolBatchReplayState(
+        approval,
+        'owner',
+        new Map([
+          [
+            'batch',
+            new Map([
+              [
+                'call',
+                {
+                  proposal,
+                  output: new ToolMessage({
+                    content: 'done',
+                    tool_call_id: 'call',
+                  }),
+                  additionalContexts: [],
+                },
+              ],
+            ]),
+          ],
+        ])
+      );
+      await expect(
+        restoreToolBatchReplayState(
+          {
+            configurable: {
+              [TOOL_BATCH_REPLAY_KEY]: getToolBatchReplayState(wrapped),
+            },
+          },
+          'owner'
+        )
+      ).rejects.toThrow('Invalid settled tool batch results');
+    }
+  );
+  it.each([null, 'confirm', ['one', 'two']])(
+    'preserves custom interrupt payload %j with settled results',
+    async (payload) => {
+      const wrapped = await attachToolBatchReplayState(
+        payload,
+        'owner',
+        new Map([
+          [
+            'batch',
+            new Map([
+              [
+                'call',
+                {
+                  output: new ToolMessage({
+                    content: 'done',
+                    tool_call_id: 'call',
+                  }),
+                  additionalContexts: [],
+                },
+              ],
+            ]),
+          ],
+        ])
+      );
+      expect(getToolBatchReplayState(wrapped)?.records).toHaveLength(1);
+      expect(stripToolBatchReplayState(wrapped)).toEqual(payload);
+    }
+  );
   it('does not reinterpret corrupt approval evidence as permission to execute', () => {
     const configurable = {
       forged: 'retained',

@@ -266,7 +266,7 @@ function isToolOutputReferenceEntry(
   return isString(entry.key) && typeof entry.value === 'string';
 }
 
-function isToolOutputReferenceState(
+export function isToolOutputReferenceState(
   value: unknown
 ): value is ToolOutputReferenceState {
   if (value == null || typeof value !== 'object') {

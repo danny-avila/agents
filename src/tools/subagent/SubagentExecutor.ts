@@ -2,7 +2,6 @@ import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
-import { rebindToolBatchReplayScope } from '@/tools/toolBatchReplay';
 import {
   AIMessage,
   BaseMessage,
@@ -89,6 +88,11 @@ import type {
   ToolApprovalReplaySnapshot,
 } from '@/hooks';
 import type { GraphFactory } from '@/graphs/graphFactory';
+import {
+  rebindToolBatchReplayScope,
+  rebindToolBatchReplayPayload,
+  restoreToolReplayConfig,
+} from '@/tools/toolBatchReplay';
 import type { StandardGraph } from '@/graphs/Graph';
 import {
   getSubagentApprovalExecutionScope,
@@ -1449,7 +1453,8 @@ export class SubagentExecutor {
       await this.prepareCheckpointFork(
         resumeExecution.checkpoints,
         branchChildThreadId,
-        lease
+        lease,
+        { source: resumeExecution.approvalExecutionScope, target: approvalExecutionScope }
       );
       let previousApprovals: ToolApprovalReplaySnapshot[] = [];
       let approvalsMutated = false;
@@ -1590,7 +1595,8 @@ export class SubagentExecutor {
   private async prepareCheckpointFork(
     sources: ReadonlyArray<SubagentCheckpointReference>,
     targetThreadId: string,
-    lease: SubagentExecutionPreparationLease
+    lease: SubagentExecutionPreparationLease,
+    approvalScope?: { source: string; target: string }
   ): Promise<void> {
     const checkpointer = this.checkpointer;
     try {
@@ -1609,7 +1615,7 @@ export class SubagentExecutor {
           checkpointer.deleteThread(targetThreadId)
         );
       }
-      await this.forkCheckpointSnapshot(sources, targetThreadId);
+      await this.forkCheckpointSnapshot(sources, targetThreadId, approvalScope);
       lease.assertOwned();
     } catch (error) {
       return lease.rollback(error);
@@ -1664,7 +1670,8 @@ export class SubagentExecutor {
   /** Copies exact checkpoint lineages, including pending task writes. */
   private async forkCheckpointSnapshot(
     sources: ReadonlyArray<SubagentCheckpointReference>,
-    targetThreadId: string
+    targetThreadId: string,
+    approvalScope?: { source: string; target: string }
   ): Promise<void> {
     if (
       this.checkpointer == null ||
@@ -1756,7 +1763,15 @@ export class SubagentExecutor {
             writes = [];
             writesByTask.set(taskId, writes);
           }
-          writes.push([channel, value]);
+          /** Repeated unconsumed forks must persist their current owner. */
+          const reboundValue =
+            channel === INTERRUPT && approvalScope != null &&
+            value != null && typeof value === 'object' && 'value' in value
+              ? { ...value, value: rebindToolBatchReplayPayload(
+                value.value, approvalScope.source, approvalScope.target
+              ) }
+              : value;
+          writes.push([channel, reboundValue]);
         }
         for (const [taskId, writes] of writesByTask) {
           await this.checkpointer.putWrites(storedConfig, writes, taskId);
@@ -2612,13 +2627,6 @@ export class SubagentExecutor {
       if (this.humanInTheLoop?.enabled === true) {
         childConfigurable[TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY] =
           approvalExecutionScope;
-        if (resumeExecution != null) {
-          rebindToolBatchReplayScope(
-            childConfigurable,
-            resumeExecution.approvalExecutionScope,
-            approvalExecutionScope
-          );
-        }
       }
       if (resumeExecution?.descendant != null) {
         childConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] =
@@ -2655,7 +2663,11 @@ export class SubagentExecutor {
         }
         const persistedInterrupts = getPersistedInterrupts(persistedState);
         if (persistedInterrupts.length > 0) {
-          activeChildRun.pendingInterrupts = persistedInterrupts;
+          activeChildRun.pendingInterrupts = resumeExecution == null ? persistedInterrupts :
+            persistedInterrupts.map((pending) => ({
+              ...pending,
+              value: rebindToolBatchReplayPayload(pending.value, resumeExecution.approvalExecutionScope, approvalExecutionScope),
+            }));
           execution.markStarted();
           childAlreadyStarted = true;
         } else if (persistedState.next.length > 0) {
@@ -2690,6 +2702,15 @@ export class SubagentExecutor {
         }
         let childInput: BaseGraphState | Command | null;
         if (childResumeMap != null) {
+          const pending = activeChildRun.pendingInterrupts.find((entry) =>
+            entry.id != null && Object.prototype.hasOwnProperty.call(childResumeMap, entry.id)
+          ) ?? activeChildRun.pendingInterrupts[0];
+          restoreToolReplayConfig(childConfigurable, pending.id, pending.value);
+          rebindToolBatchReplayScope(
+            childConfigurable,
+            resumeExecution?.approvalExecutionScope ?? approvalExecutionScope,
+            approvalExecutionScope
+          );
           childInput = new Command({ resume: childResumeMap });
         } else if (recoveredInProgress) {
           childInput = null;

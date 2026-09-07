@@ -1096,6 +1096,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     );
 
     expect(rebuiltRun.getInterrupt()).toBeUndefined();
+    expect(updates.filter((event) => event.phase === 'error')).toEqual([]);
     expect(executedToolIds).toHaveLength(1);
     expect(deniedToolIds).toHaveLength(1);
     expect(completedSubagentCalls).toEqual([first.id, second.id]);

@@ -3,7 +3,12 @@ import { isBaseMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { SubagentToolNodeResumeState } from '@/tools/subagent/SubagentReplay';
-import { isToolNodeResumeState, stripSubagentResumeManifest } from '@/tools/subagent/SubagentReplay';
+import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
+import {
+  isToolNodeResumeState,
+  isToolOutputReferenceState,
+  stripSubagentResumeManifest,
+} from '@/tools/subagent/SubagentReplay';
 import { isToolApprovalInterrupt } from '@/types/hitl';
 import { TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from '@/hooks/types';
 import {
@@ -37,6 +42,7 @@ export interface ToolBatchReplayRecord {
   encoding: string;
   data: string;
   turnState?: SubagentToolNodeResumeState;
+  referenceState?: ToolOutputReferenceState;
 }
 
 interface ToolBatchReplayState {
@@ -137,6 +143,29 @@ export function rebindToolBatchReplayScope(
   }
 }
 
+/** A fork may be paused again before it consumes its pending interrupt. */
+export function rebindToolBatchReplayPayload(
+  payload: unknown,
+  sourceScope: string,
+  destinationScope: string
+): unknown {
+  const state = getToolBatchReplayState(payload);
+  const value = stripRunStepResumeState(payload);
+  if (state == null || !isRecord(value)) {
+    return payload;
+  }
+  const configurable = { [TOOL_BATCH_REPLAY_KEY]: state };
+  rebindToolBatchReplayScope(configurable, sourceScope, destinationScope);
+  const rebound = {
+    ...value,
+    [TOOL_BATCH_REPLAY_KEY]: configurable[TOOL_BATCH_REPLAY_KEY],
+  };
+  const runStepState = getRunStepResumeState(payload);
+  return runStepState == null
+    ? rebound
+    : attachRunStepResumeState(rebound, runStepState);
+}
+
 export function getToolBatchReplayState(
   payload: unknown
 ): ToolBatchReplayState | undefined {
@@ -155,7 +184,8 @@ export function getToolBatchReplayState(
   const state = candidate as Partial<ToolBatchReplayState> | null;
   if (
     state?.version !== 1 ||
-    (state.wrappedPayload != null && typeof state.wrappedPayload !== 'boolean') ||
+    (state.wrappedPayload != null &&
+      typeof state.wrappedPayload !== 'boolean') ||
     (state.approvalOwner != null && typeof state.approvalOwner !== 'string') ||
     !Array.isArray(state.records) ||
     state.records.some((value: unknown) => {
@@ -168,7 +198,10 @@ export function getToolBatchReplayState(
         typeof record.batch !== 'string' ||
         typeof record.encoding !== 'string' ||
         typeof record.data !== 'string' ||
-        (record.turnState != null && !isToolNodeResumeState(record.turnState))
+        (record.turnState != null &&
+          !isToolNodeResumeState(record.turnState)) ||
+        (record.referenceState != null &&
+          !isToolOutputReferenceState(record.referenceState))
       );
     })
   ) {
@@ -187,7 +220,10 @@ export function stripToolBatchReplayState(payload: unknown): unknown {
   }
   const state = getToolBatchReplayState(payload);
   const { [TOOL_BATCH_REPLAY_KEY]: _state, ...publicPayload } = payload;
-  if (state?.wrappedPayload === true && TOOL_BATCH_PAYLOAD_KEY in publicPayload) {
+  if (
+    state?.wrappedPayload === true &&
+    TOOL_BATCH_PAYLOAD_KEY in publicPayload
+  ) {
     return publicPayload[TOOL_BATCH_PAYLOAD_KEY];
   }
   return publicPayload;
@@ -204,7 +240,8 @@ export async function attachToolBatchReplayState(
   payload: unknown,
   owner: string,
   batches: ReadonlyMap<string, ReadonlyMap<string, object>>,
-  turnState?: SubagentToolNodeResumeState
+  turnState?: SubagentToolNodeResumeState,
+  referenceState?: ToolOutputReferenceState
 ): Promise<unknown> {
   const publicPayload = stripRunStepResumeState(payload);
   const previous = getToolBatchReplayState(publicPayload);
@@ -218,6 +255,7 @@ export async function attachToolBatchReplayState(
       encoding,
       data: Buffer.from(bytes).toString('base64'),
       ...(turnState == null ? {} : { turnState }),
+      ...(referenceState == null ? {} : { referenceState }),
     });
   }
   const approvalOwner =
@@ -227,10 +265,12 @@ export async function attachToolBatchReplayState(
     return payload;
   }
   const result = {
-    ...(isRecord(publicPayload) ? publicPayload : {
-      [TOOL_BATCH_WRAPPER_KEY]: 1,
-      [TOOL_BATCH_PAYLOAD_KEY]: publicPayload,
-    }),
+    ...(isRecord(publicPayload)
+      ? publicPayload
+      : {
+        [TOOL_BATCH_WRAPPER_KEY]: 1,
+        [TOOL_BATCH_PAYLOAD_KEY]: publicPayload,
+      }),
     [TOOL_BATCH_REPLAY_KEY]: {
       version: 1,
       approvalOwner,
@@ -248,7 +288,12 @@ export async function restoreToolBatchReplayState(
   config: RunnableConfig,
   owner: string
 ): Promise<
-  Array<{ batch: string; results: Array<[string, SettledToolBatchResult]>; turnState?: SubagentToolNodeResumeState }>
+  Array<{
+    batch: string;
+    results: Array<[string, SettledToolBatchResult]>;
+    turnState?: SubagentToolNodeResumeState;
+    referenceState?: ToolOutputReferenceState;
+  }>
 > {
   const state = getToolBatchReplayState(config.configurable);
   if (state == null) {
@@ -288,7 +333,8 @@ export async function restoreToolBatchReplayState(
                 typeof result.completionHandled !== 'boolean') ||
               (result.referenceContent != null &&
                 typeof result.referenceContent !== 'string') ||
-              (result.turn != null && (!Number.isSafeInteger(result.turn) || result.turn < 0)) ||
+              (result.turn != null &&
+                (!Number.isSafeInteger(result.turn) || result.turn < 0)) ||
               !isRecord(result.proposal) ||
               typeof result.proposal.name !== 'string' ||
               result.proposal.name.length === 0 ||
@@ -317,7 +363,12 @@ export async function restoreToolBatchReplayState(
             ];
           }
         );
-        return { batch: record.batch, results, turnState: record.turnState };
+        return {
+          batch: record.batch,
+          results,
+          turnState: record.turnState,
+          referenceState: record.referenceState,
+        };
       })
   );
 }

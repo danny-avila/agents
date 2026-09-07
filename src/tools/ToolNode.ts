@@ -1,4 +1,5 @@
 import { nanoid } from 'nanoid';
+import { createHash } from 'crypto';
 import { ToolCall } from '@langchain/core/messages/tool';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
@@ -31,6 +32,7 @@ import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
   ToolOutputResolveView,
+  ToolOutputReferenceState,
   PreResolvedArgsMap,
   ResolvedArgsByCallId,
   ResolveResult,
@@ -81,6 +83,7 @@ import {
   coerceRecordArgs,
   resolveRuntimeSessionHint,
   recordArgsEqual,
+  stableStringify,
 } from '@/tools/eagerEventExecution';
 import {
   attachSubagentResumeManifest,
@@ -439,8 +442,6 @@ function describeOfferedShape(value: unknown): string {
 
 type AssistantBatch = {
   message: AIMessage;
-  index: number;
-  messageCount: number;
 };
 
 function findAssistantBatch(
@@ -449,7 +450,7 @@ function findAssistantBatch(
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
     if (isAIMessage(message)) {
-      return { message, index: i, messageCount: messages.length };
+      return { message };
     }
   }
   return undefined;
@@ -461,9 +462,8 @@ function getAssistantBatchReplayKey(
 ): string {
   return JSON.stringify([
     threadId ?? null,
-    batch.message.id ?? null,
-    batch.index,
-    batch.messageCount,
+    batch.message.id == null || batch.message.id === '' ? null : batch.message.id,
+    createHash('sha256').update(stableStringify(batch.message.tool_calls ?? [])).digest('hex'),
   ]);
 }
 
@@ -898,11 +898,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           config,
           this.executingAgentId ?? this.agentId ?? ''
         );
+        const reviewEvidence = getToolApprovalReviewEvidence(config);
+        if (reviewEvidence?.owner != null && reviewEvidence.owner !== replayOwner) {
+          const reviewedIds = new Set(reviewEvidence.payload.action_requests.map((request) => request.tool_call_id));
+          const calls = this.isSendInput(input) ? [input.lg_tool_call] : assistantBatch?.message.tool_calls ?? [];
+          const ownsReviewedCall = calls.some((call) => reviewedIds.has(call.id ?? ''));
+          if (ownsReviewedCall) {
+            throw new Error('Tool approval execution owner changed before resume — failing closed');
+          }
+        }
+        const referenceReplay: { state?: ToolOutputReferenceState } = {};
         const restoredBatches = await restoreToolBatchReplayState(config, replayOwner);
+        if (restoredBatches.length > 0 && !restoredBatches.some(({ batch }) => batch === activeReplayKey)) {
+          throw new Error('Tool batch proposal changed before approval replay — failing closed');
+        }
         if (activeReplayKey != null && getToolBatchReplayState(config.configurable) != null) {
           this.settledDirectResultsByBatch.delete(activeReplayKey);
         }
-        for (const { batch, results, turnState } of restoredBatches) {
+        for (const { batch, results, turnState, referenceState } of restoredBatches) {
           if (batch !== activeReplayKey) {
             continue;
           }
@@ -910,12 +923,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           if (turnState != null) {
             this.restoreSubagentResumeState(turnState);
           }
+          referenceReplay.state = referenceState;
         }
         const state = input as T & Pick<t.BaseGraphState, 'runStepState'>;
         restoreRunStepResumeState?.(state.runStepState, config);
         let result: T;
         try {
-          result = await this.run(input, config);
+          result = await this.run(input, config, referenceReplay);
         } catch (error) {
           if (!isGraphInterrupt(error)) {
             throw error;
@@ -934,7 +948,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 pendingInterrupt.value,
                 replayOwner,
                 activeBatches,
-                turnState
+                turnState,
+                referenceReplay.state
               );
               return {
                 ...pendingInterrupt,
@@ -4615,6 +4630,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const refMeta = isBaseMessage(result.output) ? result.output.additional_kwargs as t.ToolMessageRefMetadata : undefined;
       if (refMeta?._refKey != null && result.referenceContent != null) {
         this.toolOutputRegistry?.set(baseContext.batchScopeId, refMeta._refKey, result.referenceContent);
+        if (isBaseMessage(result.output)) {
+          result = { ...result, output: new ToolMessage({
+            ...(result.output as ToolMessage),
+            additional_kwargs: { ...result.output.additional_kwargs, _refScope: baseContext.batchScopeId },
+          }) };
+        }
       }
       if (
         call.id != null &&
@@ -4819,7 +4840,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  protected async run(input: any, config: RunnableConfig): Promise<T> {
+  protected async run(input: any, config: RunnableConfig, referenceReplay: { state?: ToolOutputReferenceState } = {}): Promise<T> {
     /**
      * Breaker read once at batch entry: every downstream path (direct
      * `tool.invoke` runtimes and the ON_TOOL_EXECUTE dispatch) inherits this
@@ -4878,6 +4899,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      */
     const incomingRunId = config.configurable?.run_id as string | undefined;
     const batchScopeId = incomingRunId ?? `\0anon-${this.anonBatchCounter++}`;
+    if (referenceReplay.state != null) {
+      this.toolOutputRegistry?.restoreState(batchScopeId, referenceReplay.state);
+    }
+    referenceReplay.state = this.toolOutputRegistry?.snapshotState(batchScopeId);
     const turn = this.toolOutputRegistry?.nextTurn(batchScopeId) ?? 0;
     let outputs: (BaseMessage | Command)[];
     let replayBatchKey: string | undefined;

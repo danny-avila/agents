@@ -22,7 +22,9 @@ allowed action or repeat a sibling whose completed result was checkpointed.
    review; a valid approval uses the arguments actually reviewed.
 6. A child checkpoint fork receives a new execution scope. Only the trusted
    subagent adapter rebinds evidence from the manifest's proven source scope
-   into that destination. Unrelated child and parent scopes are unchanged.
+   into that destination, including durable pending writes that have not yet
+   been consumed. Each child restores its own pending evidence. Unrelated child
+   and parent scopes are unchanged; a mismatched executing owner fails closed.
 7. Completed batches release their process-local acceleration cache. That cache
    is not the durable source of truth: selecting a checkpoint replaces any
    newer local result for that batch, including when the checkpoint is empty.
@@ -30,6 +32,11 @@ allowed action or repeat a sibling whose completed result was checkpointed.
    Restored outputs and pending calls keep their original execution and
    completion indices, with or without a hook registry. Historical per-call
    turn entries are not copied into the active batch's checkpoint.
+9. Batch identity binds the assistant message and tool proposals, not transcript
+   length: additional resume messages cannot repeat completed work. The
+   pre-batch output-reference snapshot and turn counter are restored before
+   resolution. Cached messages are rebound to the active reference scope;
+   completed siblings cannot change what pending siblings originally resolved.
 
 The private checkpoint record is versioned. Its codec preserves LangChain
 messages; Command outputs are reconstructed before graph execution. Malformed
