@@ -14,6 +14,7 @@ import {
   buildSummaryCarrierText,
   separateSummarizationParameters,
   buildSummarizationInstruction,
+  ManualSummarizationSkippedError,
 } from './shared';
 import {
   addTailCacheControl,
@@ -1026,6 +1027,14 @@ function findStreamLimitAbortReason(
   return undefined;
 }
 
+/** Wording for the history-preserved log and completion, by request reason. */
+const PRESERVATION_REASONS: Partial<
+  Record<NonNullable<t.SummarizationNodeInput['reason']>, string>
+> = {
+  overflow: 'overflow recovery',
+  manual: 'manual compaction',
+};
+
 export function createSummarizeNode({
   agentContext,
   graph: adapterGraph,
@@ -1037,7 +1046,11 @@ export function createSummarizeNode({
       summarizationRequest?: t.SummarizationNodeInput;
     },
     config?: RunnableConfig
-  ): Promise<{ summarizationRequest: undefined; messages?: BaseMessage[] }> => {
+  ): Promise<{
+    summarizationRequest: undefined;
+    messages?: BaseMessage[];
+    manualSummary?: string;
+  }> => {
     /** The breaker signal is captured at node ENTRY, before dispatchRunStep,
      * ON_SUMMARIZE_START, or PreCompact awaits: a sibling's trip plus a
      * prompt next run can reset the controller during one of those awaits,
@@ -1114,6 +1127,12 @@ export function createSummarizeNode({
      * its recursion budget dispatching empty summary steps.
      */
     if (agentContext.summarizationExhausted) {
+      if (request.reason === 'manual') {
+        throw new ManualSummarizationSkippedError(
+          'exhausted',
+          'Compaction skipped: consecutive summarization attempts produced no usable summary'
+        );
+      }
       emitAgentLog(
         config,
         'warn',
@@ -1131,6 +1150,12 @@ export function createSummarizeNode({
 
     const maxCtx = agentContext.maxContextTokens ?? 0;
     if (maxCtx > 0 && agentContext.instructionTokens >= maxCtx) {
+      if (request.reason === 'manual') {
+        throw new ManualSummarizationSkippedError(
+          'instructions_exceed_budget',
+          'Compaction skipped: instructions and tool definitions exceed the context budget'
+        );
+      }
       emitAgentLog(
         config,
         'warn',
@@ -1169,12 +1194,13 @@ export function createSummarizeNode({
     const retainRecent = agentContext.summarizationConfig?.retainRecent;
     /**
      * A manual summary is the user asking for the whole history to become a
-     * checkpoint, so the default recency window does not apply to it: only
-     * a `retainRecent` the host configured explicitly keeps a tail.
+     * checkpoint, so the default recency window does not apply to it. A
+     * `retainRecent` the host configured explicitly still keeps its tail,
+     * with the ordinary turn default when it only sets a token cap.
      */
     const retainTurns =
-      request.reason === 'manual'
-        ? (retainRecent?.turns ?? 0)
+      request.reason === 'manual' && retainRecent == null
+        ? 0
         : (retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS);
     const recencyTokenCounter =
       agentContext.contextPressureTokenCounts?.count ??
@@ -1207,6 +1233,12 @@ export function createSummarizeNode({
     const messagesToRetain = state.messages.slice(tailStartIndex);
 
     if (messagesToRefine.length === 0) {
+      if (request.reason === 'manual') {
+        throw new ManualSummarizationSkippedError(
+          'nothing_to_summarize',
+          'Nothing to compact: the retained recent turns cover the whole conversation'
+        );
+      }
       /**
        * Recency window covers the entire conversation — there is no
        * older content to summarize.  Skipping prevents the model from
@@ -1407,19 +1439,21 @@ export function createSummarizeNode({
     /**
      * The metadata stub describes the history rather than summarizing it, so
      * committing it means removing the head and keeping nothing of what it
-     * said. That trade is never worth making to paper over an overflow: the
-     * recovery would "succeed" only by destroying the conversation it was
-     * supposed to preserve. Leave state untouched and let the provider error
-     * surface instead.
+     * said. That trade is never worth making to paper over an overflow, and
+     * never for a manual compaction, which would replace the whole history
+     * with a message count: the recovery would "succeed" only by destroying
+     * the conversation it was supposed to preserve. Leave state untouched
+     * and let the provider error surface instead.
      */
     if (
       usedMetadataStub === true &&
-      (request.reason === 'overflow' || usedIntraTurnFallback)
+      (request.reason === 'overflow' ||
+        request.reason === 'manual' ||
+        usedIntraTurnFallback)
     ) {
       const preservationReason =
-        request.reason === 'overflow'
-          ? 'overflow recovery'
-          : 'intra-turn compaction';
+        PRESERVATION_REASONS[request.reason ?? 'trigger'] ??
+        'intra-turn compaction';
       log(
         'warn',
         `Summarization failed during ${preservationReason}; keeping history rather than replacing it with a metadata stub`
@@ -1579,6 +1613,8 @@ export function createSummarizeNode({
         messagesToRetain.length > 0
           ? [createRemoveAllMessage(), ...messagesToRetain]
           : [createRemoveAllMessage()],
+      /** The run's result, for trace roots that otherwise see no reply. */
+      ...(request.reason === 'manual' ? { manualSummary: summaryText } : {}),
     };
   };
 }

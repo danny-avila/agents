@@ -162,7 +162,10 @@ import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { initializeLangfuseTracing } from '@/instrumentation';
-import { shouldTriggerSummarization } from '@/summarization';
+import {
+  ManualSummarizationSkippedError,
+  shouldTriggerSummarization,
+} from '@/summarization';
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
@@ -1464,6 +1467,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   outputTruncatedIncomplete = false;
   /**
+   * The agent a summarize-only run summarizes with. Set from the first agent
+   * input that opted in; while set, every other agent's model step is a
+   * no-op and the workflow drains to END after the summary.
+   */
+  summarizeOnlyAgentId?: string;
+  /**
    * `stopReason` from a `PreemptBoundary` hook that halted the turn.
    *
    * Clearing the registry halt is what keeps the sealed turn alive, but the
@@ -1551,6 +1560,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         indexTokenCountMap,
         toolExecution
       );
+      if (agentConfig.summarizeOnly === true) {
+        this.summarizeOnlyAgentId ??= agentContext.agentId;
+      }
       if (calibrationRatio != null && calibrationRatio > 0) {
         agentContext.calibrationRatio = calibrationRatio;
       }
@@ -3113,15 +3125,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const meta = { runId: this.runId, agentId };
     if (agentContext.claimManualSummarization()) {
       if (agentContext.summarizationEnabled !== true) {
-        emitAgentLog(
-          config,
-          'warn',
-          'graph',
-          'Summarize-only run skipped — summarization is not enabled',
-          undefined,
-          meta
+        throw new ManualSummarizationSkippedError(
+          'disabled',
+          'Compaction skipped: summarization is not enabled for this agent'
         );
-        return { messages: [] };
       }
       emitAgentLog(
         config,
@@ -3208,6 +3215,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * `processStream` call starts clean.
        */
       if (this.preemptHaltReason != null) {
+        return { messages: [] };
+      }
+
+      /**
+       * A summarize-only run ends at the agent that summarizes. A chained or
+       * fanned-out successor entered through the workflow's static routing
+       * must not spend a model call on the compacted history.
+       */
+      if (
+        this.summarizeOnlyAgentId != null &&
+        this.summarizeOnlyAgentId !== agentId
+      ) {
         return { messages: [] };
       }
 
@@ -5249,7 +5268,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
       /** A summarize-only run never calls the model, so the step after the
        *  summary has nothing to route: the summary itself is the result. */
-      if (agentContext.summarizeOnly === true) {
+      if (this.summarizeOnlyAgentId != null) {
         return END;
       }
       const decision = toolsCondition(
@@ -5288,6 +5307,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           _: t.SummarizationNodeInput | undefined,
           b: t.SummarizationNodeInput | undefined
         ) => b,
+        default: () => undefined,
+      }),
+      manualSummary: Annotation<string | undefined>({
+        reducer: (_: string | undefined, b: string | undefined) => b,
         default: () => undefined,
       }),
       runStepState: this.createRunStepStateAnnotation(),

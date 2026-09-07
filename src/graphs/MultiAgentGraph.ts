@@ -1267,6 +1267,11 @@ export class MultiAgentGraph extends StandardGraph {
         reducer: (_current, update) => update,
         default: () => undefined,
       }),
+      /** Surfaced from the summarizing agent's subgraph on a summarize-only run. */
+      manualSummary: Annotation<string | undefined>({
+        reducer: (_current, update) => update,
+        default: () => undefined,
+      }),
       runStepState: this.createRunStepStateAnnotation(),
     });
 

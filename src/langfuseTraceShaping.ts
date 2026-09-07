@@ -246,6 +246,18 @@ function findLastMessageText(value: unknown, role: string): string | undefined {
   return undefined;
 }
 
+/**
+ * A summarize-only run answers with its summary, carried in state as
+ * `manualSummary`, rather than with an assistant message.
+ */
+function getManualSummary(value: unknown): string | undefined {
+  if (!isRecord(value) || typeof value.manualSummary !== 'string') {
+    return undefined;
+  }
+  const text = value.manualSummary.trim();
+  return text === '' ? undefined : text;
+}
+
 function normalizeToolCall(value: unknown): SerializedToolCall | undefined {
   if (!isRecord(value)) {
     return undefined;
@@ -534,10 +546,9 @@ function shapeConversationPayload(span: MutableSpan): void {
     parseAttributeValue(span.attributes[inputKey]),
     'user'
   );
-  const answer = findLastMessageText(
-    parseAttributeValue(span.attributes[outputKey]),
-    'assistant'
-  );
+  const output = parseAttributeValue(span.attributes[outputKey]);
+  const answer =
+    findLastMessageText(output, 'assistant') ?? getManualSummary(output);
   /** A generation that IS the trace root — a bare `model.invoke` with no
    *  wrapping chain, i.e. the activity-label path — is also the only
    *  observation carrying its own prompt: reducing its observation input

@@ -128,3 +128,26 @@ export function buildSummarizationInstruction(
   }
   return parts.join('');
 }
+
+/** Why a summarize-only run could not attempt its summary. */
+export type ManualSummarizationSkipReason =
+  | 'disabled'
+  | 'exhausted'
+  | 'instructions_exceed_budget'
+  | 'nothing_to_summarize';
+
+/**
+ * A summarize-only run asked for a summary the graph could not attempt.
+ * Thrown rather than ending the run quietly: the summary is the whole result
+ * of such a run, so a host left with neither a summary nor an error would
+ * have nothing to show the user.
+ */
+export class ManualSummarizationSkippedError extends Error {
+  readonly reason: ManualSummarizationSkipReason;
+
+  constructor(reason: ManualSummarizationSkipReason, message: string) {
+    super(message);
+    this.name = 'ManualSummarizationSkippedError';
+    this.reason = reason;
+  }
+}

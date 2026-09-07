@@ -9,7 +9,9 @@ export {
   buildSummarizationInstruction,
   buildSummaryCarrierText,
   separateSummarizationParameters,
+  ManualSummarizationSkippedError,
 } from './shared';
+export type { ManualSummarizationSkipReason } from './shared';
 
 const VALID_TRIGGER_TYPES = [
   'token_ratio',

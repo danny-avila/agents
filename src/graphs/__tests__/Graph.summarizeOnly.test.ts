@@ -7,6 +7,7 @@ import {
 } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
+import { ManualSummarizationSkippedError } from '@/summarization';
 import { GraphEvents, Providers } from '@/common';
 import * as init from '@/llm/init';
 import { Run } from '@/run';
@@ -18,12 +19,18 @@ class RecordingModel extends Runnable<BaseMessage[], AIMessageChunk> {
   lc_namespace = ['tests'];
   readonly calls: BaseMessage[][] = [];
 
-  constructor(private readonly reply: string) {
+  constructor(
+    private readonly reply: string,
+    private readonly failure?: Error
+  ) {
     super();
   }
 
   async invoke(messages: BaseMessage[]): Promise<AIMessageChunk> {
     this.calls.push(messages);
+    if (this.failure != null) {
+      throw this.failure;
+    }
     return new AIMessageChunk({ content: this.reply });
   }
 }
@@ -53,30 +60,60 @@ interface Harness {
   restore: () => void;
 }
 
-async function createHarness(options: {
+interface HarnessOptions {
   runId: string;
   summarizeOnly?: boolean;
   summarizationEnabled?: boolean;
   summarizationConfig?: t.SummarizationConfig;
   withBudget?: boolean;
-}): Promise<Harness> {
+  summarizerFailure?: Error;
+  /** A second agent reached by a direct edge from the summarizing one. */
+  successorAgent?: boolean;
+}
+
+async function createHarness(options: HarnessOptions): Promise<Harness> {
   const snapshots: t.ContextUsageEvent[] = [];
   const completions: t.SummarizeCompleteEvent[] = [];
   const withBudget = options.withBudget !== false;
+  const llmConfig = {
+    provider: Providers.ANTHROPIC,
+    disableStreaming: true,
+    streamUsage: false,
+  };
+  const agentFields = {
+    ...(withBudget ? { maxContextTokens: 100_000 } : {}),
+    summarizationEnabled: options.summarizationEnabled ?? true,
+    summarizeOnly: options.summarizeOnly ?? true,
+    summarizationConfig: options.summarizationConfig,
+  };
+  const graphConfig: t.RunConfig['graphConfig'] =
+    options.successorAgent === true
+      ? {
+        type: 'multi-agent',
+        agents: [
+          {
+            agentId: 'first',
+            provider: Providers.ANTHROPIC,
+            clientOptions: llmConfig,
+            ...agentFields,
+          },
+          {
+            agentId: 'second',
+            provider: Providers.ANTHROPIC,
+            clientOptions: llmConfig,
+            ...(withBudget ? { maxContextTokens: 100_000 } : {}),
+          },
+        ],
+        edges: [{ from: ['first'], to: ['second'], edgeType: 'direct' }],
+      }
+      : {
+        type: 'standard',
+        llmConfig,
+        ...agentFields,
+      };
   const run = await Run.create<t.IState>({
     runId: options.runId,
-    graphConfig: {
-      type: 'standard',
-      llmConfig: {
-        provider: Providers.ANTHROPIC,
-        disableStreaming: true,
-        streamUsage: false,
-      },
-      ...(withBudget ? { maxContextTokens: 100_000 } : {}),
-      summarizationEnabled: options.summarizationEnabled ?? true,
-      summarizeOnly: options.summarizeOnly ?? true,
-      summarizationConfig: options.summarizationConfig,
-    },
+    graphConfig,
     returnContent: true,
     skipCleanup: true,
     ...(withBudget ? { tokenCounter } : {}),
@@ -98,7 +135,10 @@ async function createHarness(options: {
   }
   const agentModel = new RecordingModel('the agent must not answer');
   run.Graph.overrideModel = agentModel;
-  const summarizer = new RecordingModel('CHECKPOINT: everything so far');
+  const summarizer = new RecordingModel(
+    'CHECKPOINT: everything so far',
+    options.summarizerFailure
+  );
   const spy = jest
     .spyOn(init, 'initializeModel')
     .mockReturnValue(
@@ -140,7 +180,7 @@ describe('summarize-only runs', () => {
     }
   });
 
-  it('keeps only an explicitly configured recency window', async () => {
+  it('keeps an explicitly configured recency window', async () => {
     const harness = await createHarness({
       runId: 'summarize-only-retain',
       summarizationConfig: { retainRecent: { turns: 1 } },
@@ -149,7 +189,6 @@ describe('summarize-only runs', () => {
       const history = buildHistory(3);
       await harness.run.processStream({ messages: history }, streamConfig);
 
-      expect(harness.agentModel.calls).toHaveLength(0);
       expect(harness.summarizer.calls).toHaveLength(1);
       /** The last turn (two messages) stays out of the summary. */
       expect(harness.summarizer.calls[0]).toHaveLength(history.length - 2 + 1);
@@ -160,20 +199,79 @@ describe('summarize-only runs', () => {
     }
   });
 
-  it('ends immediately when summarization is not enabled', async () => {
+  it('keeps the default turn window when the host configured only a token cap', async () => {
+    const harness = await createHarness({
+      runId: 'summarize-only-retain-tokens',
+      summarizationConfig: { retainRecent: { tokens: 1_000_000 } },
+    });
+    try {
+      const history = buildHistory(4);
+      await harness.run.processStream({ messages: history }, streamConfig);
+
+      expect(harness.summarizer.calls).toHaveLength(1);
+      /** Two default turns (four messages) retained, the rest summarized. */
+      expect(harness.summarizer.calls[0]).toHaveLength(history.length - 4 + 1);
+      expect(harness.snapshots[0].breakdown.messageCount).toBe(4);
+    } finally {
+      harness.restore();
+    }
+  });
+
+  it('rejects when the configured window already covers the whole conversation', async () => {
+    const harness = await createHarness({
+      runId: 'summarize-only-nothing',
+      summarizationConfig: { retainRecent: { turns: 5 } },
+    });
+    try {
+      await expect(
+        harness.run.processStream({ messages: buildHistory(2) }, streamConfig)
+      ).rejects.toMatchObject({
+        name: 'ManualSummarizationSkippedError',
+        reason: 'nothing_to_summarize',
+      });
+      expect(harness.summarizer.calls).toHaveLength(0);
+      expect(harness.agentModel.calls).toHaveLength(0);
+    } finally {
+      harness.restore();
+    }
+  });
+
+  it('rejects when summarization is not enabled', async () => {
     const harness = await createHarness({
       runId: 'summarize-only-disabled',
       summarizationEnabled: false,
     });
     try {
+      await expect(
+        harness.run.processStream({ messages: buildHistory(2) }, streamConfig)
+      ).rejects.toBeInstanceOf(ManualSummarizationSkippedError);
+      expect(harness.agentModel.calls).toHaveLength(0);
+      expect(harness.summarizer.calls).toHaveLength(0);
+    } finally {
+      harness.restore();
+    }
+  });
+
+  it('keeps the history when every summarizer call fails', async () => {
+    /** With no provider able to summarize, the node would otherwise commit
+     *  the metadata stub as the checkpoint and remove the whole history. */
+    const harness = await createHarness({
+      runId: 'summarize-only-provider-failure',
+      summarizerFailure: new Error('503 summarizer unavailable'),
+    });
+    try {
       await harness.run.processStream(
-        { messages: buildHistory(2) },
+        { messages: buildHistory(3) },
         streamConfig
       );
 
       expect(harness.agentModel.calls).toHaveLength(0);
-      expect(harness.summarizer.calls).toHaveLength(0);
-      expect(harness.completions).toHaveLength(0);
+      expect(harness.completions).toHaveLength(1);
+      expect(harness.completions[0].summary).toBeUndefined();
+      expect(harness.completions[0].error).toMatch(/preserved/);
+      expect(
+        harness.run.Graph?.agentContexts.get('default')?.getSummaryText()
+      ).toBeUndefined();
     } finally {
       harness.restore();
     }
@@ -214,6 +312,25 @@ describe('summarize-only runs', () => {
       expect(harness.agentModel.calls).toHaveLength(0);
       expect(harness.summarizer.calls).toHaveLength(2);
       expect(harness.completions).toHaveLength(2);
+    } finally {
+      harness.restore();
+    }
+  });
+
+  it('never lets a chained successor agent call the model', async () => {
+    const harness = await createHarness({
+      runId: 'summarize-only-successor',
+      successorAgent: true,
+    });
+    try {
+      await harness.run.processStream(
+        { messages: buildHistory(2) },
+        streamConfig
+      );
+
+      expect(harness.summarizer.calls).toHaveLength(1);
+      expect(harness.completions).toHaveLength(1);
+      expect(harness.agentModel.calls).toHaveLength(0);
     } finally {
       harness.restore();
     }

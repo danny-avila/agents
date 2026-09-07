@@ -81,6 +81,12 @@ export type SystemCallbacks = {
 export type BaseGraphState = {
   messages: BaseMessage[];
   runStepState?: RunStepResumeState;
+  /**
+   * The summary a summarize-only run produced. Kept in state because such a
+   * run has no assistant reply: trace roots report it as the run's output
+   * instead of the retained tail or the raw state.
+   */
+  manualSummary?: string;
 };
 
 export type AgentSubgraphState = BaseGraphState & {
@@ -911,8 +917,12 @@ interface AgentInputFields {
    * summarization outright instead of consulting the trigger, and the step
    * after the summary emits its context snapshot and ends the run without a
    * model call. Hosts use it for user-initiated compaction, where the summary
-   * is the whole response. Requires `summarizationEnabled`; with it off the
-   * run ends immediately and produces nothing.
+   * is the whole response. Requires `summarizationEnabled`: a run that cannot
+   * attempt the summary rejects with `ManualSummarizationSkippedError`
+   * rather than ending with nothing, and one whose provider calls all fail
+   * keeps the history and reports the failure on the summary step. In a
+   * multi-agent graph only the agent that opted in runs; every successor is
+   * a no-op.
    */
   summarizeOnly?: boolean;
   summarizationConfig?: SummarizationConfig;
