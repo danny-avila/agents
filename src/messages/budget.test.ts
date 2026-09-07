@@ -1,11 +1,16 @@
+import { RunnableLambda } from '@langchain/core/runnables';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import {
   AIMessage,
   FunctionMessage,
   HumanMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import type { RunnableConfig } from '@langchain/core/runnables';
+import type { AgentLogEvent } from '@/types';
 import type * as t from '@/types';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
+import { GraphEvents } from '@/common';
 import { toLangChainContent } from './langchain';
 import { syncBudgetDerivedFields } from './budget';
 
@@ -110,6 +115,67 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     );
     expect(usage.breakdown.toolMessageTokens).toBe(20);
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 10 });
+  });
+
+  it('counts v1 standard-content tool_call invocations', () => {
+    const usage = snapshot();
+    const invocation = new AIMessage({
+      content: toLangChainContent([
+        { type: 'tool_call', id: 'standard', name: 'file_search', args: {} },
+      ]),
+      response_metadata: { output_version: 'v1' },
+    });
+
+    syncBudgetDerivedFields(
+      usage,
+      [invocation, toolResult('standard')],
+      () => 10
+    );
+
+    expect(usage.breakdown.toolMessageTokens).toBe(20);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ file_search: 10 });
+  });
+
+  it('attributes the nested tool_call content shape', () => {
+    const usage = snapshot();
+    const invocation = new AIMessage({
+      content: toLangChainContent([
+        {
+          type: 'tool_call',
+          tool_call: { type: 'tool_call', id: 'nested', name: 'lookup' },
+        },
+      ]),
+    });
+
+    syncBudgetDerivedFields(
+      usage,
+      [invocation, toolResult('nested')],
+      () => 10
+    );
+
+    expect(usage.breakdown.toolMessageTokens).toBe(20);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 10 });
+  });
+
+  it('keeps a mirrored structured name over an inline standard block', () => {
+    const usage = snapshot();
+    const invocation = new AIMessage({
+      content: toLangChainContent([
+        { type: 'tool_call', id: 'mirrored', name: 'inline_name', args: {} },
+      ]),
+      tool_calls: [{ id: 'mirrored', name: 'structured_name', args: {} }],
+    });
+
+    syncBudgetDerivedFields(
+      usage,
+      [invocation, toolResult('mirrored')],
+      () => 10
+    );
+
+    expect(usage.breakdown.toolMessageTokens).toBe(20);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({
+      structured_name: 10,
+    });
   });
 
   it('attributes structured, raw, inline, and legacy results with explicit precedence', () => {
@@ -280,26 +346,71 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     expect(unavailable.breakdown.toolMessageTokens).toBeUndefined();
   });
 
-  it('rejects unsafe counter values and aggregate overflow', () => {
-    for (const value of [
-      Number.NaN,
-      Number.POSITIVE_INFINITY,
-      -1,
-      0.5,
-      Number.MAX_SAFE_INTEGER + 1,
-    ]) {
-      expect(() =>
-        syncBudgetDerivedFields(snapshot(), [toolResult('a')], () => value)
-      ).toThrow(RangeError);
-    }
+  it('drops the tool share on unsafe counts instead of failing the call', async () => {
+    const logs: AgentLogEvent[] = [];
+    const logHandler = BaseCallbackHandler.fromMethods({
+      handleCustomEvent: (eventName: string, data: unknown): void => {
+        if (eventName === GraphEvents.ON_AGENT_LOG) {
+          logs.push(data as AgentLogEvent);
+        }
+      },
+    });
 
-    expect(() =>
-      syncBudgetDerivedFields(
-        snapshot(),
-        [toolResult('a'), toolResult('b')],
-        () => Number.MAX_SAFE_INTEGER
-      )
-    ).toThrow(RangeError);
+    await RunnableLambda.from(
+      (_input: unknown, config?: RunnableConfig): void => {
+        for (const value of [
+          Number.NaN,
+          Number.POSITIVE_INFINITY,
+          -1,
+          0.5,
+          Number.MAX_SAFE_INTEGER + 1,
+        ]) {
+          const usage = snapshot();
+          expect(() =>
+            syncBudgetDerivedFields(
+              usage,
+              [toolResult('a')],
+              () => value,
+              config
+            )
+          ).not.toThrow();
+          expect(usage.breakdown.toolMessageTokens).toBeUndefined();
+          expect(usage.breakdown.toolMessageTokenCounts).toBeUndefined();
+          /** Every other derived field still reconciles. */
+          expect(usage.breakdown.instructionTokens).toBe(100);
+          expect(usage.breakdown.messageTokens).toBe(1_000);
+        }
+
+        const overflow = snapshot();
+        expect(() =>
+          syncBudgetDerivedFields(
+            overflow,
+            [toolResult('a'), toolResult('b')],
+            () => Number.MAX_SAFE_INTEGER,
+            config
+          )
+        ).not.toThrow();
+        expect(overflow.breakdown.toolMessageTokens).toBeUndefined();
+
+        const unclampable = snapshot();
+        unclampable.breakdown.messageTokens = Number.NaN;
+        unclampable.effectiveInstructionTokens = undefined;
+        expect(() =>
+          syncBudgetDerivedFields(
+            unclampable,
+            [toolResult('a')],
+            () => 10,
+            config
+          )
+        ).not.toThrow();
+        expect(unclampable.breakdown.toolMessageTokens).toBeUndefined();
+        expect(unclampable.breakdown.toolMessageTokenCounts).toBeUndefined();
+      }
+    ).invoke({}, { callbacks: [logHandler] });
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0].level).toBe('warn');
+    expect(logs[0].message).toContain('Tool-message context share unavailable');
   });
 
   it('reuses exact cached counts and invalidates them after token-relevant mutation', () => {

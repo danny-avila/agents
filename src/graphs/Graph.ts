@@ -4017,7 +4017,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           contextUsage,
           finalMessages,
           agentContext.contextPressureTokenCounts?.count ??
-            agentContext.tokenCounter
+            agentContext.tokenCounter,
+          config
         );
         /** Awaited so async host handlers receive the pre-invoke snapshot
          *  before any model deltas are emitted */

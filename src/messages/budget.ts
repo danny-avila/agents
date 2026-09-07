@@ -3,8 +3,10 @@ import type {
   BaseMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { apportionTokenCounts } from '@/utils/tokens';
+import { emitAgentLog } from '@/utils/events';
 
 type NamedToolCall = {
   id?: string;
@@ -12,11 +14,44 @@ type NamedToolCall = {
   function?: { name?: string };
 };
 
+/** Inline tool-call content: an Anthropic `tool_use` block, the v1 standard
+ *  `tool_call` block (`{ id, name }` at top level, which `@langchain/aws`
+ *  serializes to a Converse toolUse), and this repo's `ToolCallContent`
+ *  (`{ tool_call: { id, name } }`). */
+type InlineToolCallBlock = {
+  id?: string;
+  name?: string;
+  tool_call?: { id?: string; name?: string };
+};
+
+/** Rejects counts a subset claim cannot be derived from. Callers must degrade
+ *  rather than propagate: this runs on the live pre-invoke path. */
 function safeCount(value: number): number {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new RangeError('Invalid tool context token count');
   }
   return value;
+}
+
+let warnedUnavailableToolShare = false;
+
+/** Warns once per process: an unusable counter is a permanent host-integration
+ *  fault, while the share is dropped on every affected call regardless. */
+function warnUnavailableToolShare(
+  config: RunnableConfig | undefined,
+  error: unknown
+): void {
+  if (warnedUnavailableToolShare) {
+    return;
+  }
+  warnedUnavailableToolShare = true;
+  emitAgentLog(
+    config,
+    'warn',
+    'budget',
+    'Tool-message context share unavailable: the token counter must return safe, non-negative integers',
+    { error: error instanceof Error ? error.message : String(error) }
+  );
 }
 
 /** Counts retained tool exchanges without serializing arguments or result content.
@@ -46,6 +81,14 @@ function computeToolMessageUsage(
     ) {
       names.set(call.id, name);
     }
+  };
+  const rememberInlineCall = (block: InlineToolCallBlock): void => {
+    const nested = block.tool_call;
+    const id = nested?.id ?? block.id;
+    if (typeof id !== 'string' || names.has(id)) {
+      return;
+    }
+    rememberCall({ id, name: nested?.name ?? block.name });
   };
 
   for (const message of context) {
@@ -80,15 +123,9 @@ function computeToolMessageUsage(
         for (const part of content) {
           if (typeof part === 'string') {
             toolOnly &&= !/\S/u.test(part);
-          } else if (part.type === 'tool_use') {
+          } else if (part.type === 'tool_use' || part.type === 'tool_call') {
             hasCalls = true;
-            if (
-              typeof part.id === 'string' &&
-              typeof part.name === 'string' &&
-              !names.has(part.id)
-            ) {
-              rememberCall({ id: part.id, name: part.name });
-            }
+            rememberInlineCall(part as InlineToolCallBlock);
           } else {
             toolOnly &&=
               part.type === 'text' &&
@@ -149,32 +186,14 @@ function computeToolMessageUsage(
   };
 }
 
-/** Reconciles derived budget fields and, when supplied, the retained tool share.
- * The index map is keyed before pruning, so it cannot index the retained context.
- * Callers may pass the existing exact token cache's counter, never a stale index lookup. */
-export function syncBudgetDerivedFields(
+/** Applies the retained tool share and clamps it to the conversation total it
+ * is a subset of. Throws when a count cannot support that claim. */
+function syncToolMessageShare(
   usage: t.ContextUsageEvent,
   context?: readonly BaseMessage[],
   tokenCounter?: t.TokenCounter
 ): void {
-  const { breakdown, contextBudget, effectiveInstructionTokens } = usage;
-  if (effectiveInstructionTokens != null) {
-    breakdown.instructionTokens = effectiveInstructionTokens;
-    if (contextBudget != null) {
-      breakdown.availableForMessages = Math.max(
-        0,
-        contextBudget - effectiveInstructionTokens
-      );
-      if (usage.remainingContextTokens != null) {
-        breakdown.messageTokens = Math.max(
-          0,
-          contextBudget -
-            effectiveInstructionTokens -
-            usage.remainingContextTokens
-        );
-      }
-    }
-  }
+  const { breakdown } = usage;
   if (context != null && tokenCounter != null) {
     Object.assign(
       breakdown,
@@ -199,4 +218,42 @@ export function syncBudgetDerivedFields(
         : undefined;
   }
   breakdown.toolMessageTokens = clamped;
+}
+
+/** Reconciles derived budget fields and, when supplied, the retained tool share.
+ * The index map is keyed before pruning, so it cannot index the retained context.
+ * Callers may pass the existing exact token cache's counter, never a stale index lookup.
+ * Runs on the live pre-invoke path, so an unusable count drops the tool share
+ * (warned once) instead of failing the model call it only measures. */
+export function syncBudgetDerivedFields(
+  usage: t.ContextUsageEvent,
+  context?: readonly BaseMessage[],
+  tokenCounter?: t.TokenCounter,
+  config?: RunnableConfig
+): void {
+  const { breakdown, contextBudget, effectiveInstructionTokens } = usage;
+  if (effectiveInstructionTokens != null) {
+    breakdown.instructionTokens = effectiveInstructionTokens;
+    if (contextBudget != null) {
+      breakdown.availableForMessages = Math.max(
+        0,
+        contextBudget - effectiveInstructionTokens
+      );
+      if (usage.remainingContextTokens != null) {
+        breakdown.messageTokens = Math.max(
+          0,
+          contextBudget -
+            effectiveInstructionTokens -
+            usage.remainingContextTokens
+        );
+      }
+    }
+  }
+  try {
+    syncToolMessageShare(usage, context, tokenCounter);
+  } catch (error) {
+    warnUnavailableToolShare(config, error);
+    delete breakdown.toolMessageTokens;
+    delete breakdown.toolMessageTokenCounts;
+  }
 }
