@@ -9,6 +9,7 @@ import {
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
 } from './alternation';
+import { getLegacyFunctionCallId } from './toolResultTypes';
 import { Providers } from '@/common';
 
 describe('strictAlternationProviders', () => {
@@ -165,6 +166,62 @@ describe('coalesceAdjacentUserTurns', () => {
       }),
       new HumanMessage({ content: 'steer' }),
     ]);
+    expect(result).toHaveLength(3);
+  });
+
+  it('pairs human tool results with raw OpenAI calls', () => {
+    const result = coalesceAdjacentUserTurns([
+      new AIMessage({
+        content: '',
+        additional_kwargs: {
+          tool_calls: [
+            {
+              id: 'raw-call',
+              type: 'function',
+              function: { name: 'lookup', arguments: '{}' },
+            },
+          ],
+        },
+      }),
+      new HumanMessage({
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'raw-call',
+            content: 'ok',
+          },
+        ],
+      }),
+      new HumanMessage('steer'),
+    ]);
+
+    expect(result).toHaveLength(3);
+  });
+
+  it('pairs human tool results with legacy function calls', () => {
+    const legacyCallId = getLegacyFunctionCallId('lookup');
+    if (legacyCallId == null) {
+      throw new Error('Expected a bounded legacy call id');
+    }
+    const result = coalesceAdjacentUserTurns([
+      new AIMessage({
+        content: '',
+        additional_kwargs: {
+          function_call: { name: 'lookup', arguments: '{}' },
+        },
+      }),
+      new HumanMessage({
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: legacyCallId,
+            content: 'ok',
+          },
+        ],
+      }),
+      new HumanMessage('steer'),
+    ]);
+
     expect(result).toHaveLength(3);
   });
 

@@ -12,6 +12,7 @@ import {
   isSyntheticProviderContextMessage,
 } from './format';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { toLangChainContent } from './langchain';
 
 /** Concatenated text across a message's content (string or structured array). */
 function getTextContent(msg: {
@@ -397,6 +398,38 @@ describe('foldToolBlocksForToollessAgent', () => {
 
     expect(hasResidualToolContent(result)).toBe(false);
     expect(result.map(getTextContent).join('\n')).toContain('Found roadmap.md');
+  });
+
+  test('folds Anthropic server-search blocks for a tool-less destination', () => {
+    const messages = [
+      new AIMessage({
+        content: toLangChainContent([
+          {
+            type: 'server_tool_use',
+            id: 'srvtoolu_1',
+            name: 'web_search',
+            input: { query: 'retained' },
+          },
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_1',
+            content: {
+              type: 'web_search_tool_result_error',
+              error_code: 'max_uses_exceeded',
+            },
+          },
+        ]),
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(result).not.toBe(messages);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toBeInstanceOf(HumanMessage);
+    expect(isSyntheticProviderContextMessage(result[0])).toBe(true);
+    expect(getTextContent(result[0])).toContain('server_tool_use');
+    expect(getTextContent(result[0])).toContain('web_search_tool_result');
   });
 
   test('detects v1 standard-content tool_call blocks (no AIMessage.tool_calls)', () => {

@@ -1,6 +1,5 @@
 import { isProxy } from 'node:util/types';
 import type {
-  AIMessage,
   BaseMessage,
   ChatMessage,
   ToolMessage,
@@ -1291,11 +1290,19 @@ export function appendProviderMessageToolCalls(
     return 0;
   }
   let recognized = 0;
-  for (const toolCall of (message as AIMessage).tool_calls ?? []) {
-    const descriptor = getProviderAIMessageToolCallDescriptor(toolCall);
-    if (descriptor != null) {
-      appendProviderToolCallDescriptor(calls, descriptor);
-      recognized += 1;
+  const toolCalls = getBoundedProviderPairingArrayProperty(
+    message,
+    'tool_calls'
+  );
+  if (toolCalls != null) {
+    for (let index = 0; index < toolCalls.length; index++) {
+      const descriptor = getProviderAIMessageToolCallDescriptor(
+        toolCalls[index]
+      );
+      if (descriptor != null) {
+        appendProviderToolCallDescriptor(calls, descriptor);
+        recognized += 1;
+      }
     }
   }
 
@@ -1304,8 +1311,8 @@ export function appendProviderMessageToolCalls(
     'tool_calls'
   );
   if (rawToolCalls != null) {
-    for (const toolCall of rawToolCalls) {
-      const descriptor = getRawToolCallDescriptor(toolCall);
+    for (let index = 0; index < rawToolCalls.length; index++) {
+      const descriptor = getRawToolCallDescriptor(rawToolCalls[index]);
       if (descriptor != null) {
         appendProviderToolCallDescriptor(calls, descriptor);
         recognized += 1;

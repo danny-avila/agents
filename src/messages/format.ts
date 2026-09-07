@@ -4313,10 +4313,11 @@ function messageHasToolContent(msg: BaseMessage): boolean {
   }
   if (Array.isArray(msg.content)) {
     for (const block of msg.content as ExtendedMessageContent[]) {
-      const type = readFoldedDataProperty(block, 'type');
       if (
         typeof block === 'object' &&
-        (type === 'tool_use' || type === 'tool_call' || type === 'tool_result')
+        (getProviderToolCallPartDescriptor(block) != null ||
+          getProviderToolResultPartDescriptor(block) != null ||
+          readFoldedDataProperty(block, 'tool_call') != null)
       ) {
         return true;
       }
@@ -4338,7 +4339,7 @@ function isToolResultMessage(msg: BaseMessage): boolean {
     return (msg.content as ExtendedMessageContent[]).some(
       (block) =>
         typeof block === 'object' &&
-        readFoldedDataProperty(block, 'type') === 'tool_result'
+        getProviderToolResultPartDescriptor(block) != null
     );
   }
   return false;
