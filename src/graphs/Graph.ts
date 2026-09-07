@@ -157,6 +157,7 @@ import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { isFadingTier, isInformativeFadingTier } from '@/messages/fading';
 import { createContextPressureMeter } from '@/llm/contextPressureMeter';
+import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import {
   prepareProviderRequest,
@@ -175,7 +176,10 @@ import {
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
-import { createRemoveAllMessage, messagesStateReducer  } from '@/messages/reducer';
+import {
+  createRemoveAllMessage,
+  messagesStateReducer,
+} from '@/messages/reducer';
 import { getTruncationStopReason } from '@/llm/truncation';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
@@ -1619,7 +1623,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     ) {
       return result;
     }
-    return { ...result, messages: [createRemoveAllMessage(), ...result.messages] };
+    return {
+      ...result,
+      messages: [createRemoveAllMessage(), ...result.messages],
+    };
   }
 
   /** Rotates the Langfuse identities that must never cross fresh executions. */
@@ -3549,6 +3556,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         calibrationRatio: agentContext.calibrationRatio,
       });
       const trackProviderMessageOrigins = contextPressure.trackProjection;
+      const toolHistory = createToolHistoryPreparation();
 
       if (agentContext.useLegacyContent) {
         const before = finalMessages;
@@ -3661,7 +3669,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               before,
               agentContext.provider,
               config,
-              this.startIndex
+              this.startIndex,
+              toolHistory
             )
           );
         }
@@ -3681,7 +3690,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 (this.overrideModel ?? model) as t.ChatModel,
                 agentContext.provider,
                 config
-              )
+              ),
+              toolHistory
             )
           );
           if (agentContext.useLegacyContent) {
@@ -4051,6 +4061,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         context: this,
         config,
         maxToolResultChars: maxProviderToolResultChars,
+        toolHistory,
         measure: (preparedMessages) =>
           measureProviderPayload(
             trackProviderMessageOrigins(
@@ -4515,6 +4526,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   maxContextTokens: fallbackMaxContextTokens,
                   config: fallbackConfig,
                 }) => {
+                  const fallbackToolHistory = createToolHistoryPreparation();
                   const servingFallbackMessages =
                     toolsForBinding == null || toolsForBinding.length === 0
                       ? foldToolBlocksForToollessAgent(
@@ -4524,7 +4536,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                           fallbackModel,
                           fallbackProvider,
                           fallbackConfig
-                        )
+                        ),
+                        fallbackToolHistory
                       )
                       : fallbackMessages;
                   const fallbackToolResultChars =
@@ -4547,6 +4560,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     context: this,
                     config: fallbackConfig,
                     maxToolResultChars: fallbackToolResultChars,
+                    toolHistory: fallbackToolHistory,
                     measure: (preparedMessages) =>
                       measureProviderPayload(
                         trackProviderMessageOrigins(

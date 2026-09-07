@@ -1,9 +1,5 @@
 import { describe, expect, it, jest } from '@jest/globals';
-import {
-  AIMessage,
-  HumanMessage,
-  ToolMessage,
-} from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import {
@@ -14,6 +10,13 @@ import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { attemptInvoke } from '@/llm/invoke';
 import { Providers } from '@/common';
+import { foldToolBlocksForToollessAgent } from '@/messages/format';
+import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
+import { createContextPressureMeter } from './contextPressureMeter';
+import {
+  getProviderMessageProvenance,
+  getProviderSourceMessageIds,
+} from '@/messages/provenance';
 
 type StubModel = {
   model?: string;
@@ -41,6 +44,120 @@ function createCapturingModel(): CapturingModel {
 }
 
 describe('prepareProviderRequest', () => {
+  it('shares source facts without caching the destination serving policy', () => {
+    const { model } = createCapturingModel();
+    model._useResponsesApi = (): boolean => true;
+    const message = new AIMessage({
+      content: 'approval needed',
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            type: 'mcp_approval_request',
+            id: 'approval',
+            name: 'lookup',
+            arguments: '{}',
+          },
+        ],
+      },
+    });
+    const messages = [message];
+    const history = createToolHistoryPreparation();
+    const facts = history.get(message);
+    const native = foldToolBlocksForToollessAgent(
+      messages,
+      undefined,
+      true,
+      history
+    );
+    const fallback = foldToolBlocksForToollessAgent(
+      messages,
+      undefined,
+      false,
+      history
+    );
+    expect(native).toBe(messages);
+    expect(fallback).not.toBe(messages);
+    expect(JSON.stringify(fallback[0].content)).toContain(
+      'mcp_approval_request'
+    );
+    expect(history.get(message)).toBe(facts);
+    expect(
+      prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: native,
+        provider: Providers.OPENAI,
+        toolHistory: history,
+      }).projectionMode
+    ).toBe('openai-responses');
+    expect(
+      prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: fallback,
+        provider: Providers.ANTHROPIC,
+        toolHistory: history,
+      }).projectionMode
+    ).not.toBe('openai-responses');
+  });
+  it('preserves original provenance when fallback folds before origin tracking', () => {
+    const { model } = createCapturingModel();
+    const message = new AIMessage({
+      content: 'The answer is 4.',
+      additional_kwargs: { sourceMessageId: 'original-assistant-row' },
+      response_metadata: {
+        output: [
+          {
+            type: 'code_interpreter_call',
+            status: 'completed',
+            outputs: [{ type: 'logs', logs: '4' }],
+          },
+          {
+            type: 'message',
+            content: [{ type: 'output_text', text: 'The answer is 4.' }],
+          },
+        ],
+      },
+    });
+    const messages = [message];
+    const meter = createContextPressureMeter({
+      indexTokenCountMap: {},
+      sourceMessages: messages,
+      retainedMessages: messages,
+      provider: Providers.OPENAI,
+      tokenCounter: (entry) => JSON.stringify(entry.content).length,
+      instructionTokens: 0,
+      calibrationRatio: 1,
+      contextUsage: { contextBudget: 10_000, effectiveInstructionTokens: 0 },
+    });
+    const toolHistory = createToolHistoryPreparation();
+    const folded = foldToolBlocksForToollessAgent(
+      messages,
+      undefined,
+      false,
+      toolHistory
+    );
+    const request = prepareProviderRequest({
+      model: model as t.ChatModel,
+      provider: Providers.ANTHROPIC,
+      messages: folded,
+      toolHistory,
+      measure: (prepared) =>
+        meter.measure(meter.trackProjection(folded, prepared), {
+          contextBudget: 10_000,
+          forceRawRecount: true,
+        }),
+    });
+    expect(getProviderSourceMessageIds(request.messages[0])).toEqual([
+      'original-assistant-row',
+    ]);
+    expect(getProviderMessageProvenance(request.messages[0])?.parts).toEqual(
+      expect.arrayContaining([
+        { attribution: 'model', sourceMessageId: 'original-assistant-row' },
+        { attribution: 'tool', sourceMessageId: 'original-assistant-row' },
+      ])
+    );
+    expect(request.measurement?.toolMessageTokens).toBeGreaterThan(0);
+    expect(message.content).toBe('The answer is 4.');
+  });
   it.each([
     ['CSV', 'csv'],
     ['XLSX', 'xlsx'],
@@ -267,10 +384,7 @@ describe('prepareProviderRequest', () => {
 
   it('measures and sends the exact prepared message array without re-projection', async () => {
     const { model, invocations } = createCapturingModel();
-    const source = [
-      new HumanMessage('first'),
-      new HumanMessage('second'),
-    ];
+    const source = [new HumanMessage('first'), new HumanMessage('second')];
     const measure = jest.fn((messages: BaseMessage[]) => ({
       fits: true,
       projectedMessageTokens: messages.length * 10,
@@ -331,9 +445,7 @@ describe('prepareProviderRequest', () => {
       measure,
     });
 
-    expect(request.messages[0].content).toBe(
-      '[ref: tool0turn0]\ntool output'
-    );
+    expect(request.messages[0].content).toBe('[ref: tool0turn0]\ntool output');
     expect(measure).toHaveBeenCalledWith(request.messages);
     expect(toolMessage.content).toBe('tool output');
     expect(toolMessage.additional_kwargs._refKey).toBe('tool0turn0');
@@ -341,7 +453,10 @@ describe('prepareProviderRequest', () => {
 
   it('includes serving-provider handoff shaping before measurement', () => {
     const { model } = createCapturingModel();
-    const predecessor = new AIMessage({ id: 'previous-agent', content: 'done' });
+    const predecessor = new AIMessage({
+      id: 'previous-agent',
+      content: 'done',
+    });
     const measure = jest.fn((messages: BaseMessage[]) => ({
       fits: messages.length > 0,
     }));

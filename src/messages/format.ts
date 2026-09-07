@@ -14,6 +14,11 @@ import type {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
+  OrderedToolHistoryProjection,
+  ToolHistoryPreparation,
+  ToolHistoryCallMirrors,
+} from './toolHistoryProjection';
+import type {
   BedrockReasoningContentText,
   ExtendedMessageContent,
   GoogleReasoningContentText,
@@ -44,7 +49,6 @@ import {
   getProviderToolCallPartDescriptor,
   getProviderToolResultPartDescriptor,
   hasStructurallyValidAnthropicWebSearchResultContent,
-  isProviderToolCallContentPart,
   isProviderToolContentPart,
 } from './toolResultTypes';
 import {
@@ -78,6 +82,11 @@ import { isReasoningContentBlock } from './reasoningTypes';
 import { flattenLegacyContent, isLegacyConvertible } from './content';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { emitAgentLog } from '@/utils/events';
+import {
+  createToolHistoryPreparation,
+  isToolHistoryCallMirror,
+  recordToolHistoryCallMirror,
+} from './toolHistoryProjection';
 
 interface MediaMessageParams {
   message: {
@@ -604,8 +613,7 @@ function createDerivedCompactionSemanticIndexCollector(
     Number.isSafeInteger(serializedProvidedEntryCount) &&
     serializedProvidedEntryCount >= snapshotProvidedEntryCount;
   const providedEntryCount =
-    validSerializedProvidedEntryCount &&
-    serializedProvidedEntryCount != null
+    validSerializedProvidedEntryCount && serializedProvidedEntryCount != null
       ? serializedProvidedEntryCount
       : snapshotProvidedEntryCount;
   collector.omittedBaseEntryCount = Math.max(
@@ -3036,10 +3044,7 @@ export const formatAgentMessages = (
             }
           }
 
-          if (
-            discoveredTools.has(toolName) ||
-            isSdkManagedToolName(toolName)
-          ) {
+          if (discoveredTools.has(toolName) || isSdkManagedToolName(toolName)) {
             filteredContent.push(part);
             filteredSourceContentPartIndices.push(partSourceContentIndices);
             if (
@@ -3669,7 +3674,20 @@ function getSyntheticProviderContextProvenanceParts(
       parts.push({ attribution: fallbackAttribution });
     }
     for (const attribution of source.additionalAttributions ?? []) {
-      parts.push({ attribution });
+      const sourceMessageId =
+        sourceMessageIds.length === 1
+          ? sourceMessageIds[0]
+          : undefined;
+      const retainedSourceId =
+        retainedSourceIds.size === 1
+          ? retainedSourceIds.values().next().value
+          : undefined;
+      parts.push({
+        attribution,
+        ...((sourceMessageId ?? retainedSourceId) != null && {
+          sourceMessageId: sourceMessageId ?? retainedSourceId,
+        }),
+      });
     }
   }
   return mergeAdjacentProviderProvenanceParts(parts);
@@ -3766,115 +3784,75 @@ function flushTextChunks(
   textChunks.length = 0;
 }
 
-const OPENAI_RESPONSES_SERVER_TOOL_TYPES: ReadonlySet<string> = new Set([
-  'apply_patch_call_output',
-  'code_interpreter_call',
-  'computer_call',
-  'custom_tool_call',
-  'file_search_call',
-  'image_generation_call',
-  'local_shell_call_output',
-  'mcp_call',
-  'mcp_list_tools',
-  'program_output',
-  'shell_call_output',
-  'tool_search_output',
-  'web_search_call',
-]);
-
-interface AuthoritativeResponsesToolOutput {
-  readonly output: readonly unknown[];
-  readonly preservesOrder: boolean;
-}
-
 function getAuthoritativeResponsesToolOutput(
-  message: BaseMessage
-): AuthoritativeResponsesToolOutput | undefined {
-  const responseOutput = getBoundedProviderPairingArrayProperty(
-    message.response_metadata,
-    'output'
-  );
-  const toolOutputs = getBoundedProviderPairingArrayProperty(
-    message.additional_kwargs,
-    'tool_outputs'
-  );
-  const preservesOrder = responseOutput != null && responseOutput.length > 0;
-  const output = preservesOrder ? responseOutput : toolOutputs;
-  if (output == null || output.length === 0) {
-    return undefined;
-  }
-  const serverToolOutput: unknown[] = [];
-  for (let index = 0; index < output.length; index++) {
-    const type = readFoldedDataProperty(output[index], 'type');
-    if (
-      typeof type === 'string' &&
-      OPENAI_RESPONSES_SERVER_TOOL_TYPES.has(type)
-    ) {
-      serverToolOutput.push(output[index]);
-    }
-  }
-  if (serverToolOutput.length === 0) {
-    return undefined;
-  }
-  return {
-    output: preservesOrder ? output : serverToolOutput,
-    preservesOrder,
-  };
+  message: BaseMessage,
+  preparation: ToolHistoryPreparation
+): OrderedToolHistoryProjection | undefined {
+  const projection = preparation.get(message);
+  return projection?.hasToolContent === true ? projection : undefined;
 }
 
 function appendOrderedResponsesOutput(
-  output: readonly unknown[],
+  projection: OrderedToolHistoryProjection,
   textChunks: string[],
-  budget: FoldContextBudget
-): { contributed: boolean; complete: boolean } {
-  const remainingCharsBefore = budget.remainingChars;
-  let complete = true;
-  for (const item of output) {
+  parts: MessageContentComplex[],
+  budget: FoldContextBudget,
+  omitText = false
+): { contributed: boolean; complete: boolean; hasTool: boolean } {
+  let contributed = false;
+  let hasTool = false;
+  for (const contribution of projection.contributions) {
     if (!consumeFoldedWork(textChunks, budget)) {
-      complete = false;
       break;
     }
-    const type = readFoldedDataProperty(item, 'type');
-    if (type === 'message') {
-      const content = readFoldedDataProperty(item, 'content');
-      if (!Array.isArray(content)) {
+    const remainingCharsBefore = budget.remainingChars;
+    if (contribution.kind === 'image') {
+      const chars = getToolContentCharLength([contribution.image]);
+      if (chars > budget.remainingChars) {
+        appendFoldedLine(textChunks, budget, [
+          'Tool: [image omitted: folded context limit]',
+        ]);
+        contributed = true;
+        hasTool = true;
         continue;
       }
-      for (const part of content) {
-        const partType = readFoldedDataProperty(part, 'type');
-        const value =
-          partType === 'refusal'
-            ? readFoldedDataProperty(part, 'refusal')
-            : readFoldedDataProperty(part, 'text');
-        if (typeof value === 'string' && value) {
-          appendFoldedLine(textChunks, budget, ['AI: ', value]);
-        }
-      }
+      flushTextChunks(textChunks, parts);
+      parts.push(contribution.image as MessageContentComplex);
+      budget.remainingChars -= chars;
+      contributed = true;
+      hasTool = true;
       continue;
     }
-    if (type === 'function_call') {
-      const name = readFoldedDataProperty(item, 'name');
-      const args = readFoldedDataProperty(item, 'arguments');
+    if (contribution.kind === 'text') {
+      if (omitText) {
+        continue;
+      }
+      appendFoldedLine(textChunks, budget, ['AI: ', contribution.text]);
+    } else if (contribution.kind === 'call') {
       appendFoldedLine(textChunks, budget, [
-        `AI: [tool_call] ${typeof name === 'string' ? name : ''}(`,
-        typeof args === 'string' ? args : serializeFoldedValue(args ?? {}),
+        `AI: [tool_call] ${contribution.name}(`,
+        serializeFoldedValue(contribution.arguments),
         ')',
       ]);
-      continue;
-    }
-    if (
-      typeof type === 'string' &&
-      OPENAI_RESPONSES_SERVER_TOOL_TYPES.has(type)
-    ) {
+    } else if (contribution.providerType !== 'reasoning') {
       appendFoldedLine(textChunks, budget, [
         'AI: [server_tool_output] ',
-        serializeFoldedValue(item),
+        serializeFoldedValue(contribution.value),
       ]);
     }
+    const retained = budget.remainingChars < remainingCharsBefore;
+    contributed ||= retained;
+    hasTool ||= retained && contribution.actor === 'tool';
+  }
+  if (projection.truncated) {
+    const before = budget.remainingChars;
+    appendFoldedLine(textChunks, budget, [FOLDED_CONTEXT_TRUNCATION_NOTICE]);
+    contributed ||= budget.remainingChars < before;
   }
   return {
-    contributed: budget.remainingChars < remainingCharsBefore,
-    complete,
+    contributed,
+    complete: !budget.truncated && !projection.truncated,
+    hasTool,
   };
 }
 
@@ -3885,30 +3863,46 @@ function appendOrderedResponsesOutput(
  * blocks are retained as bounded text so a folded cross-provider history
  * cannot contain an unsupported native block or JSON-expand without limit.
  *
- * When `content` is an array containing tool_use blocks, `tool_calls` is NOT
- * additionally serialized (avoiding double output).  `tool_calls` is used as
- * a fallback when `content` is a plain string or an array with no tool_use.
+ * Parsed calls are omitted only when identity, name, and complete arguments
+ * establish an equivalent content representation.
  */
 function appendMessageContent(
   msg: BaseMessage,
   role: string,
   textChunks: string[],
   parts: MessageContentComplex[],
-  budget: FoldContextBudget
+  budget: FoldContextBudget,
+  preparation: ToolHistoryPreparation = createToolHistoryPreparation()
 ): FoldedSourceMessage | undefined {
   const { content } = msg;
-  const responsesOutput = getAuthoritativeResponsesToolOutput(msg);
-  if (responsesOutput?.preservesOrder === true) {
+  const responsesOutput = getAuthoritativeResponsesToolOutput(msg, preparation);
+  if (
+    responsesOutput != null &&
+    (responsesOutput.source.coverage === 'complete-output' ||
+      typeof content === 'string' ||
+      (Array.isArray(content) &&
+        content.length <= MAX_FOLDED_CONTEXT_WORK &&
+        content.every(
+          (block) => readFoldedDataProperty(block, 'type') === 'text'
+        )))
+  ) {
     const orderedOutput = appendOrderedResponsesOutput(
-      responsesOutput.output,
+      responsesOutput,
       textChunks,
+      parts,
       budget
     );
-    return orderedOutput.contributed
+    const toolCalls =
+      responsesOutput.source.coverage === 'tool-sidecar'
+        ? appendToolCalls(msg, role, textChunks, budget)
+        : { contributed: false, complete: true };
+    return orderedOutput.contributed || toolCalls.contributed
       ? {
         message: msg,
         mappingAmbiguous: true,
-        additionalAttributions: ['tool'],
+        ...(orderedOutput.hasTool && {
+          additionalAttributions: ['tool'] as const,
+        }),
       }
       : undefined;
   }
@@ -3921,21 +3915,12 @@ function appendMessageContent(
         consumeFoldedWork(textChunks, budget) &&
         appendFoldedLine(textChunks, budget, [`${role}: `, content]);
     }
-    if (responsesOutput != null) {
-      appendFoldedLine(textChunks, budget, [
-        'AI: [server_tool_output] ',
-        serializeFoldedValue(responsesOutput.output),
-      ]);
-    }
     const toolCalls = appendToolCalls(msg, role, textChunks, budget);
     return budget.remainingChars < remainingCharsBefore || toolCalls.contributed
       ? {
         message: msg,
         ...((!contentComplete || !toolCalls.complete) && {
           mappingAmbiguous: true,
-        }),
-        ...(responsesOutput != null && {
-          additionalAttributions: ['tool'] as const,
         }),
       }
       : undefined;
@@ -3951,13 +3936,12 @@ function appendMessageContent(
       : undefined;
   }
 
-  let hasToolUseBlock = false;
+  const representedToolCalls: ToolHistoryCallMirrors = new Map();
   const retainedContentPartIndices = new Set<number>();
 
   for (let blockIndex = 0; blockIndex < content.length; blockIndex++) {
     const block = content[blockIndex] as ExtendedMessageContent;
     if (!consumeFoldedWork(textChunks, budget)) {
-      hasToolUseBlock = true;
       break;
     }
     const remainingCharsBefore = budget.remainingChars;
@@ -3971,8 +3955,10 @@ function appendMessageContent(
       typeof blockTypeValue === 'string' ? blockTypeValue : undefined;
     const blockRole =
       getProviderToolResultPartDescriptor(block) != null ? 'Tool' : role;
-    hasToolUseBlock ||= isProviderToolCallContentPart(block);
-
+    const callDescriptor = getProviderToolCallPartDescriptor(block);
+    if (callDescriptor != null) {
+      recordToolHistoryCallMirror(representedToolCalls, block);
+    }
     if (
       blockType !== 'tool_use' &&
       blockType !== 'tool_call' &&
@@ -4002,7 +3988,6 @@ function appendMessageContent(
     }
 
     if (blockType === 'tool_use') {
-      hasToolUseBlock = true;
       const name = readFoldedDataProperty(block, 'name');
       const input = readFoldedDataProperty(block, 'input');
       appendFoldedLine(textChunks, budget, [
@@ -4019,7 +4004,6 @@ function appendMessageContent(
     // output } }`, from `convertMessagesToContent` / persisted history). Handle
     // both, and emit any embedded output, so the name/args/result survive.
     if (blockType === 'tool_call') {
-      hasToolUseBlock = true;
       const nested = readFoldedDataProperty(block, 'tool_call');
       const nestedName = readFoldedDataProperty(nested, 'name');
       const topLevelName = readFoldedDataProperty(block, 'name');
@@ -4053,16 +4037,12 @@ function appendMessageContent(
     // user message carrying the result). Preserve nested image blocks as-is
     // instead of JSON-stringifying them through the generic fallback.
     if (blockType === 'tool_result') {
-      hasToolUseBlock = true;
       const inner = readFoldedDataProperty(block, 'content') as
         | ToolResultContent['content']
         | undefined;
       if (typeof inner === 'string') {
         if (inner) {
-          appendFoldedLine(textChunks, budget, [
-            'Tool: [tool_result] ',
-            inner,
-          ]);
+          appendFoldedLine(textChunks, budget, ['Tool: [tool_result] ', inner]);
         }
       } else if (Array.isArray(inner)) {
         for (const innerBlock of inner as Array<
@@ -4138,24 +4118,23 @@ function appendMessageContent(
     markBlockRetained();
   }
 
-  let responsesOutputContributed = false;
-  if (!hasToolUseBlock) {
-    if (responsesOutput != null) {
-      const remainingCharsBefore = budget.remainingChars;
-      appendFoldedLine(textChunks, budget, [
-        'AI: [server_tool_output] ',
-        serializeFoldedValue(responsesOutput.output),
-      ]);
-      responsesOutputContributed =
-        budget.remainingChars < remainingCharsBefore;
-    }
-  }
+  const responsesOutputContributed =
+    responsesOutput != null &&
+    appendOrderedResponsesOutput(
+      responsesOutput,
+      textChunks,
+      parts,
+      budget,
+      true
+    ).contributed;
 
-  // If content array had no tool_use blocks, fall back to tool_calls metadata
-  // (handles edge case: empty content array with tool_calls populated)
-  const toolCalls = !hasToolUseBlock
-    ? appendToolCalls(msg, role, textChunks, budget)
-    : { contributed: false, complete: true };
+  const toolCalls = appendToolCalls(
+    msg,
+    role,
+    textChunks,
+    budget,
+    representedToolCalls
+  );
   if (toolCalls.contributed || responsesOutputContributed) {
     return {
       message: msg,
@@ -4176,7 +4155,8 @@ function appendToolCalls(
   msg: BaseMessage,
   role: string,
   textChunks: string[],
-  budget: FoldContextBudget
+  budget: FoldContextBudget,
+  representedToolCalls?: ToolHistoryCallMirrors
 ): { contributed: boolean; complete: boolean } {
   if (role !== 'AI') {
     return { contributed: false, complete: true };
@@ -4212,6 +4192,16 @@ function appendToolCalls(
       }
       const name = readFoldedDataProperty(tc, 'name');
       const args = readFoldedDataProperty(tc, 'args');
+      if (
+        isToolHistoryCallMirror(
+          representedToolCalls,
+          readFoldedDataProperty(tc, 'id'),
+          name,
+          args
+        )
+      ) {
+        continue;
+      }
       appendFoldedLine(textChunks, budget, [
         `AI: [tool_call] ${typeof name === 'string' ? name : ''}(`,
         serializeFoldedValue(args),
@@ -4242,7 +4232,7 @@ function appendToolCalls(
     const args = readFoldedDataProperty(fn, 'arguments');
     appendFoldedLine(textChunks, budget, [
       `AI: [tool_call] ${typeof name === 'string' ? name : ''}(`,
-      typeof args === 'string' ? args : '',
+      serializeFoldedValue(typeof args === 'string' ? args : ''),
       ')',
     ]);
   }
@@ -4282,7 +4272,8 @@ export function ensureThinkingBlockInMessages(
   messages: BaseMessage[],
   _provider: ProviderName,
   config?: RunnableConfig,
-  runStartIndex?: number
+  runStartIndex?: number,
+  preparation: ToolHistoryPreparation = createToolHistoryPreparation()
 ): BaseMessage[] {
   if (messages.length === 0) {
     return messages;
@@ -4405,7 +4396,8 @@ export function ensureThinkingBlockInMessages(
         'AI',
         textChunks,
         parts,
-        foldBudget
+        foldBudget,
+        preparation
       );
       if (aiSource != null) {
         foldedSourceMessages.push(aiSource);
@@ -4418,7 +4410,8 @@ export function ensureThinkingBlockInMessages(
           'Tool',
           textChunks,
           parts,
-          foldBudget
+          foldBudget,
+          preparation
         );
         if (toolSource != null) {
           foldedSourceMessages.push(toolSource);
@@ -4464,7 +4457,8 @@ export function ensureThinkingBlockInMessages(
  *  `assistant(tool_calls) -> user(...)` sequence. */
 function messageHasToolContent(
   msg: BaseMessage,
-  preserveNativeOpenAIResponses = false
+  preserveNativeOpenAIResponses = false,
+  preparation: ToolHistoryPreparation = createToolHistoryPreparation()
 ): boolean {
   if (isToolMessage(msg)) {
     return true;
@@ -4502,7 +4496,7 @@ function messageHasToolContent(
   }
   if (
     !preserveNativeOpenAIResponses &&
-    getAuthoritativeResponsesToolOutput(msg) != null
+    getAuthoritativeResponsesToolOutput(msg, preparation) != null
   ) {
     return true;
   }
@@ -4569,7 +4563,8 @@ function getFoldedMessageRole(msg: BaseMessage): 'AI' | 'Tool' | 'User' {
 export function foldToolBlocksForToollessAgent(
   messages: BaseMessage[],
   config?: RunnableConfig,
-  preserveNativeOpenAIResponses = false
+  preserveNativeOpenAIResponses = false,
+  preparation: ToolHistoryPreparation = createToolHistoryPreparation()
 ): BaseMessage[] {
   let result: BaseMessage[] | null = null;
   let foldedCount = 0;
@@ -4577,7 +4572,9 @@ export function foldToolBlocksForToollessAgent(
   let i = 0;
   while (i < messages.length) {
     const msg = messages[i];
-    if (!messageHasToolContent(msg, preserveNativeOpenAIResponses)) {
+    if (
+      !messageHasToolContent(msg, preserveNativeOpenAIResponses, preparation)
+    ) {
       result?.push(msg);
       i++;
       continue;
@@ -4597,7 +4594,8 @@ export function foldToolBlocksForToollessAgent(
       getFoldedMessageRole(msg),
       textChunks,
       parts,
-      foldBudget
+      foldBudget,
+      preparation
     );
     if (initialSource != null) {
       foldedSourceMessages.push(initialSource);
@@ -4611,7 +4609,8 @@ export function foldToolBlocksForToollessAgent(
         getFoldedMessageRole(messages[j]),
         textChunks,
         parts,
-        foldBudget
+        foldBudget,
+        preparation
       );
       if (toolSource != null) {
         foldedSourceMessages.push(toolSource);
