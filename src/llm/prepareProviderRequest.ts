@@ -7,6 +7,7 @@ import type {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type * as t from '@/types';
+import type { ToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import {
   projectCacheControlledToolOutputsToText,
   projectComputerCallOutputsToText,
@@ -32,6 +33,7 @@ import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { getProviderFamily } from '@/llm/providerRegistry';
 import { Providers } from '@/common';
+import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 
 const preparedProviderRequestBrand = Symbol('PreparedProviderRequest');
 const OMITTED_ATTACHMENT_TEXT =
@@ -119,6 +121,7 @@ export interface PrepareProviderRequestParams {
   config?: RunnableConfig;
   maxToolResultChars?: number;
   measure?: (messages: BaseMessage[]) => ProviderPayloadMeasurement;
+  toolHistory?: ToolHistoryPreparation;
 }
 
 export function usesNativeOpenAIResponses(
@@ -163,11 +166,8 @@ export function usesNativeOpenAIResponses(
       } else if (effectiveCallOptions == null) {
         effectiveCallOptions = runnable.defaultOptions;
       }
-      if (
-        runnable._useResponsesApi?.(effectiveCallOptions) === true ||
-        runnable._useResponsesApi?.(undefined) === true
-      ) {
-        return true;
+      if (typeof runnable._useResponsesApi === 'function') {
+        return runnable._useResponsesApi(effectiveCallOptions) === true;
       }
     } catch {
       // Continue through RunnableSequence/RunnableBinding wrappers.
@@ -207,6 +207,7 @@ interface ProjectMessagesForProviderParams {
   provider: t.ProviderName;
   maxToolResultChars?: number;
   callOptions?: unknown;
+  toolHistory?: ToolHistoryPreparation;
 }
 
 function isSerializedBuffer(value: object): value is SerializedBuffer {
@@ -404,7 +405,12 @@ function projectAttachmentsForProvider(
 }
 
 function projectMessagesForProviderMode(
-  { messages, provider, maxToolResultChars }: ProjectMessagesForProviderParams,
+  {
+    messages,
+    provider,
+    maxToolResultChars,
+    toolHistory,
+  }: ProjectMessagesForProviderParams,
   projectionMode: ProviderMessageProjectionMode
 ): BaseMessage[] {
   const providerFamily = getProviderFamily(provider);
@@ -413,7 +419,8 @@ function projectMessagesForProviderMode(
     projectToolStreamContentForProvider(
       messages,
       nativeOpenAIResponses ? 'native' : 'fallback',
-      maxToolResultChars
+      maxToolResultChars,
+      toolHistory
     ),
     provider
   );
@@ -525,6 +532,7 @@ export function prepareProviderRequest({
   config,
   maxToolResultChars,
   measure,
+  toolHistory = createToolHistoryPreparation(),
 }: PrepareProviderRequestParams): PreparedProviderRequest {
   const projectionMode = resolveProviderMessageProjectionMode(
     model,
@@ -538,6 +546,7 @@ export function prepareProviderRequest({
       provider,
       maxToolResultChars,
       callOptions: config,
+      toolHistory,
     },
     projectionMode
   );

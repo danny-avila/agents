@@ -244,6 +244,14 @@ specific replay and wire shaping remain later request projections.
 
 ## Model Context Reconstruction
 
+An **Ordered Tool History Projection** preserves the contributions carried by
+provider history together with their order, actor, item identity, and text or
+media payload. Complete Responses output and partial streaming sidecars have
+different coverage: a sidecar cannot replace ordinary message content or prove
+its position without recorded replay positions. Folding and replay share source
+selection and generated-image interpretation. Native replay policy remains in
+request preparation; the projection never mutates checkpoint messages.
+
 A **Session Log** is the append-only source of persisted conversation events.
 It retains message, summary, and lifecycle history without becoming a second
 mutable message state.

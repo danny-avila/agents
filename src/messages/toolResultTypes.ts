@@ -1,6 +1,5 @@
 import { isProxy } from 'node:util/types';
 import type {
-  AIMessage,
   BaseMessage,
   ChatMessage,
   ToolMessage,
@@ -34,7 +33,7 @@ export interface ProviderToolResultPartDescriptor {
 
 export interface ProviderToolCallIndexEntry {
   readonly descriptor: ProviderToolCallPartDescriptor;
-  secondarySourceType?: string;
+  secondarySourceTypes?: Set<string>;
 }
 
 export type ProviderToolCallIndex = Map<
@@ -754,6 +753,33 @@ export function getProviderToolResultPartDescriptor(
   return undefined;
 }
 
+const PROVIDER_TOOL_CALL_CONTENT_TYPES: ReadonlySet<string> = new Set([
+  'tool_call',
+  'tool_use',
+  'server_tool_use',
+  'mcp_tool_use',
+  'server_tool_call',
+  'toolCall',
+  'toolUse',
+  'executableCode',
+]);
+
+export function isProviderToolCallContentPart(part: unknown): boolean {
+  const record = getRecord(part);
+  const type = record == null ? undefined : readString(record, 'type');
+  return type != null && PROVIDER_TOOL_CALL_CONTENT_TYPES.has(type);
+}
+
+export function isProviderToolContentPart(part: unknown): boolean {
+  const record = getRecord(part);
+  const type = record == null ? undefined : readString(record, 'type');
+  return (
+    type != null &&
+    (PROVIDER_TOOL_CALL_CONTENT_TYPES.has(type) ||
+      Object.prototype.hasOwnProperty.call(TOOL_RESULT_ENVELOPE_FIELDS, type))
+  );
+}
+
 function optionalName(
   record: Record<string, unknown>
 ): { readonly name?: string } | undefined {
@@ -1072,17 +1098,16 @@ export function appendProviderToolCallDescriptor(
   if (existing === null) {
     return;
   }
-  const isDualRepresentation =
-    existing.secondarySourceType == null &&
-    existing.descriptor.sourceType !== descriptor.sourceType &&
-    (existing.descriptor.sourceType === 'ai_tool_calls' ||
-      descriptor.sourceType === 'ai_tool_calls');
-  if (
+  const sourceTypes =
+    existing.secondarySourceTypes ??
+    new Set<string>([existing.descriptor.sourceType]);
+  const isEquivalentRepresentation =
     existing.descriptor.kind === descriptor.kind &&
     existing.descriptor.name === descriptor.name &&
-    isDualRepresentation
-  ) {
-    existing.secondarySourceType = descriptor.sourceType;
+    !sourceTypes.has(descriptor.sourceType);
+  if (isEquivalentRepresentation) {
+    sourceTypes.add(descriptor.sourceType);
+    existing.secondarySourceTypes = sourceTypes;
     return;
   }
   index.set(descriptor.callId, null);
@@ -1291,11 +1316,19 @@ export function appendProviderMessageToolCalls(
     return 0;
   }
   let recognized = 0;
-  for (const toolCall of (message as AIMessage).tool_calls ?? []) {
-    const descriptor = getProviderAIMessageToolCallDescriptor(toolCall);
-    if (descriptor != null) {
-      appendProviderToolCallDescriptor(calls, descriptor);
-      recognized += 1;
+  const toolCalls = getBoundedProviderPairingArrayProperty(
+    message,
+    'tool_calls'
+  );
+  if (toolCalls != null) {
+    for (let index = 0; index < toolCalls.length; index++) {
+      const descriptor = getProviderAIMessageToolCallDescriptor(
+        toolCalls[index]
+      );
+      if (descriptor != null) {
+        appendProviderToolCallDescriptor(calls, descriptor);
+        recognized += 1;
+      }
     }
   }
 
@@ -1304,8 +1337,8 @@ export function appendProviderMessageToolCalls(
     'tool_calls'
   );
   if (rawToolCalls != null) {
-    for (const toolCall of rawToolCalls) {
-      const descriptor = getRawToolCallDescriptor(toolCall);
+    for (let index = 0; index < rawToolCalls.length; index++) {
+      const descriptor = getRawToolCallDescriptor(rawToolCalls[index]);
       if (descriptor != null) {
         appendProviderToolCallDescriptor(calls, descriptor);
         recognized += 1;
