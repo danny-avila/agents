@@ -209,6 +209,42 @@ describe('splitAtRecencyBoundary', () => {
   });
 
   describe('pairing-balanced intra-turn fallback', () => {
+    it('uses provider roles while finding an intra-turn boundary', () => {
+      const genericAssistant = new ChatMessage({
+        role: 'assistant',
+        content: '',
+        additional_kwargs: {
+          tool_calls: [
+            {
+              id: 'generic',
+              type: 'function',
+              function: { name: 'search', arguments: '{}' },
+            },
+          ],
+        },
+      });
+      const messages = [
+        genericAssistant,
+        new ToolMessage({
+          content: 'result',
+          tool_call_id: 'generic',
+          name: 'search',
+        }),
+        new AIMessage('latest state'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        provider: 'bedrock',
+        turns: 1,
+        tokenCounter: () => 100,
+        intraTurnTokens: 100,
+      });
+
+      expect(result.head).toEqual([]);
+      expect(result.tail).toEqual(messages);
+      expect(result.usedIntraTurnFallback).toBe(false);
+    });
+
     it('compacts older closed tool units from a single long turn', () => {
       const messages: BaseMessage[] = [new HumanMessage('inspect the repo')];
       for (let index = 0; index < 4; index++) {

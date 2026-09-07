@@ -208,7 +208,8 @@ function findIntraTurnBoundary(
   messages: BaseMessage[],
   countMessageAt: (index: number) => number,
   retainTokens: number,
-  earliestRetainedTurnEndIndex: number
+  earliestRetainedTurnEndIndex: number,
+  provider?: ProviderName
 ): number | undefined {
   let remainingTokens = 0;
   for (let i = 0; i < messages.length; i++) {
@@ -241,9 +242,9 @@ function findIntraTurnBoundary(
     const message = messages[i] as BaseMessage;
     remainingTokens -= countMessageAt(i);
 
-    const pairing = inspectMessagePairing(message, pendingToolCalls);
+    const pairing = inspectMessagePairing(message, pendingToolCalls, provider);
     completedToolCalls += pairing.completedToolCalls;
-    if (message.getType() === 'human' && !pairing.trustedHumanToolResult) {
+    if (pairing.userMessage && !pairing.trustedHumanToolResult) {
       pendingToolCalls.clear();
     }
 
@@ -262,7 +263,7 @@ function findIntraTurnBoundary(
       completedToolCalls > 0 &&
       pendingToolCalls.size === 0 &&
       straddlingSourceIds.size === 0 &&
-      (message.getType() !== 'human' || pairing.trustedHumanToolResult)
+      (!pairing.userMessage || pairing.trustedHumanToolResult)
     ) {
       boundary = i + 1;
     }
@@ -389,7 +390,8 @@ export function splitAtRecencyBoundary(
         messages,
         countMessageAt,
         intraTurnTokens,
-        turnStarts[1] ?? messages.length
+        turnStarts[1] ?? messages.length,
+        options.provider
       );
       if (intraTurnBoundary != null) {
         return {
