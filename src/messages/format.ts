@@ -3789,16 +3789,17 @@ function getAuthoritativeResponsesToolOutput(
   if (output == null || output.length === 0) {
     return undefined;
   }
+  const serverToolOutput: unknown[] = [];
   for (let index = 0; index < output.length; index++) {
     const type = readFoldedDataProperty(output[index], 'type');
     if (
       typeof type === 'string' &&
       OPENAI_RESPONSES_SERVER_TOOL_TYPES.has(type)
     ) {
-      return output;
+      serverToolOutput.push(output[index]);
     }
   }
-  return undefined;
+  return serverToolOutput.length > 0 ? serverToolOutput : undefined;
 }
 
 /**
@@ -4427,7 +4428,7 @@ function isToolResultMessage(msg: BaseMessage): boolean {
   return false;
 }
 
-function getFoldedMessageRole(msg: BaseMessage): 'AI' | 'Tool' {
+function getFoldedMessageRole(msg: BaseMessage): 'AI' | 'Tool' | 'User' {
   if (isToolMessage(msg)) {
     return 'Tool';
   }
@@ -4437,6 +4438,9 @@ function getFoldedMessageRole(msg: BaseMessage): 'AI' | 'Tool' {
     ('role' in msg && msg.role === 'assistant')
   ) {
     return 'AI';
+  }
+  if (msg instanceof HumanMessage || ('role' in msg && msg.role === 'user')) {
+    return 'User';
   }
   return isToolResultMessage(msg) ? 'Tool' : 'AI';
 }

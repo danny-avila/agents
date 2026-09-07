@@ -543,6 +543,18 @@ describe('foldToolBlocksForToollessAgent', () => {
               code: 'print(2 + 2)',
               outputs: [{ type: 'logs', logs: '4' }],
             },
+            {
+              id: 'message-1',
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'duplicate text' }],
+            },
+            {
+              id: 'function-1',
+              type: 'function_call',
+              name: 'lookup',
+              arguments: '{}',
+            },
           ],
         },
       }),
@@ -554,6 +566,26 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(getTextContent(result[0])).toContain('server_tool_output');
     expect(getTextContent(result[0])).toContain('code_interpreter_call');
     expect(getTextContent(result[0])).toContain('The calculation completed.');
+    expect(getTextContent(result[0])).not.toContain('duplicate text');
+    expect(getTextContent(result[0])).not.toContain('function_call');
+  });
+
+  test('preserves user authorship in mixed tool-result turns', () => {
+    const messages = [
+      new HumanMessage({
+        content: [
+          { type: 'tool_result', tool_use_id: 'call-1', content: 'result' },
+          { type: 'text', text: 'Please continue carefully.' },
+        ],
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+    const text = getTextContent(folded);
+
+    expect(text).toContain('Tool: [tool_result] result');
+    expect(text).toContain('User: Please continue carefully.');
+    expect(text).not.toContain('Tool: Please continue carefully.');
   });
 
   test('detects v1 standard-content tool_call blocks (no AIMessage.tool_calls)', () => {
