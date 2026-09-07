@@ -11,6 +11,13 @@ preparations each select native replay versus portable folding using the actual
 serving model and invocation options. The cache is not persisted or shared between
 runs. Plain messages without Responses evidence allocate no projection objects.
 
+Fallback preparation starts from the pruned history before any primary wire
+shaping. Each fallback applies its own input limits, thinking normalization,
+folding, and measured request projection. A model's call-specific API-mode answer
+is authoritative, including `false`; a Responses default cannot override an
+explicit Chat selection. Graph regressions exercise both directions and a failed
+intermediate fallback, including source provenance and native media.
+
 Regression coverage checks source identity through fallback folding before origin
 tracking, mixed model/tool provenance, completed media, mixed native and parsed
 calls, bounded nested traversal, per-value argument limits, and source immutability.

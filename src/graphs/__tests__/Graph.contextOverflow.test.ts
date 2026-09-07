@@ -13,6 +13,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
 import { ContentTypes, GraphEvents, Providers } from '@/common';
+import { getProviderSourceMessageIds } from '@/messages/provenance';
 import * as init from '@/llm/init';
 import { Run } from '@/run';
 
@@ -157,6 +158,112 @@ const streamConfig = {
 };
 
 describe('context overflow recovery', () => {
+  it.each([
+    { primaryNative: false, intermediate: false },
+    { primaryNative: true, intermediate: false },
+    { primaryNative: false, intermediate: true },
+  ])(
+    'preserves source history across serving policy changes: %j',
+    async ({ primaryNative, intermediate }) => {
+      const source = new AIMessage({
+        content: 'A drawing.',
+        additional_kwargs: { sourceMessageId: 'original-drawing' },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+          output: [
+            {
+              type: 'image_generation_call',
+              id: 'image-1',
+              status: 'completed',
+              result: '/9j/AA==',
+            },
+            {
+              type: 'message',
+              id: 'msg-1',
+              content: [{ type: 'output_text', text: 'A drawing.' }],
+            },
+          ],
+        },
+      });
+      const run = await createRun({
+        runId: 'native-fallback-source-history',
+        maxContextTokens: 1_000_000,
+        provider: primaryNative ? Providers.OPENAI : Providers.ANTHROPIC,
+        tokenCounter: () => 10,
+        fallbacks: [
+          ...(intermediate
+            ? [{ provider: Providers.GOOGLE, maxContextTokens: 1_000_000 }]
+            : []),
+          {
+            provider: primaryNative ? Providers.ANTHROPIC : Providers.OPENAI,
+            maxContextTokens: 1_000_000,
+          },
+        ],
+      });
+      if (!run.Graph) {
+        throw new Error('Expected graph');
+      }
+      const primary = new OverflowThenSucceedModel({
+        message: '503 unavailable',
+      });
+      const fallback = new OverflowThenSucceedModel({}, 0);
+      Object.assign(primary, {
+        _useResponsesApi: (): boolean => primaryNative,
+      });
+      Object.assign(fallback, { _useResponsesApi: (): boolean => true });
+      const initializeSpy = jest.spyOn(init, 'initializeModel');
+      if (intermediate) {
+        initializeSpy.mockReturnValueOnce(
+          new OverflowThenSucceedModel({
+            message: '503 intermediate unavailable',
+          }) as ReturnType<typeof init.initializeModel>
+        );
+      }
+      initializeSpy.mockReturnValue(
+        fallback as ReturnType<typeof init.initializeModel>
+      );
+      run.Graph.overrideModel = primary;
+      try {
+        await run.processStream(
+          {
+            messages: [
+              new HumanMessage('Draw'),
+              source,
+              new HumanMessage('Continue'),
+            ],
+          },
+          streamConfig
+        );
+        expect(
+          JSON.stringify(primary.calls[0]).includes(
+            '[Previous tool interaction]'
+          )
+        ).toBe(!primaryNative);
+        expect(fallback.calls).toHaveLength(1);
+        const retained = fallback.calls[0].find((message) =>
+          getProviderSourceMessageIds(message).includes('original-drawing')
+        );
+        expect(retained?.content).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: 'image',
+              mimeType: 'image/jpeg',
+              data: '/9j/AA==',
+            }),
+          ])
+        );
+        expect(
+          JSON.stringify(fallback.calls[0]).includes(
+            '[Previous tool interaction]'
+          )
+        ).toBe(primaryNative);
+        expect(source.response_metadata.output).toBeDefined();
+      } finally {
+        initializeSpy.mockRestore();
+      }
+    }
+  );
   it('projects structured OpenAI tool content before the final payload check', async () => {
     const toolCallId = 'tc-openai-structured';
     const toolMessage = new ToolMessage({

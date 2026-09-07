@@ -44,6 +44,27 @@ function createCapturingModel(): CapturingModel {
 }
 
 describe('prepareProviderRequest', () => {
+  it('honors an explicit Chat override over Responses model defaults', () => {
+    const { model } = createCapturingModel();
+    model._useResponsesApi = (options?: unknown): boolean =>
+      (options as { configurable?: { apiMode?: string } } | undefined)
+        ?.configurable?.apiMode !== 'chat';
+    expect(
+      prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage('hello')],
+        provider: Providers.OPENAI,
+        config: { configurable: { apiMode: 'chat' } },
+      }).projectionMode
+    ).toBe('chat-messages');
+    expect(
+      prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage('hello')],
+        provider: Providers.OPENAI,
+      }).projectionMode
+    ).toBe('openai-responses');
+  });
   it('shares source facts without caching the destination serving policy', () => {
     const { model } = createCapturingModel();
     model._useResponsesApi = (): boolean => true;

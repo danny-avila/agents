@@ -3537,6 +3537,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       let finalMessages = messagesToUse;
+      /** Primary wire shaping is lossy; each fallback starts from pruned source history. */
+      const fallbackBaseMessages = messagesToUse;
       /**
        * Keep the pruner's provider-grounded aggregate as the authoritative
        * baseline, then attribute it across retained messages. Provider
@@ -4052,8 +4054,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
-      const fallbackBaseMessages = finalMessages;
-      const beforeFinalProviderProjection = fallbackBaseMessages;
+      const beforeFinalProviderProjection = finalMessages;
       const preparedRequest = prepareProviderRequest({
         model: (this.overrideModel ?? model) as t.ChatModel,
         messages: beforeFinalProviderProjection,
@@ -4523,14 +4524,36 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   model: fallbackModel,
                   messages: fallbackMessages,
                   provider: fallbackProvider,
+                  clientOptions: fallbackClientOptions,
                   maxContextTokens: fallbackMaxContextTokens,
                   config: fallbackConfig,
                 }) => {
                   const fallbackToolHistory = createToolHistoryPreparation();
+                  let fallbackSourceMessages = trackProviderMessageOrigins(
+                    fallbackMessages,
+                    projectToolMessagesForProvider(
+                      fallbackMessages,
+                      calculateMaxToolCallInputChars(fallbackMaxContextTokens),
+                      fallbackProvider
+                    )
+                  );
+                  if (isThinkingEnabled(fallbackProvider, fallbackClientOptions)) {
+                    const beforeThinking = fallbackSourceMessages;
+                    fallbackSourceMessages = trackProviderMessageOrigins(
+                      beforeThinking,
+                      ensureThinkingBlockInMessages(
+                        beforeThinking,
+                        fallbackProvider,
+                        fallbackConfig,
+                        this.startIndex,
+                        fallbackToolHistory
+                      )
+                    );
+                  }
                   const servingFallbackMessages =
                     toolsForBinding == null || toolsForBinding.length === 0
                       ? foldToolBlocksForToollessAgent(
-                        fallbackMessages,
+                        fallbackSourceMessages,
                         fallbackConfig,
                         usesNativeOpenAIResponses(
                           fallbackModel,
@@ -4539,7 +4562,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                         ),
                         fallbackToolHistory
                       )
-                      : fallbackMessages;
+                      : fallbackSourceMessages;
                   const fallbackToolResultChars =
                     agentContext.maxToolResultChars ??
                     calculateMaxToolResultChars(

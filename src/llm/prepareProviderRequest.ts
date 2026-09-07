@@ -166,11 +166,8 @@ export function usesNativeOpenAIResponses(
       } else if (effectiveCallOptions == null) {
         effectiveCallOptions = runnable.defaultOptions;
       }
-      if (
-        runnable._useResponsesApi?.(effectiveCallOptions) === true ||
-        runnable._useResponsesApi?.(undefined) === true
-      ) {
-        return true;
+      if (typeof runnable._useResponsesApi === 'function') {
+        return runnable._useResponsesApi(effectiveCallOptions) === true;
       }
     } catch {
       // Continue through RunnableSequence/RunnableBinding wrappers.
