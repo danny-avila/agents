@@ -157,7 +157,196 @@ const streamConfig = {
   version: 'v2' as const,
 };
 
+async function captureFallback(
+  messages: BaseMessage[],
+  fallbackConfig: t.FallbackConfig,
+  options: Partial<Parameters<typeof createRun>[0]> & { legacy?: boolean } = {}
+): Promise<BaseMessage[]> {
+  const run = await createRun({
+    runId: 'fallback-serving-pipeline',
+    maxContextTokens: 1_000_000,
+    provider: Providers.ANTHROPIC,
+    tokenCounter: () => 10,
+    ...options,
+    fallbacks: [fallbackConfig],
+  });
+  if (!run.Graph) {
+    throw new Error('Expected graph');
+  }
+  const context = run.Graph.agentContexts.get('default');
+  if (context != null && options.legacy === true) {
+    context.useLegacyContent = true;
+  }
+  const primary = new OverflowThenSucceedModel({ message: '503 unavailable' });
+  const fallback = new OverflowThenSucceedModel({}, 0);
+  const spy = jest
+    .spyOn(init, 'initializeModel')
+    .mockReturnValue(fallback as ReturnType<typeof init.initializeModel>);
+  run.Graph.overrideModel = primary;
+  try {
+    await run.processStream({ messages }, streamConfig);
+    expect(primary.calls).toHaveLength(1);
+    expect(fallback.calls).toHaveLength(1);
+    return fallback.calls[0];
+  } finally {
+    spy.mockRestore();
+  }
+}
+
 describe('context overflow recovery', () => {
+  it.each([Providers.ANTHROPIC, Providers.OPENAI, Providers.GOOGLE])(
+    'preserves fallback artifacts for %s',
+    async (provider) => {
+      const source = new ToolMessage({
+        content: 'rendered',
+        name: 'render',
+        tool_call_id: 'render-1',
+        artifact: {
+          content: [
+            { type: 'text', text: 'fallback-artifact-evidence' },
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,aW1hZ2U=' },
+            },
+          ],
+        },
+      });
+      const result = await captureFallback(
+        [
+          new HumanMessage('Render'),
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'render-1', name: 'render', args: {} }],
+          }),
+          source,
+        ],
+        { provider, maxContextTokens: 1_000_000 }
+      );
+      const wire = JSON.stringify(result.map((message) => message.content));
+      expect(wire).toContain('fallback-artifact-evidence');
+      expect(wire).toContain('aW1hZ2U=');
+      expect(source.content).toBe('rendered');
+    }
+  );
+
+  it('restores legacy string content for fallback endpoints', async () => {
+    const result = await captureFallback(
+      [
+        new HumanMessage({
+          content: [{ type: 'text', text: 'legacy question' }],
+        }),
+      ],
+      { provider: Providers.OPENAI, maxContextTokens: 1_000_000 },
+      { legacy: true }
+    );
+    expect(result.every((message) => typeof message.content === 'string')).toBe(
+      true
+    );
+    expect(result[0].content).toContain('legacy question');
+  });
+
+  it('omits optional artifact expansion when the fallback budget cannot fit it', async () => {
+    const result = await captureFallback(
+      [
+        new HumanMessage('Keep this question'),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call', name: 'render', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'rendered',
+          tool_call_id: 'call',
+          artifact: { content: [{ type: 'text', text: 'oversized-artifact' }] },
+        }),
+      ],
+      { provider: Providers.ANTHROPIC, maxContextTokens: 1_000 },
+      {
+        tokenCounter: (message) =>
+          JSON.stringify(message.content).includes('oversized-artifact')
+            ? 100_000
+            : 10,
+      }
+    );
+    const wire = JSON.stringify(result.map((message) => message.content));
+    expect(wire).not.toContain('oversized-artifact');
+    expect(wire).toContain('rendered');
+    expect(wire).toContain('Keep this question');
+  });
+
+  it.each([Providers.ANTHROPIC, Providers.OPENROUTER, Providers.BEDROCK])(
+    'adds serving fallback cache markers for %s',
+    async (provider) => {
+      const result = await captureFallback(
+        [new HumanMessage('cache this history')],
+        {
+          provider,
+          clientOptions: {
+            promptCache: true,
+            model: 'anthropic.claude-sonnet-4-5',
+          },
+          maxContextTokens: 1_000_000,
+        }
+      );
+      expect(
+        JSON.stringify(result.map((message) => message.content))
+      ).toContain(
+        provider === Providers.BEDROCK ? 'cachePoint' : 'cache_control'
+      );
+    }
+  );
+
+  it('sanitizes orphan tool results before a tool-enabled fallback', async () => {
+    const result = await captureFallback(
+      [
+        new HumanMessage('Continue'),
+        new ToolMessage({
+          content: 'orphan evidence',
+          tool_call_id: 'missing',
+          name: 'lookup',
+        }),
+        new HumanMessage('Latest'),
+      ],
+      { provider: Providers.ANTHROPIC, maxContextTokens: 1_000_000 },
+      {
+        tools: [
+          tool(async () => 'unused', {
+            name: 'lookup',
+            description: 'Lookup',
+            schema: z.object({}),
+          }),
+        ],
+      }
+    );
+    expect(result.some((message) => message.getType() === 'tool')).toBe(false);
+  });
+
+  it('compacts only synthetic fallback context to fit a smaller window', async () => {
+    const result = await captureFallback(
+      [
+        new HumanMessage('Keep this question'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'call', name: 'lookup', args: { query: 'x'.repeat(5_000) } },
+          ],
+        }),
+        new ToolMessage({ content: 'result', tool_call_id: 'call' }),
+      ],
+      { provider: Providers.ANTHROPIC, maxContextTokens: 1_000 },
+      {
+        tokenCounter: (message) => JSON.stringify(message.content).length,
+      }
+    );
+    expect(JSON.stringify(result.map((message) => message.content))).toContain(
+      'Keep this question'
+    );
+    expect(
+      result.reduce(
+        (sum, message) => sum + JSON.stringify(message.content).length,
+        0
+      )
+    ).toBeLessThanOrEqual(1_000);
+  });
   it.each([
     { primaryNative: false, intermediate: false },
     { primaryNative: true, intermediate: false },

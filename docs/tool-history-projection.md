@@ -18,6 +18,13 @@ is authoritative, including `false`; a Responses default cannot override an
 explicit Chat selection. Graph regressions exercise both directions and a failed
 intermediate fallback, including source provenance and native media.
 
+Primary and fallback paths reuse the serving-policy, artifact projection, tail
+cache, and synthetic-context compaction helpers. Fallbacks also restore legacy
+formatting and sanitize orphan tool pairs before adding cache markers. Artifact
+expansion is retried without the artifact when necessary; oversized synthetic
+context is compacted against the final, serving-specific measured payload before
+rejecting a fallback. No content is appended after the final budget check.
+
 Regression coverage checks source identity through fallback folding before origin
 tracking, mixed model/tool provenance, completed media, mixed native and parsed
 calls, bounded nested traversal, per-value argument limits, and source immutability.

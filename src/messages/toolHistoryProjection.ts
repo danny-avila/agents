@@ -169,7 +169,7 @@ export type ResponsesHistoryContribution = ToolHistoryPosition &
         readonly actor: 'model';
         readonly name: string;
         readonly callId?: string;
-        readonly arguments: string;
+        readonly arguments: unknown;
       }
     | {
         readonly kind: 'image';
@@ -286,6 +286,18 @@ function* projectResponsesItems(
           };
         }
       }
+      continue;
+    }
+    if (type === 'computer_call') {
+      const callId = readData(item, 'call_id');
+      yield {
+        ...position,
+        kind: 'call',
+        actor: 'model',
+        name: 'computer',
+        arguments: readData(item, 'action'),
+        ...(typeof callId === 'string' && { callId }),
+      };
       continue;
     }
     if (type === 'function_call' || type === 'custom_tool_call') {

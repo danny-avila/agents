@@ -9,6 +9,28 @@ import {
 } from './toolHistoryProjection';
 
 describe('Ordered Tool History Projection', () => {
+  test('projects computer actions as model-authored calls', () => {
+    const action = { type: 'click', x: 10, y: 20 };
+    const message = new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          { type: 'computer_call', id: 'item', call_id: 'call', action },
+        ],
+      },
+    });
+    expect(createToolHistoryPreparation().get(message)?.contributions).toEqual([
+      {
+        kind: 'call',
+        actor: 'model',
+        name: 'computer',
+        callId: 'call',
+        itemId: 'item',
+        outputIndex: 0,
+        arguments: action,
+      },
+    ]);
+  });
   test('keeps source precedence and does not mutate provider evidence', () => {
     const output = [
       { type: 'message', content: [{ type: 'output_text', text: 'answer' }] },

@@ -14,6 +14,32 @@ import {
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { toLangChainContent } from './langchain';
 
+test('folds computer actions as model calls rather than tool results', () => {
+  const [folded] = foldToolBlocksForToollessAgent([
+    new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          {
+            type: 'computer_call',
+            id: 'item',
+            call_id: 'call',
+            action: { type: 'click', x: 10, y: 20 },
+          },
+        ],
+      },
+    }),
+  ]);
+  expect(getTextContent(folded)).toContain(
+    '[tool_call] computer({"type":"click","x":10,"y":20})'
+  );
+  expect(getTextContent(folded)).not.toContain('server_tool_output');
+  expect(folded.additional_kwargs.provenance).toEqual({
+    version: 1,
+    parts: [{ attribution: 'synthetic' }, { attribution: 'model' }],
+  });
+});
+
 test('retains a generated-image sidecar alongside a distinct native tool call', () => {
   const message = new AIMessage({
     content: [

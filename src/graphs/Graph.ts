@@ -3654,12 +3654,24 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       };
 
       const applyProviderMessageTransforms = (
-        candidate: BaseMessage[]
+        candidate: BaseMessage[],
+        serving?: {
+          provider: t.ProviderName;
+          clientOptions?: t.ClientOptions;
+          model: t.ChatModel;
+          config?: RunnableConfig;
+          history: ReturnType<typeof createToolHistoryPreparation>;
+        }
       ): BaseMessage[] => {
+        const provider = serving?.provider ?? agentContext.provider;
+        const clientOptions =
+          serving == null ? agentContext.clientOptions : serving.clientOptions;
+        const callConfig = serving == null ? config : serving.config;
+        const history = serving?.history ?? toolHistory;
+        const servingModel =
+          serving?.model ?? ((this.overrideModel ?? model) as t.ChatModel);
         let transformed = candidate;
-        if (
-          isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
-        ) {
+        if (isThinkingEnabled(provider, clientOptions)) {
           /**
            * Current-run AI messages may validly omit a thinking block. The
            * boundary prevents them from being mistaken for foreign history.
@@ -3669,10 +3681,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             before,
             ensureThinkingBlockInMessages(
               before,
-              agentContext.provider,
-              config,
+              provider,
+              callConfig,
               this.startIndex,
-              toolHistory
+              history
             )
           );
         }
@@ -3687,13 +3699,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             before,
             foldToolBlocksForToollessAgent(
               before,
-              config,
-              usesNativeOpenAIResponses(
-                (this.overrideModel ?? model) as t.ChatModel,
-                agentContext.provider,
-                config
-              ),
-              toolHistory
+              callConfig,
+              usesNativeOpenAIResponses(servingModel, provider, callConfig),
+              history
             )
           );
           if (agentContext.useLegacyContent) {
@@ -3713,12 +3721,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * tolerant fallback and adds it for a Claude fallback behind a
          * tolerant primary.
          */
-        if (
-          isAnthropicLike(
-            agentContext.provider,
-            agentContext.clientOptions as { model?: string }
-          )
-        ) {
+        if (isAnthropicLike(provider, clientOptions as { model?: string })) {
           const before = transformed;
           transformed = trackProviderMessageOrigins(
             before,
@@ -3741,7 +3744,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
 
       const compactSyntheticProviderContext = (
-        candidate: BaseMessage[]
+        candidate: BaseMessage[],
+        measure = measureProviderPayload
       ): BaseMessage[] => {
         const synthetic: Array<{
           index: number;
@@ -3779,7 +3783,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         };
 
         let best = buildCandidate(0);
-        if (!measureProviderPayload(best).fits) {
+        if (!measure(best).fits) {
           return candidate;
         }
         let low = 0;
@@ -3787,7 +3791,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         for (let i = 0; i < 12; i++) {
           const scale = (low + high) / 2;
           const attempt = buildCandidate(scale);
-          if (measureProviderPayload(attempt).fits) {
+          if (measure(attempt).fits) {
             best = attempt;
             low = scale;
           } else {
@@ -3797,27 +3801,83 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         return best;
       };
 
-      let artifactBaseMessages: BaseMessage[] | undefined;
-      if (lastMessageY instanceof ToolMessage) {
-        let artifactCandidate = finalMessages;
-        if (anthropicLike) {
-          artifactCandidate = trackProviderMessageOrigins(
-            finalMessages,
-            projectAnthropicArtifactContent(
-              finalMessages,
-              maxProviderToolResultChars
-            )
-          );
-        } else if (
-          (isOpenAILike(agentContext.provider) &&
-            agentContext.provider !== Providers.DEEPSEEK) ||
-          isGoogleLike(agentContext.provider)
-        ) {
-          artifactCandidate = trackProviderMessageOrigins(
-            finalMessages,
-            projectArtifactPayload(finalMessages, maxProviderToolResultChars)
+      const projectServingArtifacts = (
+        candidate: BaseMessage[],
+        provider: t.ProviderName,
+        clientOptions: t.ClientOptions | undefined,
+        maxChars: number
+      ): BaseMessage[] => {
+        if (!(candidate[candidate.length - 1] instanceof ToolMessage)) {
+          return candidate;
+        }
+        if (isAnthropicLike(provider, clientOptions as { model?: string })) {
+          return trackProviderMessageOrigins(
+            candidate,
+            projectAnthropicArtifactContent(candidate, maxChars)
           );
         }
+        if (
+          (isOpenAILike(provider) && provider !== Providers.DEEPSEEK) ||
+          isGoogleLike(provider)
+        ) {
+          return trackProviderMessageOrigins(
+            candidate,
+            projectArtifactPayload(candidate, maxChars)
+          );
+        }
+        return candidate;
+      };
+
+      const applyServingTailCache = (
+        candidate: BaseMessage[],
+        provider: t.ProviderName,
+        clientOptions: t.ClientOptions | undefined,
+        systemOwnsTail = false
+      ): BaseMessage[] => {
+        if (provider === Providers.BEDROCK) {
+          const options = clientOptions as
+            | t.BedrockAnthropicClientOptions
+            | undefined;
+          return options?.promptCache === true
+            ? trackProviderMessageOrigins(
+              candidate,
+              addBedrockTailCacheControl(
+                candidate,
+                resolveBedrockPromptCacheTtl(
+                  options.promptCacheTtl,
+                  options.model
+                )
+              )
+            )
+            : candidate;
+        }
+        if (
+          systemOwnsTail ||
+          (provider !== Providers.ANTHROPIC &&
+            provider !== Providers.OPENROUTER)
+        ) {
+          return candidate;
+        }
+        const options = clientOptions as t.AnthropicClientOptions | undefined;
+        return options?.promptCache === true
+          ? trackProviderMessageOrigins(
+            candidate,
+            addTailCacheControl(
+              candidate,
+              resolvePromptCacheTtl(options.promptCacheTtl)
+            )
+          )
+          : candidate;
+      };
+
+      let artifactBaseMessages: BaseMessage[] | undefined;
+      if (lastMessageY instanceof ToolMessage) {
+        const artifactCandidate = projectServingArtifacts(
+          finalMessages,
+          agentContext.provider,
+          agentContext.clientOptions,
+          maxProviderToolResultChars
+        );
 
         if (artifactCandidate !== finalMessages) {
           const projection = measureProviderPayload(artifactCandidate);
@@ -4011,48 +4071,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       // call (zero message caching). Anchoring on the final message list keeps
       // the marker on a block that actually ships. The system-runnable path
       // adds its body marker in AgentContext, so this node skips it there.
-      if (
-        (anthropicPromptCacheEnabled || openRouterPromptCacheEnabled) &&
-        !agentContext.systemRunnable
-      ) {
-        const beforeCacheControl = finalMessages;
-        finalMessages = trackProviderMessageOrigins(
-          beforeCacheControl,
-          addTailCacheControl<BaseMessage>(
-            beforeCacheControl,
-            resolvePromptCacheTtl(
-              anthropicPromptCacheEnabled
-                ? (
-                    agentContext.clientOptions as
-                      | t.AnthropicClientOptions
-                      | undefined
-                )?.promptCacheTtl
-                : (
-                    agentContext.clientOptions as
-                      | t.ProviderOptionsMap[Providers.OPENROUTER]
-                      | undefined
-                )?.promptCacheTtl
-            )
-          )
-        );
-      } else if (bedrockPromptCacheEnabled) {
-        const bedrockOptions = agentContext.clientOptions as
-          | t.BedrockAnthropicClientOptions
-          | undefined;
-        // Non-Claude models (Nova) reject the extended 1h TTL, so resolve it
-        // against the model — message/system caching stays on, clamped to 5m.
-        const beforeCacheControl = finalMessages;
-        finalMessages = trackProviderMessageOrigins(
-          beforeCacheControl,
-          addBedrockTailCacheControl<BaseMessage>(
-            beforeCacheControl,
-            resolveBedrockPromptCacheTtl(
-              bedrockOptions?.promptCacheTtl,
-              (bedrockOptions as { model?: string } | undefined)?.model
-            )
-          )
-        );
-      }
+      finalMessages = applyServingTailCache(
+        finalMessages,
+        agentContext.provider,
+        agentContext.clientOptions,
+        agentContext.systemRunnable != null
+      );
 
       const beforeFinalProviderProjection = finalMessages;
       const preparedRequest = prepareProviderRequest({
@@ -4529,40 +4553,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   config: fallbackConfig,
                 }) => {
                   const fallbackToolHistory = createToolHistoryPreparation();
-                  let fallbackSourceMessages = trackProviderMessageOrigins(
-                    fallbackMessages,
-                    projectToolMessagesForProvider(
-                      fallbackMessages,
-                      calculateMaxToolCallInputChars(fallbackMaxContextTokens),
-                      fallbackProvider
-                    )
-                  );
-                  if (isThinkingEnabled(fallbackProvider, fallbackClientOptions)) {
-                    const beforeThinking = fallbackSourceMessages;
-                    fallbackSourceMessages = trackProviderMessageOrigins(
-                      beforeThinking,
-                      ensureThinkingBlockInMessages(
-                        beforeThinking,
-                        fallbackProvider,
-                        fallbackConfig,
-                        this.startIndex,
-                        fallbackToolHistory
-                      )
-                    );
-                  }
-                  const servingFallbackMessages =
-                    toolsForBinding == null || toolsForBinding.length === 0
-                      ? foldToolBlocksForToollessAgent(
-                        fallbackSourceMessages,
-                        fallbackConfig,
-                        usesNativeOpenAIResponses(
-                          fallbackModel,
-                          fallbackProvider,
-                          fallbackConfig
-                        ),
-                        fallbackToolHistory
-                      )
-                      : fallbackSourceMessages;
                   const fallbackToolResultChars =
                     agentContext.maxToolResultChars ??
                     calculateMaxToolResultChars(
@@ -4576,32 +4566,112 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                         primaryContextBudget ?? fallbackMaxContextTokens,
                         fallbackMaxContextTokens
                       );
-                  const preparedFallbackRequest = prepareProviderRequest({
-                    model: fallbackModel,
-                    messages: servingFallbackMessages,
-                    provider: fallbackProvider,
-                    context: this,
-                    config: fallbackConfig,
-                    maxToolResultChars: fallbackToolResultChars,
-                    toolHistory: fallbackToolHistory,
-                    measure: (preparedMessages) =>
-                      measureProviderPayload(
-                        trackProviderMessageOrigins(
-                          servingFallbackMessages,
-                          preparedMessages
-                        ),
-                        {
-                          contextBudget: fallbackContextBudget,
-                          forceRawRecount: true,
-                        }
-                      ),
-                  });
-                  const projection =
-                    preparedFallbackRequest.measurement ??
-                    measureProviderPayload(preparedFallbackRequest.messages, {
+                  const measureFallback = (
+                    candidate: BaseMessage[]
+                  ): ReturnType<typeof measureProviderPayload> =>
+                    measureProviderPayload(candidate, {
                       contextBudget: fallbackContextBudget,
                       forceRawRecount: true,
                     });
+                  const source = agentContext.useLegacyContent
+                    ? trackProviderMessageOrigins(
+                      fallbackMessages,
+                      formatContentStrings(fallbackMessages)
+                    )
+                    : fallbackMessages;
+                  const boundedSource = trackProviderMessageOrigins(
+                    source,
+                    projectToolMessagesForProvider(
+                      source,
+                      calculateMaxToolCallInputChars(fallbackMaxContextTokens),
+                      fallbackProvider
+                    )
+                  );
+                  const artifactSource = projectServingArtifacts(
+                    boundedSource,
+                    fallbackProvider,
+                    fallbackClientOptions,
+                    fallbackToolResultChars
+                  );
+                  const transformFallback = (
+                    candidate: BaseMessage[]
+                  ): BaseMessage[] =>
+                    applyProviderMessageTransforms(candidate, {
+                      provider: fallbackProvider,
+                      clientOptions: fallbackClientOptions,
+                      model: fallbackModel,
+                      config: fallbackConfig,
+                      history: fallbackToolHistory,
+                    });
+                  const prepareFallback = (
+                    candidate: BaseMessage[]
+                  ): {
+                    request: ReturnType<typeof prepareProviderRequest>;
+                    projection: ReturnType<typeof measureProviderPayload>;
+                  } => {
+                    const sanitized = isAnthropicLike(
+                      fallbackProvider,
+                      fallbackClientOptions as { model?: string }
+                    )
+                      ? trackProviderMessageOrigins(
+                        candidate,
+                        sanitizeOrphanToolBlocks(
+                          candidate,
+                          (original, clone) =>
+                            contextPressure.trackClone(original, clone)
+                        )
+                      )
+                      : candidate;
+                    const cached = applyServingTailCache(
+                      sanitized,
+                      fallbackProvider,
+                      fallbackClientOptions
+                    );
+                    let projection: ReturnType<typeof measureProviderPayload> | undefined;
+                    const request = prepareProviderRequest({
+                      model: fallbackModel,
+                      messages: cached,
+                      provider: fallbackProvider,
+                      context: this,
+                      config: fallbackConfig,
+                      maxToolResultChars: fallbackToolResultChars,
+                      toolHistory: fallbackToolHistory,
+                      measure: (prepared) => {
+                        projection = measureFallback(
+                          trackProviderMessageOrigins(cached, prepared)
+                        );
+                        return projection;
+                      },
+                    });
+                    if (projection == null) {
+                      throw new Error('Fallback preparation did not measure its payload');
+                    }
+                    return { request, projection };
+                  };
+                  let servingFallbackMessages =
+                    transformFallback(artifactSource);
+                  let preparedFallbackRequest = prepareFallback(
+                    servingFallbackMessages
+                  );
+                  let projection = preparedFallbackRequest.projection;
+                  if (!projection.fits && artifactSource !== boundedSource) {
+                    servingFallbackMessages = transformFallback(boundedSource);
+                    preparedFallbackRequest = prepareFallback(
+                      servingFallbackMessages
+                    );
+                    projection = preparedFallbackRequest.projection;
+                  }
+                  if (!projection.fits) {
+                    const compacted = compactSyntheticProviderContext(
+                      servingFallbackMessages,
+                      (candidate) =>
+                        prepareFallback(candidate).projection
+                    );
+                    if (compacted !== servingFallbackMessages) {
+                      preparedFallbackRequest = prepareFallback(compacted);
+                      projection = preparedFallbackRequest.projection;
+                    }
+                  }
                   if (!projection.fits) {
                     throw createProviderPayloadOverflowError({
                       projection,
@@ -4609,7 +4679,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       info: 'Fallback provider message formatting exceeded the context budget before invocation.',
                     });
                   }
-                  return preparedFallbackRequest;
+                  return preparedFallbackRequest.request;
                 },
               })
           );
