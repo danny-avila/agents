@@ -72,6 +72,7 @@ import {
 } from '@/common';
 import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
+import { isReasoningContentBlock } from './reasoningTypes';
 import { flattenLegacyContent, isLegacyConvertible } from './content';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { emitAgentLog } from '@/utils/events';
@@ -484,13 +485,7 @@ function hasMeaningfulAssistantContent(part: MessageContentComplex): boolean {
   ) {
     return false;
   }
-  if (
-    part.type === ContentTypes.THINK ||
-    part.type === ContentTypes.THINKING ||
-    part.type === ContentTypes.REASONING ||
-    part.type === ContentTypes.REASONING_CONTENT ||
-    part.type === 'redacted_thinking'
-  ) {
+  if (isReasoningContentBlock(part)) {
     return extractReasoningContent(part).trim().length > 0;
   }
   return part.type != null && part.type !== '';
@@ -1983,13 +1978,7 @@ function formatAssistantMessage(
           'tool',
           sourcePartIndices
         );
-      } else if (
-        part.type === ContentTypes.THINK ||
-        part.type === ContentTypes.THINKING ||
-        part.type === ContentTypes.REASONING ||
-        part.type === ContentTypes.REASONING_CONTENT ||
-        part.type === 'redacted_thinking'
-      ) {
+      } else if (isReasoningContentBlock(part)) {
         if (
           part.type === ContentTypes.THINK &&
           compactionSemanticIndex != null &&
@@ -4182,12 +4171,7 @@ export function ensureThinkingBlockInMessages(
         const type = readFoldedDataProperty(c, 'type');
         if (type === 'tool_use') {
           hasToolUse = true;
-        } else if (
-          type === ContentTypes.THINKING ||
-          type === ContentTypes.REASONING_CONTENT ||
-          type === ContentTypes.REASONING ||
-          type === 'redacted_thinking'
-        ) {
+        } else if (isReasoningContentBlock({ type })) {
           hasThinkingBlock = true;
         }
         if (hasToolUse && hasThinkingBlock) {
@@ -4482,16 +4466,7 @@ function chainHasThinkingBlock(
 
       if (Array.isArray(prevAiMsg.content) && prevAiMsg.content.length > 0) {
         const content = prevAiMsg.content as ExtendedMessageContent[];
-        if (
-          content.some(
-            (c) =>
-              typeof c === 'object' &&
-              (c.type === ContentTypes.THINKING ||
-                c.type === ContentTypes.REASONING_CONTENT ||
-                c.type === ContentTypes.REASONING ||
-                c.type === 'redacted_thinking')
-          )
-        ) {
+        if (content.some((c) => isReasoningContentBlock(c))) {
           return true;
         }
       }

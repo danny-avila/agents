@@ -56,6 +56,7 @@ import {
   serializeToolCallInput,
 } from '@/messages/prune';
 import { toLangChainContent } from '@/messages/langchain';
+import { isReasoningContentBlock } from '@/messages/reasoningTypes';
 
 export type { OpenAICallOptions, OpenAIChatInput };
 
@@ -361,7 +362,7 @@ export function _convertMessagesToOpenAIParams(
       role = 'developer';
     }
 
-    let hasAnthropicThinkingBlock: boolean = false;
+    let hasReasoningBlock = false;
 
     let content: unknown;
     if (
@@ -384,8 +385,8 @@ export function _convertMessagesToOpenAIParams(
       content = message.content;
     } else {
       content = message.content.map((m) => {
-        if ('type' in m && m.type === 'thinking') {
-          hasAnthropicThinkingBlock = true;
+        if (isReasoningContentBlock(m)) {
+          hasReasoningBlock = true;
           return m;
         }
         if (isDataContentBlock(m)) {
@@ -416,7 +417,7 @@ export function _convertMessagesToOpenAIParams(
       completionParam.tool_calls = message.tool_calls.map(
         convertLangChainToolCallToBoundedOpenAI
       );
-      completionParam.content = hasAnthropicThinkingBlock ? content : '';
+      completionParam.content = hasReasoningBlock ? content : '';
       if (
         options?.includeReasoningDetails === true &&
         message.additional_kwargs.reasoning_details != null
