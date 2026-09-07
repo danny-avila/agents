@@ -22,7 +22,6 @@ import type {
 } from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import { isFadingTier } from '@/messages/fading';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import type { StandardGraph } from '@/graphs/Graph';
@@ -40,7 +39,6 @@ import {
 } from '@/common';
 import {
   requireValidSubagentResumeManifest,
-  stripSubagentResumeManifest,
   SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from '@/tools/subagent/SubagentReplay';
@@ -70,6 +68,16 @@ import {
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
+import {
+  cloneToolApprovalInterruptPayload,
+  TOOL_APPROVAL_REVIEW_CONFIG_KEY,
+} from '@/hitl/approvalReview';
+import {
+  TOOL_BATCH_REPLAY_KEY,
+  restoreToolReplayConfig,
+  stripToolBatchReplayState,
+  getPublicToolInterruptPayload,
+} from '@/tools/toolBatchReplay';
 import {
   resolveLangfuseDestinationKey,
   resolveLangfuseTraceAnchorParent,
@@ -104,6 +112,7 @@ import { seedRunInitialSessions } from '@/utils/toolSessions';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { createGraph } from '@/graphs/createGraph';
+import { isFadingTier } from '@/messages/fading';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { isBuiltRuntime } from '@/lazyRequire';
 import { initializeModel } from '@/llm/init';
@@ -169,9 +178,7 @@ function materializeStopContinuation(
   return messages;
 }
 
-function advanceCheckpointCursor(
-  config: t.RunStreamConfig
-): t.RunStreamConfig {
+function advanceCheckpointCursor(config: t.RunStreamConfig): t.RunStreamConfig {
   const configurable = { ...config.configurable };
   delete configurable.checkpoint_id;
   delete configurable.checkpoint_map;
@@ -186,9 +193,7 @@ function assertFinalAdmissionSucceeded(result: AggregatedHookResult): void {
     result.errors.length > 0
       ? result.errors.join('; ')
       : 'one or more internal finalizers failed';
-  throw new Error(
-    `StopFinalize terminal admission failed: ${detail}`
-  );
+  throw new Error(`StopFinalize terminal admission failed: ${detail}`);
 }
 
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
@@ -268,9 +273,7 @@ function isLangGraphResumeMapForInterrupt(
 }
 
 function getInterruptHookSessionId(payload: unknown): string | undefined {
-  const publicPayload = stripSubagentResumeManifest(
-    stripRunStepResumeState(payload)
-  );
+  const publicPayload = getPublicToolInterruptPayload(payload);
   if (
     publicPayload == null ||
     typeof publicPayload !== 'object' ||
@@ -423,7 +426,7 @@ function overwriteResumeRunStepState(
   const update = Array.isArray(command.update)
     ? [
       ...command.update.filter(([key]) => key !== 'runStepState'),
-      ['runStepState', overwrite] as [string, unknown],
+        ['runStepState', overwrite] as [string, unknown],
     ]
     : { ...(command.update ?? {}), runStepState: overwrite };
   const resumed = new Command({
@@ -1266,6 +1269,8 @@ export class Run<_T extends t.BaseGraphState> {
       recursionLimit,
       configurable: { ...callerConfig.configurable },
     };
+    delete config.configurable?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+    delete config.configurable?.[TOOL_BATCH_REPLAY_KEY];
     if (!isResume) {
       delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
@@ -1276,6 +1281,10 @@ export class Run<_T extends t.BaseGraphState> {
         config,
         (inputs as Command).update
       );
+      const publicPayload = stripRunStepResumeState(this._interrupt?.payload);
+      if (config.configurable != null) {
+        restoreToolReplayConfig(config.configurable, this._interrupt?.interruptId, publicPayload);
+      }
       if (graph.getStopContinuationExecutionId() === '') {
         graph.startStopContinuationExecution(nanoid());
         overwriteLegacyResumeState = this.hasCheckpointer;
@@ -1514,7 +1523,7 @@ export class Run<_T extends t.BaseGraphState> {
               this._interrupt = {
                 interruptId: first.id ?? '',
                 threadId,
-                payload: first.value,
+                payload: cloneToolApprovalInterruptPayload(first.value),
               };
             }
           }
@@ -1558,7 +1567,8 @@ export class Run<_T extends t.BaseGraphState> {
           stopReason = OUTPUT_TRUNCATED_HALT_REASON;
         }
 
-        const stopMessages = graph.getRunMessages() ?? stateInputs?.messages ?? [];
+        const stopMessages =
+          graph.getRunMessages() ?? stateInputs?.messages ?? [];
         const stopContinuationCount = graph.getStopContinuationCount();
         const continuationBudgetRemaining = Math.max(
           0,
@@ -1881,8 +1891,8 @@ export class Run<_T extends t.BaseGraphState> {
     }
     return {
       ...this._interrupt,
-      payload: stripSubagentResumeManifest(
-        stripRunStepResumeState(this._interrupt.payload)
+      payload: cloneToolApprovalInterruptPayload(
+        getPublicToolInterruptPayload(this._interrupt.payload)
       ),
     } as t.RunInterruptResult<TPayload>;
   }
@@ -2004,16 +2014,20 @@ export class Run<_T extends t.BaseGraphState> {
   ): Promise<t.RunStreamConfig> {
     await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
     const interrupt = this._interrupt;
-    const resumeManifest = requireValidSubagentResumeManifest(
-      stripRunStepResumeState(interrupt?.payload)
-    );
+    const replayPayload = stripRunStepResumeState(interrupt?.payload);
+    const resumeManifest = requireValidSubagentResumeManifest(replayPayload) ??
+      requireValidSubagentResumeManifest(stripToolBatchReplayState(replayPayload));
     const resumeConfigurable = { ...callerConfig.configurable };
+    delete resumeConfigurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+    delete resumeConfigurable[TOOL_BATCH_REPLAY_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = nanoid();
     if (resumeManifest != null) {
       resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] = resumeManifest;
     }
+    const publicPayload = stripRunStepResumeState(interrupt?.payload);
+    restoreToolReplayConfig(resumeConfigurable, interrupt?.interruptId, publicPayload);
     const manifestConfig = {
       ...callerConfig,
       configurable: resumeConfigurable,
@@ -2130,7 +2144,7 @@ export class Run<_T extends t.BaseGraphState> {
     const threadId = callerConfig.configurable?.thread_id;
     this._interrupt = {
       interruptId: persistedInterrupt.id,
-      payload: persistedInterrupt.value,
+      payload: cloneToolApprovalInterruptPayload(persistedInterrupt.value),
       ...(typeof threadId === 'string' ? { threadId } : {}),
       ...(typeof checkpointId === 'string' ? { checkpointId } : {}),
       ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),

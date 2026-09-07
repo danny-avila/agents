@@ -24,12 +24,12 @@ import type { PreToolUseHookOutput } from '@/hooks';
 import type * as t from '@/types';
 import {
   getSubagentResumeManifest,
-  stripSubagentResumeManifest,
   SUBAGENT_PARENT_BATCH_CONFIG_KEY,
   SUBAGENT_REPLAY_CONTROLLER,
 } from '@/tools/subagent/SubagentReplay';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
+import { getPublicToolInterruptPayload } from '../toolBatchReplay';
 
 /**
  * Pins the resume-scope behaviour for direct-path interrupts. The
@@ -193,7 +193,7 @@ describe('direct-path HITL: resume scope', () => {
       })
     );
     expect(getSubagentResumeManifest(internalPayload)).toEqual(manifest);
-    expect(stripSubagentResumeManifest(internalPayload)).toBe('confirm child');
+    expect(getPublicToolInterruptPayload(internalPayload)).toBe('confirm child');
   });
 
   it('preserves a one-shot approval until a reject decision is applied', async () => {

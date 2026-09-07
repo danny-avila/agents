@@ -1096,6 +1096,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     );
 
     expect(rebuiltRun.getInterrupt()).toBeUndefined();
+    expect(updates.filter((event) => event.phase === 'error')).toEqual([]);
     expect(executedToolIds).toHaveLength(1);
     expect(deniedToolIds).toHaveLength(1);
     expect(completedSubagentCalls).toEqual([first.id, second.id]);
@@ -1450,7 +1451,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     ).toBe(true);
   });
 
-  it('forks nested resumes from each checkpoint in the manifest chain', async () => {
+  it.each([true, false])('forks nested resumes from each checkpoint in the manifest chain (restore hooks=%s)', async (restoreHooks) => {
     getChatModelClassSpy.mockImplementation(((provider: Providers) => {
       if (provider === Providers.OPENAI) {
         return NestedHitlFakeChatModel;
@@ -1500,7 +1501,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
         returnContent: true,
         skipCleanup: true,
         customHandlers,
-        hooks: registry,
+        hooks: restoreHooks || runId.endsWith('-initial') ? registry : undefined,
         humanInTheLoop: { enabled: true },
       });
     const parentCall = makeSubagentToolCall(

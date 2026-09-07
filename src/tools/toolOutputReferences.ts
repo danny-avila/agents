@@ -420,6 +420,22 @@ export class ToolOutputReferenceRegistry {
     };
   }
 
+  /** Restore batch inputs without rolling back graph-owned concurrent outputs. */
+  resumeBatch(runId: string, state: ToolOutputReferenceState): ToolOutputResolveView {
+    if (!this.runStates.has(runId)) {
+      this.restoreState(runId, state);
+    }
+    const bucket = this.getOrCreate(runId);
+    bucket.turnCounter = Math.max(bucket.turnCounter, state.turnCounter + 1);
+    const inputs = new ToolOutputReferenceRegistry({
+      maxOutputSize: this.maxOutputSize,
+      maxTotalSize: this.maxTotalSize,
+      maxActiveRuns: 1,
+    });
+    inputs.restoreState(runId, state);
+    return inputs.snapshot(runId);
+  }
+
   /** Restores a checkpointed run bucket under the current resume scope. */
   restoreState(
     runId: string | undefined,

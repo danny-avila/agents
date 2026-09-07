@@ -133,7 +133,7 @@ describe('Direct tool schema error across interrupt/resume', () => {
     return run;
   }
 
-  test('error completion dispatches exactly once; resume-pass handler reports false instead of throwing', async () => {
+  test('error completion dispatches exactly once; a rebuilt run restores the settled error', async () => {
     const saver = new MemorySaver();
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     const staticSpy = jest.spyOn(StandardGraph, 'handleToolCallErrorStatic');
@@ -159,22 +159,18 @@ describe('Direct tool schema error across interrupt/resume', () => {
         'did not match expected schema'
       );
 
-      /** Pass 2: fresh instance (host restart shape), resume with the
-       *  answer. The batch re-executes; the strict tool fails again before
-       *  any run step is registered on the rebuilt graph. */
+      /** Pass 2: reconstruct the runtime and restore the checkpointed error
+       * rather than executing the already-settled lifecycle again. */
       const run2 = await buildRun(saver, 'run-pass-2');
       await run2.processStream(
         new Command({ resume: { answer: 'blue' } }) as unknown as t.IState,
         threadConfig
       );
 
-      /** The handler reported "not dispatched" (no run step yet) rather than
-       *  throwing — so nothing was logged and no duplicate completion event
-       *  reached the client. */
       const resumeResults = await Promise.all(
         staticSpy.mock.results.map((r) => r.value as Promise<boolean>)
       );
-      expect(resumeResults).toContain(false);
+      expect(resumeResults).toEqual([true]);
       const handlerFailures = errorSpy.mock.calls.filter((args) =>
         String(args[0]).includes('Error in errorHandler')
       );

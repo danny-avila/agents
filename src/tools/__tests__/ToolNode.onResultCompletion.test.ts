@@ -647,7 +647,8 @@ describe('ToolNode error-ownership scoping', () => {
    * instance-scoped markers, invocation 2's output loop consumes the
    * marker invocation 1 set and drops its only completion.
    */
-  it('does not let a pending invocation\'s marker suppress a concurrent call reusing the id', async () => {
+  it.each([undefined, ''])('isolates concurrent calls reusing an id with missing scope %j', async (threadId) => {
+    const config = { configurable: { thread_id: threadId } };
     const completions: string[] = [];
     jest
       .spyOn(events, 'safeDispatchCustomEvent')
@@ -712,7 +713,7 @@ describe('ToolNode error-ownership scoping', () => {
           { id: 'call_slow', name: 'slow', args: {} },
         ]),
       ],
-    }) as Promise<unknown>;
+    }, config) as Promise<unknown>;
     await flushAsync();
 
     // Invocation 2, while invocation 1 is still parked.
@@ -723,7 +724,7 @@ describe('ToolNode error-ownership scoping', () => {
           { id: shared, name: 'returner', args: {} },
         ]),
       ],
-    });
+    }, config);
     await flushAsync();
     const emittedBySecond = completions.slice(before);
 

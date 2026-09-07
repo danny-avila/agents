@@ -9,6 +9,24 @@ import {
 } from '../toolOutputReferences';
 
 describe('ToolOutputReferenceRegistry', () => {
+  describe('resumeBatch', () => {
+    it.each([0, 5])('keeps shared state and applies current limits to frozen inputs (turns=%s)', (turns) => {
+      const registry = new ToolOutputReferenceRegistry({ maxOutputSize: 4, maxTotalSize: 8 });
+      registry.set('r', 'tool0turn4', 'live');
+      for (let i = 0; i < turns; i++) registry.nextTurn('r');
+      const snapshot = registry.resumeBatch('r', {
+        entries: [{ key: 'tool0turn0', value: 'historical-long-value' }],
+        turnCounter: 1, warnedNonStringTools: [],
+      });
+      const value = snapshot.resolve('{{tool0turn0}}').resolved;
+      expect(value.length).toBeLessThanOrEqual(4);
+      expect(snapshot.resolve('{{tool0turn4}}').unresolved).toEqual(['tool0turn4']);
+      expect(registry.get('r', 'tool0turn4')).toBe('live');
+      expect(registry.get('r', 'tool0turn0')).toBeUndefined();
+      expect(registry.nextTurn('r')).toBe(Math.max(turns, 2));
+    });
+  });
+
   describe('buildReferenceKey', () => {
     it('formats keys as tool<idx>turn<turn>', () => {
       expect(buildReferenceKey(0, 0)).toBe('tool0turn0');

@@ -1,10 +1,6 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import {
-  AIMessage,
-  HumanMessage,
-  ToolMessage,
-} from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import {
   describe,
   it,
@@ -38,6 +34,15 @@ import type {
   UserPromptSubmitHookOutput,
 } from '@/hooks';
 import type * as t from '@/types';
+import type { ReplayableSubagentTool } from '@/tools/subagent/SubagentReplay';
+import {
+  TOOL_APPROVAL_REVIEW_CONFIG_KEY,
+  createToolApprovalReviewEvidence,
+} from '@/hitl/approvalReview';
+import {
+  SUBAGENT_REPLAY_CONTROLLER,
+} from '@/tools/subagent/SubagentReplay';
+import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { Constants, Providers as providers, GraphEvents } from '@/common';
 import { getProviderMessageProvenance } from '@/messages/provenance';
 import { getRunStepResumeState } from '@/tools/runStepResume';
@@ -45,6 +50,7 @@ import { HookRegistry, createToolPolicyHook } from '@/hooks';
 import * as events from '@/utils/events';
 import { askUserQuestion } from '@/hitl';
 import { ToolNode } from '../ToolNode';
+import { TOOL_BATCH_REPLAY_KEY, getToolBatchReplayState } from '../toolBatchReplay';
 
 async function flushAsyncWork(): Promise<void> {
   await Promise.resolve();
@@ -101,10 +107,7 @@ async function stripStopContinuationExecutionIds(
     checkpointer.storage[threadId] ?? {}
   )) {
     for (const stored of Object.values(checkpoints)) {
-      const checkpoint = await checkpointer.serde.loadsTyped(
-        'json',
-        stored[0]
-      );
+      const checkpoint = await checkpointer.serde.loadsTyped('json', stored[0]);
       const runStepState = (
         checkpoint as {
           channel_values?: { runStepState?: t.RunStepResumeState };
@@ -155,7 +158,8 @@ type CompiledMessagesGraph = Runnable<unknown, { messages: BaseMessage[] }> & {
 /** Factory for a minimal `agent → tools → END` graph wrapping the ToolNode. */
 function buildHITLGraph(
   toolNode: ToolNode,
-  toolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }>
+  toolCalls: Array<{ id?: string; name: string; args: Record<string, unknown> }>,
+  checkpointer = new MemorySaver()
 ): CompiledMessagesGraph {
   const toolCallIds = new Set(toolCalls.map((call) => call.id));
   const builder = new StateGraph(MessagesAnnotation)
@@ -188,7 +192,7 @@ function buildHITLGraph(
     .addEdge('agent', 'tools')
     .addEdge('tools', END);
   return builder.compile({
-    checkpointer: new MemorySaver(),
+    checkpointer,
   }) as unknown as CompiledMessagesGraph;
 }
 
@@ -250,7 +254,15 @@ async function resumeGraph<TResume>(
   }
   return graph.invoke(
     resumeFromInterrupt(interrupted, resume),
-    checkpointConfig
+    {
+      ...checkpointConfig,
+      configurable: {
+        ...checkpointConfig.configurable,
+        [TOOL_BATCH_REPLAY_KEY]: isInterrupted<unknown>(interrupted)
+          ? getToolBatchReplayState(interrupted.__interrupt__[0]?.value)
+          : undefined,
+      },
+    }
   );
 }
 
@@ -1190,6 +1202,8 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
               value: {
                 type: 'tool_approval',
                 hook_session_id: 'persisted-hook-session',
+                action_requests: [],
+                review_configs: [],
               },
             },
           ],
@@ -3256,6 +3270,1094 @@ describe('Codex review fixes', () => {
      * the original. Without the fix, the policy redaction would be
      * silently dropped after approval. */
     expect(dispatchedArgs).toEqual([{ command: 'redacted-command' }]);
+  });
+
+  it.each([
+    {
+      label: 'rejection',
+      decision: { type: 'reject', reason: 'not approved' } as const,
+      expectedDispatches: 0,
+    },
+    {
+      label: 'approval',
+      decision: { type: 'approve' } as const,
+      expectedDispatches: 1,
+    },
+  ])(
+    'Run.resume preserves a reviewed $label when a reusable hook later loosens ask to allow',
+    async ({ label, decision, expectedDispatches }) => {
+      let dispatchCalls = 0;
+      const hostConfigurables: Array<Record<string, unknown> | undefined> = [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== 'on_tool_execute') {
+            return;
+          }
+          dispatchCalls += 1;
+          const request = data as {
+            toolCalls: t.ToolCallRequest[];
+            configurable?: Record<string, unknown>;
+            resolve: (results: t.ToolExecuteResult[]) => void;
+          };
+          hostConfigurables.push(request.configurable);
+          request.resolve(
+            request.toolCalls.map((call) => ({
+              toolCallId: call.id,
+              content: 'ran',
+              status: 'success' as const,
+            }))
+          );
+        });
+
+      let hookCalls = 0;
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => {
+            hookCalls += 1;
+            return hookCalls === 1
+              ? { decision: 'ask', reason: 'review this command' }
+              : { decision: 'allow' };
+          },
+        ],
+      });
+
+      const node = new ToolNode({
+        tools: [createSchemaStub('echo')],
+        eventDrivenMode: true,
+        agentId: 'a',
+        toolCallStepIds: new Map([['call_1', 'step_1']]),
+        hookRegistry: registry,
+        humanInTheLoop: { enabled: true },
+      });
+      const graph = buildHITLGraph(node, [
+        { id: 'call_1', name: 'echo', args: { command: 'reviewed' } },
+      ]);
+
+      const { Run } = await import('@/run');
+      const run = await Run.create<t.IState>({
+        runId: `reviewed-decision-survives-policy-replay-${label}`,
+        graphConfig: {
+          type: 'standard',
+          agents: [
+            {
+              agentId: 'a',
+              provider: providers.OPENAI,
+              clientOptions: {
+                modelName: 'gpt-4o-mini',
+                apiKey: 'test-key',
+              },
+              instructions: 'noop',
+              maxContextTokens: 8000,
+            },
+          ],
+        },
+        hooks: registry,
+        humanInTheLoop: { enabled: true },
+      });
+      run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+      const config = {
+        configurable: { thread_id: `reviewed-decision-thread-${label}` },
+        version: 'v2' as const,
+      };
+
+      await run.processStream({ messages: [] }, config);
+      expect(run.getInterrupt()?.payload).toMatchObject({
+        type: 'tool_approval',
+        action_requests: [
+          {
+            tool_call_id: 'call_1',
+            name: 'echo',
+            arguments: { command: 'reviewed' },
+          },
+        ],
+      });
+
+      await run.resume([decision], config);
+
+      expect(hookCalls).toBe(2);
+      expect(dispatchCalls).toBe(expectedDispatches);
+      expect(
+        hostConfigurables.every(
+          (configurable) =>
+            configurable?.__librechat_tool_approval_review == null
+        )
+      ).toBe(true);
+    }
+  );
+
+  it('fails closed for a direct sibling missing from restored review evidence', async () => {
+    const executed: string[] = [];
+    const tools = ['first_direct', 'second_direct'].map(
+      (name) =>
+        tool(
+          async (): Promise<string> => {
+            executed.push(name);
+            return 'ran';
+          },
+          {
+            name,
+            description: `${name} test tool`,
+            schema: z.object({ command: z.string() }),
+          }
+        ) as unknown as StructuredToolInterface
+    );
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review direct command',
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools,
+      eventDrivenMode: true,
+      directToolNames: new Set(tools.map((entry) => entry.name)),
+      agentId: 'a',
+      toolCallStepIds: new Map([
+        ['call_1', 'step_1'],
+        ['call_2', 'step_2'],
+      ]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'first_direct', args: { command: 'first' } },
+      { id: 'call_2', name: 'second_direct', args: { command: 'second' } },
+    ]);
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'parallel-reviewed-directs',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+    const config = {
+      configurable: { thread_id: 'parallel-reviewed-directs' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, config);
+    const interrupt = run.getInterrupt();
+    const reviewedName =
+      interrupt?.payload.type === 'tool_approval'
+        ? interrupt.payload.action_requests[0]?.name
+        : undefined;
+    expect(reviewedName).toBeDefined();
+    (node as unknown as { hookRegistry?: HookRegistry }).hookRegistry =
+      undefined;
+
+    await run.resume([{ type: 'approve' }], config);
+
+    expect(executed).toEqual([reviewedName]);
+  });
+
+  it('waits for a started sibling before checkpointing an approval pause', async () => {
+    let release: () => void = () => { throw new Error('not initialized'); };
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    let executions = 0;
+    const slow = tool(async () => {
+      await barrier;
+      executions += 1;
+      return 'completed';
+    }, { name: 'slow', description: 'controlled side effect', schema: z.object({}) });
+    const ask = tool(async () => 'approved', { name: 'ask', description: 'approval', schema: z.object({}) });
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', { hooks: [async (input) => ({ decision: input.toolName === 'ask' ? 'ask' : 'allow' })] });
+    const node = new ToolNode({ tools: [ask, slow], directToolNames: new Set(['ask', 'slow']),
+      hookRegistry: registry, humanInTheLoop: { enabled: true } });
+    const graph = buildHITLGraph(node, [
+      { id: 'ask_call', name: 'ask', args: {} }, { id: 'slow_call', name: 'slow', args: {} },
+    ]);
+    let paused = false;
+    const pending = graph.invoke({ messages: [] }, { configurable: { thread_id: 'settle-before-pause' } })
+      .then((result) => { paused = true; return result; });
+    await flushAsyncWork();
+    expect(paused).toBe(false);
+    expect(executions).toBe(0);
+    release();
+    const interrupted = await pending;
+    expect(executions).toBe(1);
+    expect(isInterrupted(interrupted)).toBe(true);
+    if (!isInterrupted<unknown>(interrupted)) {
+      throw new Error('Expected approval pause');
+    }
+    const state = getToolBatchReplayState(interrupted.__interrupt__[0].value);
+    expect(state?.records).toHaveLength(1);
+  });
+
+  it.each([
+    { fresh: false, mutate: false, append: false }, { fresh: true, mutate: false, append: false }, { fresh: true, mutate: true, append: false },
+    { fresh: true, mutate: false, append: true },
+  ])('reuses a settled direct sibling when a later event tool interrupts (fresh=$fresh, mutate=$mutate, append=$append)', async ({ fresh, mutate, append }) => {
+    let directExecutions = 0;
+    const completedCallIds: string[] = [];
+    const dispatchedEventNames: string[] = [];
+    const directTool = tool(
+      async (): Promise<string> => {
+        directExecutions += 1;
+        return 'direct-result';
+      },
+      {
+        name: 'local_direct',
+        description: 'local direct test tool',
+        schema: z.object({ command: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          const completed = data as {
+            result?: { tool_call?: { id?: string } };
+          };
+          const id = completed.result?.tool_call?.id;
+          if (id != null) {
+            completedCallIds.push(id);
+          }
+          return;
+        }
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (results: t.ToolExecuteResult[]) => void;
+        };
+        dispatchedEventNames.push(
+          ...request.toolCalls.map((call) => call.name)
+        );
+        request.resolve(
+          request.toolCalls.map((call) => ({
+            toolCallId: call.id,
+            content: 'event-result',
+            status: 'success' as const,
+          }))
+        );
+      });
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> =>
+          input.toolName === 'remote_event'
+            ? { decision: 'ask', reason: 'review event tool' }
+            : { decision: 'allow' },
+      ],
+    });
+    const createNode = () => new ToolNode({
+      tools: [directTool, createSchemaStub('remote_event')],
+      toolMap: new Map([
+        ['local_direct', directTool],
+        ['remote_event', createSchemaStub('remote_event')],
+      ]),
+      eventDrivenMode: true,
+      directToolNames: new Set(['local_direct']),
+      agentId: 'a',
+      toolCallStepIds: new Map([
+        ['call_direct', 'step_direct'],
+        ['call_event', 'step_event'],
+      ]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const checkpointer = new MemorySaver();
+    const calls = [
+      {
+        id: 'call_direct',
+        name: 'local_direct',
+        args: { command: 'local' },
+      },
+      {
+        id: 'call_event',
+        name: 'remote_event',
+        args: { command: 'remote' },
+      },
+    ];
+    const graph = buildHITLGraph(createNode(), calls, checkpointer);
+    const config = { configurable: { thread_id: 'mixed-direct-event-replay' } };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    expect(directExecutions).toBe(1);
+    expect(completedCallIds.filter((id) => id === 'call_direct')).toHaveLength(
+      1
+    );
+
+    let resumed: { messages: BaseMessage[] };
+    if (fresh) {
+      const restoredGraph = buildHITLGraph(createNode(), calls, checkpointer);
+      const { Run } = await import('@/run');
+      const restoredRun = await Run.create<t.IState>({
+        runId: 'a-different-process-run-id',
+        graphConfig: {
+          type: 'standard',
+          agents: [{
+            agentId: 'a', provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop', maxContextTokens: 8000,
+          }],
+          compileOptions: { checkpointer },
+        },
+        humanInTheLoop: { enabled: true },
+      });
+      restoredRun.graphRunnable = restoredGraph as unknown as t.CompiledStateWorkflow;
+      if (mutate) {
+        const checkpoint = await checkpointer.getTuple(config);
+        const messages = checkpoint?.checkpoint.channel_values.messages as BaseMessage[];
+        const original = messages.find((message) => message.getType() === 'ai');
+        await expect(restoredRun.resume([{ type: 'approve' }], { ...config, version: 'v2' }, undefined, {
+          update: { messages: [new AIMessage({
+            id: original?.id, content: '', tool_calls: calls.map((call) => call.id === 'call_direct' ?
+              { ...call, args: { command: 'different operation' } } : call),
+          })] },
+        })).rejects.toThrow('Tool batch proposal changed before approval replay');
+        expect(directExecutions).toBe(1);
+        expect(dispatchedEventNames).toEqual([]);
+        return;
+      }
+      await restoredRun.resume([{ type: 'approve' }], { ...config, version: 'v2' }, undefined,
+        append ? { update: { messages: [new HumanMessage('Additional instructions during approval')] } } : undefined);
+      await restoredRun.resume([{ type: 'approve' }], { ...config, version: 'v2' });
+      const state = await restoredGraph.getState?.(config);
+      resumed = (state as { values: { messages: BaseMessage[] } }).values;
+    } else {
+      resumed = await resumeGraph(graph, interrupted, [{ type: 'approve' }], config) as { messages: BaseMessage[] };
+    }
+
+    expect(directExecutions).toBe(1);
+    expect(completedCallIds.filter((id) => id === 'call_direct')).toHaveLength(
+      1
+    );
+    expect(dispatchedEventNames).toEqual(['remote_event']);
+    const directResult = resumed.messages.find(
+      (message): message is ToolMessage =>
+        message._getType() === 'tool' &&
+        (message as ToolMessage).tool_call_id === 'call_direct'
+    );
+    expect(directResult?.status).not.toBe('error');
+    expect(directResult?.content).toBe('direct-result');
+  });
+
+  it('executes the exact resolved direct arguments that were reviewed', async () => {
+    const executedCommands: string[] = [];
+    const directTool = tool(
+      async ({ command }): Promise<string> => {
+        executedCommands.push(command);
+        return 'ran';
+      },
+      {
+        name: 'reference_direct',
+        description: 'reference test tool',
+        schema: z.object({ command: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const registry = makeHookRegistry('ask', 'review resolved command');
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      directToolNames: new Set(['reference_direct']),
+      agentId: 'a',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+      toolOutputReferences: { enabled: true },
+    });
+    const referenceRegistry = (
+      node as unknown as {
+        toolOutputRegistry?: ToolOutputReferenceRegistry;
+      }
+    ).toolOutputRegistry;
+    referenceRegistry?.set(
+      'reviewed-reference-direct',
+      'tool0turn0',
+      'resolved-value'
+    );
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_1',
+        name: 'reference_direct',
+        args: { command: 'echo {{tool0turn0}}' },
+      },
+    ]);
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'reviewed-reference-direct',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+      toolOutputReferences: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+    const config = {
+      configurable: {
+        thread_id: 'reviewed-reference-direct',
+        run_id: 'reviewed-reference-direct',
+      },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, config);
+    const interrupt = run.getInterrupt();
+    const reviewedArguments =
+      interrupt?.payload.type === 'tool_approval'
+        ? interrupt.payload.action_requests[0]?.arguments
+        : undefined;
+    expect(reviewedArguments).toEqual({
+      command: 'echo resolved-value',
+    });
+    (
+      node as unknown as {
+        toolOutputRegistry?: ToolOutputReferenceRegistry;
+      }
+    ).toolOutputRegistry = new ToolOutputReferenceRegistry();
+
+    await run.resume([{ type: 'approve' }], config);
+
+    expect(executedCommands).toEqual(['echo resolved-value']);
+  });
+
+  it('replays a direct hook rewrite from the original arguments', async () => {
+    const hookInputs: string[] = [];
+    const executedCommands: string[] = [];
+    const directTool = tool(
+      async ({ command }): Promise<string> => {
+        executedCommands.push(command);
+        return 'ran';
+      },
+      {
+        name: 'rewritten_direct',
+        description: 'rewrite replay test tool',
+        schema: z.object({ command: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => {
+          const command = String(input.toolInput.command);
+          hookInputs.push(command);
+          return {
+            decision: 'ask',
+            reason: 'review rewritten command',
+            updatedInput: { command: `safe:${command}` },
+          };
+        },
+      ],
+    });
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      directToolNames: new Set(['rewritten_direct']),
+      agentId: 'a',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_1',
+        name: 'rewritten_direct',
+        args: { command: 'original' },
+      },
+    ]);
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'direct-rewrite-replay',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: {
+              modelName: 'gpt-4o-mini',
+              apiKey: 'test-key',
+            },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+    const config = {
+      configurable: { thread_id: 'direct-rewrite-replay' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, config);
+    await run.resume([{ type: 'approve' }], config);
+
+    expect(hookInputs).toEqual(['original', 'original']);
+    expect(executedCommands).toEqual(['safe:original']);
+  });
+
+  it('does not let a host mutation change the reviewed direct proposal', async () => {
+    const executedCommands: string[] = [];
+    const directTool = tool(
+      async ({ command }): Promise<string> => {
+        executedCommands.push(command);
+        return 'ran';
+      },
+      {
+        name: 'immutable_direct',
+        description: 'immutable proposal test tool',
+        schema: z.object({ command: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const registry = makeHookRegistry('ask', 'review immutable command');
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      directToolNames: new Set(['immutable_direct']),
+      agentId: 'a',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_1',
+        name: 'immutable_direct',
+        args: { command: 'reviewed' },
+      },
+    ]);
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'immutable-direct-proposal',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: {
+              modelName: 'gpt-4o-mini',
+              apiKey: 'test-key',
+            },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+    const config = {
+      configurable: { thread_id: 'immutable-direct-proposal' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, config);
+    const exposed = run.getInterrupt();
+    if (exposed?.payload.type !== 'tool_approval') {
+      throw new Error('expected tool approval');
+    }
+    exposed.payload.action_requests[0].arguments.command = 'mutated';
+    await run.resume([{ type: 'approve' }], config);
+
+    expect(executedCommands).toEqual(['reviewed']);
+  });
+
+  it('Run.resume fails closed when a reusable hook changes the reviewed arguments', async () => {
+    let dispatchCalls = 0;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        dispatchCalls += 1;
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (results: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve(
+          request.toolCalls.map((call) => ({
+            toolCallId: call.id,
+            content: 'ran',
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    let hookCalls = 0;
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          hookCalls += 1;
+          return {
+            decision: 'ask',
+            reason: 'review this command',
+            updatedInput: {
+              command: hookCalls === 1 ? 'reviewed' : 'changed-after-review',
+            },
+          };
+        },
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'a',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'original' } },
+    ]);
+
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'reviewed-argument-integrity',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: {
+              modelName: 'gpt-4o-mini',
+              apiKey: 'test-key',
+            },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+    const config = {
+      configurable: { thread_id: 'reviewed-argument-thread' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, config);
+    await run.resume([{ type: 'approve' }], config);
+
+    expect(hookCalls).toBe(2);
+    expect(dispatchCalls).toBe(0);
+  });
+
+  it('Run.resume preserves the reviewed decision for a direct tool when policy replay loosens', async () => {
+    const executedCommands: string[] = [];
+    const directTool = tool(
+      async ({ command }): Promise<string> => {
+        executedCommands.push(command);
+        return 'ran';
+      },
+      {
+        name: 'direct_echo',
+        description: 'direct test tool',
+        schema: z.object({ command: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+
+    let hookCalls = 0;
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          hookCalls += 1;
+          return hookCalls === 1
+            ? { decision: 'ask', reason: 'review direct command' }
+            : { decision: 'allow' };
+        },
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      directToolNames: new Set(['direct_echo']),
+      agentId: 'a',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'direct_echo', args: { command: 'reviewed' } },
+    ]);
+
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'reviewed-direct-rejection',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: {
+              modelName: 'gpt-4o-mini',
+              apiKey: 'test-key',
+            },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+    const config = {
+      configurable: { thread_id: 'reviewed-direct-thread' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, config);
+    await run.resume([{ type: 'reject', reason: 'not approved' }], config);
+
+    expect(hookCalls).toBe(2);
+    expect(executedCommands).toEqual([]);
+  });
+
+  it.each([
+    { label: 'event-dispatched', direct: false },
+    { label: 'direct', direct: true },
+  ])(
+    'Run.resume honors a reviewed rejection for a $label tool after its hook registry is removed',
+    async ({ direct }) => {
+      let executions = 0;
+      const echoTool = tool(
+        async (): Promise<string> => {
+          executions += 1;
+          return 'ran';
+        },
+        {
+          name: 'echo',
+          description: 'test tool',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+      if (!direct) {
+        jest
+          .spyOn(events, 'safeDispatchCustomEvent')
+          .mockImplementation(async (event, data) => {
+            if (event !== 'on_tool_execute') {
+              return;
+            }
+            executions += 1;
+            const request = data as {
+              toolCalls: t.ToolCallRequest[];
+              resolve: (results: t.ToolExecuteResult[]) => void;
+            };
+            request.resolve(
+              request.toolCalls.map((call) => ({
+                toolCallId: call.id,
+                content: 'ran',
+                status: 'success' as const,
+              }))
+            );
+          });
+      }
+
+      let hookCalls = 0;
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => {
+            hookCalls += 1;
+            return { decision: 'ask', reason: 'review this command' };
+          },
+        ],
+      });
+      const node = new ToolNode({
+        tools: [echoTool],
+        eventDrivenMode: true,
+        ...(direct ? { directToolNames: new Set(['echo']) } : {}),
+        agentId: 'a',
+        toolCallStepIds: new Map([['call_1', 'step_1']]),
+        hookRegistry: registry,
+        humanInTheLoop: { enabled: true },
+      });
+      const graph = buildHITLGraph(node, [
+        { id: 'call_1', name: 'echo', args: { command: 'reviewed' } },
+      ]);
+      const { Run } = await import('@/run');
+      const run = await Run.create<t.IState>({
+        runId: `removed-hook-registry-${direct ? 'direct' : 'event'}`,
+        graphConfig: {
+          type: 'standard',
+          agents: [
+            {
+              agentId: 'a',
+              provider: providers.OPENAI,
+              clientOptions: {
+                modelName: 'gpt-4o-mini',
+                apiKey: 'test-key',
+              },
+              instructions: 'noop',
+              maxContextTokens: 8000,
+            },
+          ],
+        },
+        hooks: registry,
+        humanInTheLoop: { enabled: true },
+      });
+      run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+      const config = {
+        configurable: {
+          thread_id: `removed-hook-registry-${direct ? 'direct' : 'event'}`,
+        },
+        version: 'v2' as const,
+      };
+
+      await run.processStream({ messages: [] }, config);
+      expect(run.getInterrupt()?.payload).toMatchObject({
+        type: 'tool_approval',
+      });
+      (node as unknown as { hookRegistry?: HookRegistry }).hookRegistry =
+        undefined;
+
+      await run.resume([{ type: 'reject', reason: 'not approved' }], config);
+
+      expect(hookCalls).toBe(1);
+      expect(executions).toBe(0);
+    }
+  );
+
+  it.each([
+    { direct: true, changedOwner: false, replaceIds: false }, { direct: false, changedOwner: false, replaceIds: false },
+    { direct: true, changedOwner: true, replaceIds: false }, { direct: false, changedOwner: true, replaceIds: false },
+    { direct: true, changedOwner: true, replaceIds: true }, { direct: false, changedOwner: true, replaceIds: true },
+  ])(
+    'restores a rewritten approval with fresh instances (direct=$direct, changedOwner=$changedOwner, replaceIds=$replaceIds)',
+    async ({ direct, changedOwner, replaceIds }) => {
+      const checkpointer = new MemorySaver();
+      const executed: string[] = [];
+      const echo = tool(async ({ command }) => {
+        executed.push(command);
+        return command;
+      }, {
+        name: 'echo',
+        description: 'echo a reviewed command',
+        schema: z.object({ command: z.string() }),
+      });
+      if (!direct) {
+        jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(async (event, data) => {
+          if (event !== 'on_tool_execute') {
+            return;
+          }
+          const request = data as {
+            toolCalls: t.ToolCallRequest[];
+            resolve: (results: t.ToolExecuteResult[]) => void;
+          };
+          request.resolve(request.toolCalls.map((call) => {
+            const command = String(call.args.command);
+            executed.push(command);
+            return { toolCallId: call.id, content: command, status: 'success' };
+          }));
+        });
+      }
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [async () => ({ decision: 'ask', updatedInput: { command: 'reviewed' } })],
+      });
+      const { Run } = await import('@/run');
+      const create = async (hooks?: HookRegistry, agentId = 'a') => {
+        const node = new ToolNode({
+          tools: [echo],
+          eventDrivenMode: true,
+          ...(direct ? { directToolNames: new Set(['echo']) } : {}),
+          agentId,
+          toolCallStepIds: new Map([['call_1', 'step_1']]),
+          hookRegistry: hooks,
+          humanInTheLoop: { enabled: true },
+        });
+        const run = await Run.create<t.IState>({
+          runId: `fresh-approval-${direct}`,
+          graphConfig: {
+            type: 'standard',
+            agents: [{
+              agentId: 'a', provider: providers.OPENAI,
+              clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+              instructions: 'noop', maxContextTokens: 8000,
+            }],
+            compileOptions: { checkpointer },
+          },
+          hooks,
+          humanInTheLoop: { enabled: true },
+        });
+        run.graphRunnable = buildHITLGraph(node, [
+          { id: 'call_1', name: 'echo', args: { command: 'original' } },
+        ], checkpointer) as unknown as t.CompiledStateWorkflow;
+        return run;
+      };
+      const config = { configurable: { thread_id: `fresh-approval-${direct}` }, version: 'v2' as const };
+      const original = await create(registry);
+      await original.processStream({ messages: [] }, config);
+      expect(original.getInterrupt()?.payload).toMatchObject({
+        action_requests: [{ arguments: { command: 'reviewed' } }],
+      });
+      expect(executed).toEqual([]);
+      const restored = await create(undefined, changedOwner ? 'different-agent' : 'a');
+      if (changedOwner) {
+        const tuple = await checkpointer.getTuple(config);
+        const messages = tuple?.checkpoint.channel_values.messages as BaseMessage[];
+        const assistant = messages.find((message) => message.getType() === 'ai');
+        await expect(restored.resume([{ type: 'reject' }], config, undefined, replaceIds ? {
+          update: { messages: [new AIMessage({ id: assistant?.id, content: '', tool_calls: [
+            { id: 'replacement', name: 'echo', args: { command: 'unreviewed' } },
+          ] })] },
+        } : undefined)).rejects.toThrow('Tool approval execution owner changed');
+        expect(executed).toEqual([]);
+        return;
+      }
+      await restored.resume([{ type: 'approve' }], config);
+      expect(executed).toEqual(['reviewed']);
+    }
+  );
+
+  it.each([false, true])('preserves ID-less successes beside a rejected approval (mixed=%s)', async (mixed) => {
+    let executions = 0;
+    const work = tool(async () => { executions += 1; return `completed-${executions}`; }, {
+      name: 'work', description: 'work', schema: z.object({}),
+    });
+    const ask = tool(async () => 'approved', { name: 'ask', description: 'ask', schema: z.object({}) });
+    const checkpointer = new MemorySaver();
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', { hooks: [async (input) => ({ decision: input.toolName === 'ask' ? 'ask' : 'allow' })] });
+    const { Run } = await import('@/run');
+    const makeRun = async (hooks?: HookRegistry) => {
+      const run = await Run.create<t.IState>({
+        runId: `idless-${mixed}`,
+        graphConfig: { type: 'standard', agents: [{
+          agentId: 'a', provider: providers.OPENAI,
+          clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+          instructions: 'noop', maxContextTokens: 8000,
+        }], compileOptions: { checkpointer } },
+        humanInTheLoop: { enabled: true }, hooks,
+      });
+      const graph = buildHITLGraph(new ToolNode({
+        tools: [work, ask], agentId: 'a', eventDrivenMode: mixed,
+        directToolNames: new Set(['work']), hookRegistry: hooks,
+        toolCallStepIds: new Map([['ask', 'ask-step']]),
+        humanInTheLoop: { enabled: true },
+      }), [{ name: 'work', args: {} }, { name: 'work', args: {} }, { id: 'ask', name: 'ask', args: {} }], checkpointer);
+      run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+      return { run, graph };
+    };
+    const config = { configurable: { thread_id: `idless-${mixed}` }, version: 'v2' as const };
+    const original = await makeRun(registry);
+    await original.run.processStream({ messages: [] }, config);
+    expect(original.run.getInterrupt()?.payload).toMatchObject({ type: 'tool_approval' });
+    expect(executions).toBe(2);
+    const fresh = await makeRun();
+    await fresh.run.resume([{ type: 'reject' }], config);
+    const result = await fresh.graph.getState?.(config);
+    expect(executions).toBe(2);
+    expect(JSON.stringify(result)).toContain('completed-1');
+    expect(JSON.stringify(result)).toContain('completed-2');
+  });
+
+  it('forwards child review evidence without blocking an unrelated parent sibling', async () => {
+    const receivedConfigurables: Array<Record<string, unknown> | undefined> =
+      [];
+    const subagentTool = tool(
+      async (_input, config): Promise<string> => {
+        receivedConfigurables.push(config.configurable);
+        return 'child result';
+      },
+      {
+        name: Constants.SUBAGENT,
+        description: 'execute a child agent',
+        schema: z.object({
+          description: z.string(),
+          subagent_type: z.string(),
+        }),
+      }
+    ) as unknown as StructuredToolInterface & ReplayableSubagentTool;
+    subagentTool[SUBAGENT_REPLAY_CONTROLLER] = {
+      getSettledOutput: async () => undefined,
+      persistSettledOutput: async () => undefined,
+    };
+    let siblingExecutions = 0;
+    const sibling = tool(async () => {
+      siblingExecutions += 1;
+      return 'parent result';
+    }, { name: 'parent_sibling', description: 'parent sibling', schema: z.object({}) });
+    const node = new ToolNode({
+      tools: [subagentTool, sibling],
+      directToolNames: new Set([Constants.SUBAGENT, 'parent_sibling']),
+      interruptingToolNames: new Set([Constants.SUBAGENT]),
+    });
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'parent_call',
+        name: Constants.SUBAGENT,
+        args: { description: 'inspect logs', subagent_type: 'researcher' },
+      },
+      { id: 'parent_sibling_call', name: 'parent_sibling', args: {} },
+    ]);
+    const reviewEvidence = createToolApprovalReviewEvidence('interrupt_1', {
+      type: 'tool_approval',
+      action_requests: [
+        {
+          tool_call_id: 'child_call',
+          name: 'bash',
+          arguments: { command: 'git status' },
+        },
+      ],
+      review_configs: [
+        {
+          tool_call_id: 'child_call',
+          action_name: 'bash',
+          allowed_decisions: ['approve', 'reject'],
+        },
+      ],
+    });
+    expect(reviewEvidence).toBeDefined();
+
+    await graph.invoke(
+      { messages: [] },
+      {
+        configurable: {
+          thread_id: 'nested-review-evidence',
+          [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: reviewEvidence,
+        },
+      }
+    );
+
+    expect(receivedConfigurables).toHaveLength(1);
+    expect(siblingExecutions).toBe(1);
+    expect(receivedConfigurables[0]?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY]).toBe(
+      reviewEvidence
+    );
   });
 
   it('captures interrupt even when payload is null (custom node calling interrupt(null))', async () => {
