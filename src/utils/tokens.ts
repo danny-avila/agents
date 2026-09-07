@@ -946,6 +946,63 @@ function getBoundedStructuredTokenCount(
   );
 }
 
+function readTokenMetadataProperty(
+  value: object,
+  key: PropertyKey,
+  path: string
+): unknown {
+  const seen = new Set<object>();
+  let current: object | null = value;
+  for (let depth = 0; current != null && depth < 100; depth++) {
+    if (isProxy(current)) {
+      throw new UnsafeTokenMeasurementError({
+        reason: 'metadata_proxy',
+        path,
+      });
+    }
+    if (seen.has(current)) {
+      throw new UnsafeTokenMeasurementError({
+        reason: 'metadata_accessor',
+        path,
+      });
+    }
+    seen.add(current);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(current, key);
+    } catch {
+      throw new UnsafeTokenMeasurementError({
+        reason: 'metadata_accessor',
+        path,
+      });
+    }
+    if (descriptor != null) {
+      if (!('value' in descriptor)) {
+        throw new UnsafeTokenMeasurementError({
+          reason: 'metadata_accessor',
+          path,
+        });
+      }
+      return descriptor.value;
+    }
+    try {
+      current = Object.getPrototypeOf(current) as object | null;
+    } catch {
+      throw new UnsafeTokenMeasurementError({
+        reason: 'metadata_accessor',
+        path,
+      });
+    }
+  }
+  if (current != null) {
+    throw new UnsafeTokenMeasurementError({
+      reason: 'metadata_accessor',
+      path,
+    });
+  }
+  return undefined;
+}
+
 export function getTokenCountForMessage(
   message: BaseMessage,
   getTokenCount: (text: string) => number,
@@ -1191,72 +1248,68 @@ export function getTokenCountForMessage(
             : getBoundedStructuredTokenCount(args, countText);
       }
     }
-    let rawToolCalls: PropertyDescriptor | undefined;
-    try {
-      rawToolCalls =
-        additionalKwargs != null
-          ? Object.getOwnPropertyDescriptor(additionalKwargs, 'tool_calls')
-          : undefined;
-    } catch {
-      throw new UnsafeTokenMeasurementError({
-        reason: 'metadata_accessor',
-        path: 'additional_kwargs.tool_calls',
-      });
-    }
-    if (rawToolCalls != null) {
-      if (!('value' in rawToolCalls)) {
+    const rawCalls =
+      additionalKwargs == null
+        ? undefined
+        : readTokenMetadataProperty(
+          additionalKwargs,
+          'tool_calls',
+          'additional_kwargs.tool_calls'
+        );
+    if (rawCalls != null) {
+      if (isProxy(rawCalls)) {
+        throw new UnsafeTokenMeasurementError({
+          reason: 'metadata_proxy',
+          path: 'additional_kwargs.tool_calls',
+        });
+      }
+      if (!Array.isArray(rawCalls)) {
         throw new UnsafeTokenMeasurementError({
           reason: 'metadata_accessor',
           path: 'additional_kwargs.tool_calls',
         });
       }
-      const rawCalls = rawToolCalls.value;
-      if (rawCalls != null) {
-        if (!Array.isArray(rawCalls) || isProxy(rawCalls)) {
+      for (let i = 0; i < rawCalls.length; i++) {
+        const rawCall = readTokenMetadataProperty(
+          rawCalls,
+          String(i),
+          `additional_kwargs.tool_calls[${i}]`
+        );
+        if (
+          rawCall == null ||
+          typeof rawCall !== 'object' ||
+          isProxy(rawCall)
+        ) {
           throw new UnsafeTokenMeasurementError({
             reason: 'metadata_proxy',
-            path: 'additional_kwargs.tool_calls',
+            path: `additional_kwargs.tool_calls[${i}]`,
           });
         }
-        for (let i = 0; i < rawCalls.length; i++) {
-          const rawCall = rawCalls[i];
-          if (
-            rawCall == null ||
-            typeof rawCall !== 'object' ||
-            isProxy(rawCall)
-          ) {
-            throw new UnsafeTokenMeasurementError({
-              reason: 'metadata_proxy',
-              path: `additional_kwargs.tool_calls[${i}]`,
-            });
-          }
-          let id: PropertyDescriptor | undefined;
-          try {
-            id = Object.getOwnPropertyDescriptor(rawCall, 'id');
-          } catch {
-            throw new UnsafeTokenMeasurementError({
-              reason: 'metadata_accessor',
-              path: `additional_kwargs.tool_calls[${i}].id`,
-            });
-          }
-          if (id != null && !('value' in id)) {
-            throw new UnsafeTokenMeasurementError({
-              reason: 'metadata_accessor',
-              path: `additional_kwargs.tool_calls[${i}].id`,
-            });
-          }
-          const callId = id?.value;
-          if (
-            typeof callId === 'string' &&
-            (representedToolCallIds.has(callId) ||
-              parsedToolCallIds.has(callId))
-          ) {
-            continue;
-          }
-          numTokens += getBoundedStructuredTokenCount(rawCall, countText);
-          if (typeof callId === 'string' && callId.length > 0) {
-            representedToolCallIds.add(callId);
-          }
+        let id: PropertyDescriptor | undefined;
+        try {
+          id = Object.getOwnPropertyDescriptor(rawCall, 'id');
+        } catch {
+          throw new UnsafeTokenMeasurementError({
+            reason: 'metadata_accessor',
+            path: `additional_kwargs.tool_calls[${i}].id`,
+          });
+        }
+        if (id != null && !('value' in id)) {
+          throw new UnsafeTokenMeasurementError({
+            reason: 'metadata_accessor',
+            path: `additional_kwargs.tool_calls[${i}].id`,
+          });
+        }
+        const callId = id?.value;
+        if (
+          typeof callId === 'string' &&
+          (representedToolCallIds.has(callId) || parsedToolCallIds.has(callId))
+        ) {
+          continue;
+        }
+        numTokens += getBoundedStructuredTokenCount(rawCall, countText);
+        if (typeof callId === 'string' && callId.length > 0) {
+          representedToolCallIds.add(callId);
         }
       }
     }

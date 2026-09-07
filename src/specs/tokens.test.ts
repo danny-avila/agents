@@ -302,6 +302,61 @@ describe('getTokenCountForMessage', () => {
     );
   });
 
+  test('counts inherited raw OpenAI tool calls', () => {
+    const message = new AIMessage('');
+    Object.setPrototypeOf(message.additional_kwargs, {
+      tool_calls: [
+        {
+          id: 'inherited-call',
+          type: 'function',
+          function: {
+            name: 'lookup',
+            arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+          },
+        },
+      ],
+    });
+
+    expect(
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toBeGreaterThan(5_000);
+  });
+
+  test('rejects a revoked raw tool-call proxy with the typed error', () => {
+    const message = new AIMessage('');
+    const { proxy, revoke } = Proxy.revocable([], {});
+    message.additional_kwargs.tool_calls = proxy;
+    revoke();
+
+    expect(() =>
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toThrow(UnsafeTokenMeasurementError);
+  });
+
+  test('rejects raw tool-call array accessors without invoking them', () => {
+    const message = new AIMessage('');
+    const rawCalls: Array<{
+      id: string;
+      type: 'function';
+      function: { name: string; arguments: string };
+    }> = [];
+    let getterCalls = 0;
+    Object.defineProperty(rawCalls, '0', {
+      configurable: true,
+      get: () => {
+        getterCalls += 1;
+        throw new Error('must not run');
+      },
+    });
+    rawCalls.length = 1;
+    message.additional_kwargs.tool_calls = rawCalls;
+
+    expect(() =>
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toThrow(UnsafeTokenMeasurementError);
+    expect(getterCalls).toBe(0);
+  });
+
   test('keeps nested dense strings on the bounded structured path', () => {
     const callbackLengths: number[] = [];
     const payload = 'x'.repeat(4 * 1024 * 1024);
