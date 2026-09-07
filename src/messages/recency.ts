@@ -1,23 +1,14 @@
-import type {
-  AIMessage,
-  BaseMessage,
-  ToolMessage,
-} from '@langchain/core/messages';
-import type {
-  ProviderToolCallIndex,
-  ProviderToolCallPartDescriptor,
-  ProviderToolResultPartDescriptor,
-} from './toolResultTypes';
+import type { BaseMessage } from '@langchain/core/messages';
+import type { ProviderToolCallIndex } from './toolResultTypes';
 import { getProviderSourceMessageIds } from './provenance';
 import {
+  appendProviderMessageToolCalls,
   appendProviderToolCallDescriptor,
   consumeProviderToolResultPair,
   getBoundedProviderPairingArray,
-  getBoundedProviderPairingArrayProperty,
-  getProviderAIMessageToolCallDescriptor,
   getProviderToolCallPartDescriptor,
+  getProviderToolMessageResultDescriptor,
   getProviderToolResultPartDescriptor,
-  PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS,
 } from './toolResultTypes';
 
 export const DEFAULT_RETAIN_RECENT_TURNS = 2;
@@ -102,155 +93,6 @@ export function resolveIntraTurnRetainTokens({
   );
 }
 
-function readOwnString(value: unknown, key: string): string | undefined {
-  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
-    return undefined;
-  }
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    return descriptor != null &&
-      'value' in descriptor &&
-      typeof descriptor.value === 'string' &&
-      descriptor.value !== '' &&
-      descriptor.value.length <= PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS
-      ? descriptor.value
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function readOwnValue(value: unknown, key: string): unknown {
-  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
-    return undefined;
-  }
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    return descriptor != null && 'value' in descriptor
-      ? descriptor.value
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-const LEGACY_FUNCTION_CALL_PREFIX = 'legacy_function:';
-
-function getLegacyFunctionCallId(name: string): string | undefined {
-  const callId = `${LEGACY_FUNCTION_CALL_PREFIX}${name}`;
-  return callId.length <= PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS
-    ? callId
-    : undefined;
-}
-
-function getRawToolCallDescriptor(
-  toolCall: unknown
-): ProviderToolCallPartDescriptor | undefined {
-  const callId = readOwnString(toolCall, 'id');
-  if (callId == null) {
-    return undefined;
-  }
-  let name: string | undefined;
-  if (toolCall != null && typeof toolCall === 'object') {
-    try {
-      const property = Object.getOwnPropertyDescriptor(toolCall, 'function');
-      name =
-        property != null && 'value' in property
-          ? readOwnString(property.value, 'name')
-          : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-  return {
-    callId,
-    kind: 'tool',
-    sourceType: 'raw_tool_calls',
-    ...(name == null ? {} : { name }),
-  };
-}
-
-function appendMessageToolCalls(
-  message: BaseMessage,
-  calls: ProviderToolCallIndex
-): void {
-  const messageRole = (message as BaseMessage & { role?: unknown }).role;
-  if (message.getType() !== 'ai' && messageRole !== 'assistant') {
-    return;
-  }
-
-  for (const toolCall of (message as AIMessage).tool_calls ?? []) {
-    const descriptor = getProviderAIMessageToolCallDescriptor(toolCall);
-    if (descriptor != null) {
-      appendProviderToolCallDescriptor(calls, descriptor);
-    }
-  }
-
-  const rawToolCalls = getBoundedProviderPairingArrayProperty(
-    message.additional_kwargs,
-    'tool_calls'
-  );
-  if (rawToolCalls != null) {
-    for (const toolCall of rawToolCalls) {
-      const descriptor = getRawToolCallDescriptor(toolCall);
-      if (descriptor != null) {
-        appendProviderToolCallDescriptor(calls, descriptor);
-      }
-    }
-  }
-
-  const legacyFunctionCall = readOwnValue(
-    message.additional_kwargs,
-    'function_call'
-  );
-  const legacyFunctionName = readOwnString(legacyFunctionCall, 'name');
-  const legacyFunctionCallId =
-    legacyFunctionName == null
-      ? undefined
-      : getLegacyFunctionCallId(legacyFunctionName);
-  if (legacyFunctionCallId != null) {
-    appendProviderToolCallDescriptor(calls, {
-      callId: legacyFunctionCallId,
-      kind: 'tool',
-      name: legacyFunctionName,
-      sourceType: 'legacy_function_call',
-    });
-  }
-}
-
-function getToolMessageResultDescriptor(
-  message: BaseMessage
-): ProviderToolResultPartDescriptor | undefined {
-  if (message.getType() === 'function' && message.name != null) {
-    const toolCallId = getLegacyFunctionCallId(message.name);
-    return toolCallId == null
-      ? undefined
-      : {
-        type: 'function_message',
-        toolCallId,
-        compatibleCallKinds: ['tool'],
-        expectedToolNames: [message.name],
-      };
-  }
-  if (message.getType() !== 'tool') {
-    return undefined;
-  }
-  const toolMessage = message as ToolMessage & { toolCallId?: unknown };
-  const toolCallId =
-    typeof toolMessage.tool_call_id === 'string'
-      ? toolMessage.tool_call_id
-      : toolMessage.toolCallId;
-  return typeof toolCallId === 'string' &&
-    toolCallId !== '' &&
-    toolCallId.length <= PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS
-    ? {
-      type: 'tool_message',
-      toolCallId,
-      compatibleCallKinds: ['tool'],
-    }
-    : undefined;
-}
-
 interface MessagePairingResult {
   completedToolCalls: number;
   trustedHumanToolResult: boolean;
@@ -263,7 +105,7 @@ function inspectMessagePairing(
   const isHuman = message.getType() === 'human';
   const candidateCalls = isHuman ? new Map(calls) : calls;
   if (!isHuman) {
-    appendMessageToolCalls(message, candidateCalls);
+    appendProviderMessageToolCalls(message, candidateCalls);
   }
   const content = getBoundedProviderPairingArray(message.content);
   let completedToolCalls = 0;
@@ -300,7 +142,7 @@ function inspectMessagePairing(
     }
   }
 
-  const toolMessageResult = getToolMessageResultDescriptor(message);
+  const toolMessageResult = getProviderToolMessageResultDescriptor(message);
   if (
     toolMessageResult != null &&
     consumeProviderToolResultPair(toolMessageResult, candidateCalls)

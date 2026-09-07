@@ -1,29 +1,28 @@
 import type {
-  AIMessage,
   BaseMessage,
-  ChatMessage,
-  ToolMessage,
+  MessageContentComplex,
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type {
+  ProviderToolCallIndex,
+  ProviderToolResultPartDescriptor,
+} from './toolResultTypes';
 import type * as t from '@/types';
+import {
+  appendProviderMessageToolCalls,
+  appendProviderToolCallDescriptor,
+  getProviderMessageRole,
+  getProviderToolCallPartDescriptor,
+  getProviderToolMessageResultDescriptor,
+  getProviderToolResultPartDescriptor,
+} from './toolResultTypes';
 import { apportionTokenCounts } from '@/utils/tokens';
+import { isReasoningContentBlock } from './core';
 import { emitAgentLog } from '@/utils/events';
+import { ContentTypes } from '@/common';
 
-type NamedToolCall = {
-  id?: string;
-  name?: string;
-  function?: { name?: string };
-};
-
-/** Inline tool-call content: an Anthropic `tool_use` block, the v1 standard
- *  `tool_call` block (`{ id, name }` at top level, which `@langchain/aws`
- *  serializes to a Converse toolUse), and this repo's `ToolCallContent`
- *  (`{ tool_call: { id, name } }`). */
-type InlineToolCallBlock = {
-  id?: string;
-  name?: string;
-  tool_call?: { id?: string; name?: string };
-};
+const UNKNOWN_TOOL = 'unknown_tool';
+const BLANK_TEXT = /^\s*$/u;
 
 /** Rejects counts a subset claim cannot be derived from. Callers must degrade
  *  rather than propagate: this runs on the live pre-invoke path. */
@@ -57,17 +56,131 @@ function warnUnavailableToolShare(
   );
 }
 
-/** A `ChatMessage` carrying `role: 'assistant'` reports its type as `generic`,
- *  a shape the OpenAI role converter and the default token counter both accept. */
-function isAssistantMessage(message: BaseMessage, type: string): boolean {
-  if (type === 'ai') {
-    return true;
-  }
-  return type === 'generic' && (message as ChatMessage).role === 'assistant';
+/** `isReasoningContentBlock` matches every provider reasoning block by prefix
+ *  but deliberately excludes LibreChat's `think`, which this gauge must treat
+ *  the same way: reasoning attached to the turn, not visible conversation. */
+function isReasoningPart(part: MessageContentComplex): boolean {
+  return part.type === ContentTypes.THINK || isReasoningContentBlock(part);
 }
 
-/** Counts retained tool exchanges without serializing arguments or result content.
- * Mixed text/reasoning/media assistant messages remain in the conversation share. */
+function isBlankTextPart(part: string | MessageContentComplex): boolean {
+  if (typeof part === 'string') {
+    return BLANK_TEXT.test(part);
+  }
+  return (
+    part.type === ContentTypes.TEXT &&
+    typeof part.text === 'string' &&
+    BLANK_TEXT.test(part.text)
+  );
+}
+
+function readLegacyFunctionName(message: BaseMessage): string | undefined {
+  const name = message.additional_kwargs.function_call?.name;
+  return typeof name === 'string' && name.length > 0 ? name : undefined;
+}
+
+function getPairedToolName(
+  descriptor: ProviderToolResultPartDescriptor,
+  calls: ProviderToolCallIndex
+): string | undefined {
+  return descriptor.toolCallId == null
+    ? undefined
+    : calls.get(descriptor.toolCallId)?.descriptor.name;
+}
+
+interface InvocationScan {
+  readonly recognizedCalls: number;
+  readonly toolOnly: boolean;
+}
+
+/**
+ * Registers an assistant turn's calls and decides whether the turn is
+ * tool-only. Tool-only means every part is blank text, a tool call, a provider
+ * tool result returned inline (Anthropic server tools), or reasoning attached
+ * to the turn. Visible text, media and unrecognized blocks keep the whole turn
+ * in the conversation share. Shape recognition is the taxonomy's, so a call or
+ * result representation this repo's converters accept is accepted here.
+ */
+function scanInvocation(
+  message: BaseMessage,
+  calls: ProviderToolCallIndex
+): InvocationScan {
+  let recognizedCalls = appendProviderMessageToolCalls(message, calls);
+  if (typeof message.content === 'string') {
+    return { recognizedCalls, toolOnly: BLANK_TEXT.test(message.content) };
+  }
+  const parts: ReadonlyArray<string | MessageContentComplex> = message.content;
+  let toolOnly = true;
+  for (const part of parts) {
+    if (typeof part === 'string') {
+      toolOnly &&= BLANK_TEXT.test(part);
+      continue;
+    }
+    const call = getProviderToolCallPartDescriptor(part);
+    if (call != null) {
+      appendProviderToolCallDescriptor(calls, call);
+      recognizedCalls += 1;
+      continue;
+    }
+    if (getProviderToolResultPartDescriptor(part) != null) {
+      continue;
+    }
+    if (isReasoningPart(part)) {
+      continue;
+    }
+    toolOnly &&= isBlankTextPart(part);
+  }
+  return { recognizedCalls, toolOnly };
+}
+
+/** Result attribution: the paired call's name, then the message's own name,
+ *  then the legacy call still pending for a nameless `FunctionMessage`. */
+function getToolMessageResultName(
+  message: BaseMessage,
+  calls: ProviderToolCallIndex,
+  pendingLegacyName: string | undefined
+): string {
+  const descriptor = getProviderToolMessageResultDescriptor(message);
+  const paired =
+    descriptor == null ? undefined : getPairedToolName(descriptor, calls);
+  if (paired != null) {
+    return paired;
+  }
+  if (message.name != null && message.name.length > 0) {
+    return message.name;
+  }
+  return pendingLegacyName ?? UNKNOWN_TOOL;
+}
+
+/**
+ * A user turn made only of `tool_result` parts the converters accept in that
+ * position: the split `AIMessage(tool_call)` + `HumanMessage(tool_result)`
+ * history. The counter measures whole messages, so the turn is attributed to
+ * its one paired tool, or to `unknown_tool` when its parts name several.
+ * Returns undefined for any other user turn.
+ */
+function getUserToolResultName(
+  message: BaseMessage,
+  calls: ProviderToolCallIndex
+): string | undefined {
+  if (typeof message.content === 'string' || message.content.length === 0) {
+    return undefined;
+  }
+  let name: string | undefined;
+  let mixed = false;
+  for (const part of message.content) {
+    const descriptor = getProviderToolResultPartDescriptor(part);
+    if (descriptor?.allowHumanMessagePairing !== true) {
+      return undefined;
+    }
+    const paired = getPairedToolName(descriptor, calls);
+    mixed ||= name != null && paired !== name;
+    name = paired;
+  }
+  return mixed || name == null ? UNKNOWN_TOOL : name;
+}
+
+/** Counts retained tool exchanges without serializing arguments or result content. */
 function computeToolMessageUsage(
   context: readonly BaseMessage[],
   tokenCounter: t.TokenCounter,
@@ -76,108 +189,46 @@ function computeToolMessageUsage(
   t.TokenBudgetBreakdown,
   'toolMessageTokens' | 'toolMessageTokenCounts'
 > {
-  const names = new Map<string, string>();
+  const calls: ProviderToolCallIndex = new Map();
   const counts: Record<string, number> = Object.create(null);
-  let legacyName: string | undefined;
+  let pendingLegacyName: string | undefined;
   let total = 0;
   let resultTotal = 0;
-  const rememberCall = (call: NamedToolCall): void => {
-    const name =
-      call.name != null && call.name.length > 0
-        ? call.name
-        : call.function?.name;
-    if (
-      typeof call.id === 'string' &&
-      typeof name === 'string' &&
-      name.length > 0
-    ) {
-      names.set(call.id, name);
-    }
-  };
-  const rememberInlineCall = (block: InlineToolCallBlock): void => {
-    const nested = block.tool_call;
-    const id = nested?.id ?? block.id;
-    if (typeof id !== 'string' || names.has(id)) {
+  const countResult = (message: BaseMessage, name: string): void => {
+    const tokens = safeCount(tokenCounter(message));
+    total = safeCount(total + tokens);
+    if (tokens === 0) {
       return;
     }
-    rememberCall({ id, name: nested?.name ?? block.name });
+    counts[name] = safeCount((counts[name] ?? 0) + tokens);
+    resultTotal = safeCount(resultTotal + tokens);
   };
 
   for (const message of context) {
-    const type = message.getType();
-    const isResult = type === 'tool' || type === 'function';
-    if (isAssistantMessage(message, type)) {
-      const ai = message as AIMessage;
-      const calls = ai.tool_calls;
-      const rawCalls = ai.additional_kwargs.tool_calls;
-      if (rawCalls != null) {
-        for (const call of rawCalls) {
-          rememberCall(call);
-        }
+    const role = getProviderMessageRole(message);
+    if (role === 'assistant') {
+      const scan = scanInvocation(message, calls);
+      pendingLegacyName = readLegacyFunctionName(message);
+      if (scan.recognizedCalls > 0 && scan.toolOnly) {
+        total = safeCount(total + safeCount(tokenCounter(message)));
       }
-      if (calls != null) {
-        for (const call of calls) {
-          rememberCall(call);
-        }
-      }
-      legacyName = ai.additional_kwargs.function_call?.name;
-      let hasCalls =
-        (calls?.length ?? 0) > 0 ||
-        (rawCalls?.length ?? 0) > 0 ||
-        (legacyName != null && legacyName.length > 0);
-      let toolOnly = true;
-      if (typeof ai.content === 'string') {
-        toolOnly = !/\S/u.test(ai.content);
-      } else {
-        const content: ReadonlyArray<
-          string | Exclude<AIMessage['content'], string>[number]
-        > = ai.content;
-        for (const part of content) {
-          if (typeof part === 'string') {
-            toolOnly &&= !/\S/u.test(part);
-          } else if (part.type === 'tool_use' || part.type === 'tool_call') {
-            hasCalls = true;
-            rememberInlineCall(part as InlineToolCallBlock);
-          } else {
-            toolOnly &&=
-              part.type === 'text' &&
-              typeof part.text === 'string' &&
-              !/\S/u.test(part.text);
-          }
-        }
-      }
-      if (!hasCalls || !toolOnly) {
-        continue;
-      }
-    } else if (!isResult) {
-      legacyName = undefined;
       continue;
     }
-
-    const tokens = safeCount(tokenCounter(message));
-    total = safeCount(total + tokens);
-    if (!isResult) {
+    if (role === 'tool' || role === 'function') {
+      const legacyName = role === 'function' ? pendingLegacyName : undefined;
+      countResult(message, getToolMessageResultName(message, calls, legacyName));
+      if (role === 'function') {
+        pendingLegacyName = undefined;
+      }
       continue;
     }
-    const id =
-      type === 'tool' ? (message as ToolMessage).tool_call_id : undefined;
-    const pendingName =
-      type === 'function' && legacyName != null && legacyName.length > 0
-        ? legacyName
-        : undefined;
-    const name =
-      (id != null ? names.get(id) : undefined) ??
-      (message.name != null && message.name.length > 0
-        ? message.name
-        : pendingName) ??
-      'unknown_tool';
-    if (type === 'function') {
-      legacyName = undefined;
+    const userResultName =
+      role === 'user' ? getUserToolResultName(message, calls) : undefined;
+    if (userResultName != null) {
+      countResult(message, userResultName);
+      continue;
     }
-    if (tokens > 0) {
-      counts[name] = safeCount((counts[name] ?? 0) + tokens);
-      resultTotal = safeCount(resultTotal + tokens);
-    }
+    pendingLegacyName = undefined;
   }
 
   const ratio =

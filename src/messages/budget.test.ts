@@ -77,7 +77,6 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
 
   it.each([
     { type: 'text', text: 'explaining the result' },
-    { type: 'thinking', thinking: 'private reasoning' },
     {
       type: 'image_url',
       image_url: { url: 'https://example.com/image.png' },
@@ -99,6 +98,129 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
 
     expect(usage.breakdown.toolMessageTokens).toBe(10);
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({ read_file: 10 });
+  });
+
+  it.each([
+    { type: 'thinking', thinking: 'private reasoning', signature: 'sig' },
+    { type: 'redacted_thinking', data: 'opaque' },
+    { type: 'reasoning_content', reasoningText: { text: 'bedrock' } },
+    { type: 'reasoning', reasoning: 'google' },
+    { type: 'think', think: 'librechat' },
+  ])('keeps $type reasoning with the tool-only turn it precedes', (part) => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: toLangChainContent([
+          part,
+          { type: 'tool_use', id: 'reasoned', name: 'read_file', input: {} },
+        ]),
+        tool_calls: [{ id: 'reasoned', name: 'read_file', args: {} }],
+      }),
+      toolResult('reasoned'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(20);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ read_file: 10 });
+  });
+
+  it('counts an Anthropic server-tool turn as a tool-only invocation', () => {
+    const usage = snapshot();
+    const turn = new AIMessage({
+      content: toLangChainContent([
+        {
+          type: 'server_tool_use',
+          id: 'srvtoolu_1',
+          name: 'web_search',
+          input: { query: 'retained' },
+        },
+        {
+          type: 'web_search_tool_result',
+          tool_use_id: 'srvtoolu_1',
+          content: {
+            type: 'web_search_tool_result_error',
+            error_code: 'max_uses_exceeded',
+          },
+        },
+      ]),
+    });
+
+    syncBudgetDerivedFields(usage, [turn, new AIMessage('answer')], () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(10);
+    expect(usage.breakdown.toolMessageTokenCounts).toBeUndefined();
+  });
+
+  it('counts an MCP connector turn as a tool-only invocation', () => {
+    const usage = snapshot();
+    const turn = new AIMessage({
+      content: toLangChainContent([
+        {
+          type: 'mcp_tool_use',
+          id: 'mcptoolu_1',
+          name: 'search',
+          input: {},
+          server_name: 'docs',
+        },
+        {
+          type: 'mcp_tool_result',
+          tool_use_id: 'mcptoolu_1',
+          content: 'found',
+          is_error: false,
+        },
+      ]),
+    });
+
+    syncBudgetDerivedFields(usage, [turn], () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(10);
+  });
+
+  it('attributes a user turn made only of tool results', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'split-a', name: 'lookup', args: {} },
+          { id: 'split-b', name: 'lookup', args: {} },
+        ],
+      }),
+      new HumanMessage({
+        content: toLangChainContent([
+          { type: 'tool_result', tool_use_id: 'split-a', content: 'first' },
+          { type: 'tool_result', tool_use_id: 'split-b', content: 'second' },
+        ]),
+      }),
+      new HumanMessage({
+        content: toLangChainContent([
+          { type: 'tool_result', tool_use_id: 'split-a', content: 'again' },
+          { type: 'text', text: 'and my question' },
+        ]),
+      }),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(20);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 10 });
+  });
+
+  it('counts generic tool-role results', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'generic-result', name: 'lookup', args: {} }],
+      }),
+      new ChatMessage({ role: 'tool', content: 'result', name: 'lookup' }),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(20);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 10 });
   });
 
   it('counts whitespace-only inline invocations without structured calls', () => {
@@ -143,7 +265,12 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
       content: toLangChainContent([
         {
           type: 'tool_call',
-          tool_call: { type: 'tool_call', id: 'nested', name: 'lookup' },
+          tool_call: {
+            type: 'tool_call',
+            id: 'nested',
+            name: 'lookup',
+            args: {},
+          },
         },
       ]),
     });
@@ -158,7 +285,7 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 10 });
   });
 
-  it('keeps a mirrored structured name over an inline standard block', () => {
+  it('does not guess between conflicting names for one call id', () => {
     const usage = snapshot();
     const invocation = new AIMessage({
       content: toLangChainContent([
@@ -175,7 +302,7 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
 
     expect(usage.breakdown.toolMessageTokens).toBe(20);
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({
-      structured_name: 10,
+      unknown_tool: 10,
     });
   });
 
