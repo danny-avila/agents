@@ -36,6 +36,10 @@ This protocol guarantees replay of **checkpointed completed work** when resuming
 an approval pause. Rebuilding a Run/ToolNode with the same checkpointer is a
 supported operation; retaining the old hooks or instances is not required.
 
+Standalone ToolNode callers must supply a stable `configurable.thread_id` (or
+the SDK-managed approval execution scope) to identify a replay. Anonymous
+invocations are independent operations and never share completed-result state.
+
 This is not a distributed exactly-once transaction for arbitrary external tools.
 A process can die after an external side effect but before a checkpoint commits.
 That outcome is ambiguous: absence of a saved result does not prove the tool did

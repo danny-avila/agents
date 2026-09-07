@@ -319,8 +319,9 @@ describe('ToolNode breaker signal composition', () => {
       ],
     };
 
-    await expect(node.invoke(input)).rejects.toBeInstanceOf(GraphInterrupt);
-    const replayResult = await node.invoke(input);
+    const config = { configurable: { thread_id: 'terminal-sibling-replay' } };
+    await expect(node.invoke(input, config)).rejects.toBeInstanceOf(GraphInterrupt);
+    const replayResult = await node.invoke(input, config);
     expect(terminalRuns).toBe(1);
     expect(terminalPreHooks).toBe(1);
     expect(JSON.stringify(replayResult)).toContain('cached terminal context');
