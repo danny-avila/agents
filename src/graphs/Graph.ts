@@ -146,7 +146,10 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
-import { PreparedSubagents, PreparedSubagentError } from '@/tools/preparedSubagents';
+import {
+  PreparedSubagents,
+  PreparedSubagentError,
+} from '@/tools/preparedSubagents';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
@@ -1242,7 +1245,10 @@ export abstract class Graph<
   }> = new Set();
   private _subagentExecutors = new Set<SubagentExecutor>();
   readonly preparedSubagents = new PreparedSubagents();
-  protected readonly subagentToolNodes = new Map<string, CustomToolNode<t.BaseGraphState>>();
+  protected readonly subagentToolNodes = new Map<
+    string,
+    CustomToolNode<t.BaseGraphState>
+  >();
   public getOrCreateFileCheckpointer(): t.LocalFileCheckpointer | undefined {
     // Return the cached instance unconditionally if one exists. The
     // toolExecution check below decides whether to *create* a new
@@ -1404,13 +1410,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   ): StreamLimitExceededError | PreparedSubagentError | undefined {
     if (
       breakerSignal.aborted &&
-      (breakerSignal.reason instanceof StreamLimitExceededError || breakerSignal.reason instanceof PreparedSubagentError)
+      (breakerSignal.reason instanceof StreamLimitExceededError ||
+        breakerSignal.reason instanceof PreparedSubagentError)
     ) {
       return breakerSignal.reason;
     }
     if (
       this.signal?.aborted === true &&
-      (this.signal.reason instanceof StreamLimitExceededError || this.signal.reason instanceof PreparedSubagentError)
+      (this.signal.reason instanceof StreamLimitExceededError ||
+        this.signal.reason instanceof PreparedSubagentError)
     ) {
       return this.signal.reason;
     }
@@ -1957,8 +1965,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.nextContentIndex = state.nextIndex;
     this.runStepStateRevision = state.revision;
     this.stopContinuationCount = state.stopContinuationCount ?? 0;
-    this.stopContinuationExecutionId =
-      state.stopContinuationExecutionId ?? '';
+    this.stopContinuationExecutionId = state.stopContinuationExecutionId ?? '';
     this.streamSegment = state.streamSegment ?? 0;
     for (const { toolCallId, stepId } of state.toolCallSteps) {
       this.toolCallStepIds.set(toolCallId, stepId);
@@ -4006,7 +4013,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               finalProjection.projectedMessageTokens
           );
         }
-        syncBudgetDerivedFields(contextUsage);
+        syncBudgetDerivedFields(
+          contextUsage,
+          finalMessages,
+          agentContext.contextPressureTokenCounts?.count ??
+            agentContext.tokenCounter
+        );
         /** Awaited so async host handlers receive the pre-invoke snapshot
          *  before any model deltas are emitted */
         await safeDispatchCustomEvent(

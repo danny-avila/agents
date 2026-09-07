@@ -2107,7 +2107,9 @@ describe('AgentContext', () => {
       const first = [new HumanMessage('a'), tool];
       context.getProviderProjectedMessages(first);
       context.preserveOriginalToolContent(new Map([[1, 'original result']]));
-      expect(context.pendingOriginalToolContent?.get(1)).toBe('original result');
+      expect(context.pendingOriginalToolContent?.get(1)).toBe(
+        'original result'
+      );
 
       const shifted = [new HumanMessage('inserted'), ...first];
       context.getProviderProjectedMessages(shifted);
@@ -2115,7 +2117,9 @@ describe('AgentContext', () => {
 
       context.preserveOriginalToolContent(new Map([[2, 'original result']]));
       context.getProviderProjectedMessages([...shifted, new AIMessage('done')]);
-      expect(context.pendingOriginalToolContent?.get(2)).toBe('original result');
+      expect(context.pendingOriginalToolContent?.get(2)).toBe(
+        'original result'
+      );
     });
   });
 
@@ -2968,6 +2972,59 @@ describe('AgentContext', () => {
       expect(messages[2]).toBe(originalRef);
       expect((messages[2] as unknown as ToolMessage).content).toBe(
         originalContent
+      );
+    });
+    it('reports retained tool shares without mutating canonical history', () => {
+      const ctx = createBasicContext({ tokenCounter: countByChars });
+      ctx.maxContextTokens = 1_000;
+      ctx.maxToolResultChars = 200;
+
+      const toolCallId = 'projection-tool-call';
+      const originalResult = `result:${'x'.repeat(20_000)}`;
+      const toolCall = new AIMessage({
+        content: ' ',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'lookup',
+            args: { query: 'retained context' },
+          },
+        ],
+      });
+      const toolResult = new ToolMessage({
+        content: originalResult,
+        tool_call_id: toolCallId,
+        name: 'lookup',
+      });
+      const messages: Array<AIMessage | HumanMessage | ToolMessage> = [
+        new HumanMessage('question'),
+        toolCall,
+        toolResult,
+        new AIMessage('final answer'),
+      ];
+
+      const usage = ctx.projectContextUsage(messages);
+
+      expect(usage).not.toBeNull();
+      expect(messages[1]).toBe(toolCall);
+      expect(messages[2]).toBe(toolResult);
+      expect(toolResult.content).toBe(originalResult);
+
+      const toolMessageTokenCounts = usage!.breakdown.toolMessageTokenCounts;
+      expect(toolMessageTokenCounts).toBeDefined();
+      expect(Object.getPrototypeOf(toolMessageTokenCounts!)).toBeNull();
+      expect(toolMessageTokenCounts!.lookup).toBeGreaterThan(0);
+      expect(toolMessageTokenCounts!.lookup).toBeLessThan(
+        originalResult.length
+      );
+      expect(usage!.breakdown.toolMessageTokens).toBeGreaterThan(
+        toolMessageTokenCounts!.lookup
+      );
+      expect(usage!.breakdown.toolMessageTokens).toBe(
+        toolMessageTokenCounts!.lookup + countByChars(toolCall)
+      );
+      expect(usage!.breakdown.toolMessageTokens).toBeLessThan(
+        originalResult.length
       );
     });
 

@@ -1767,8 +1767,9 @@ export class AgentContext {
         const recounted: Record<string, number> = {};
         for (let i = 0; i < messages.length; i++) {
           const localCount = this.tokenCounter(messages[i]);
-          const conservativeFloor =
-            this.providerProjectionRecountFloors?.get(messages[i]);
+          const conservativeFloor = this.providerProjectionRecountFloors?.get(
+            messages[i]
+          );
           recounted[i] =
             conservativeFloor == null
               ? localCount
@@ -2112,7 +2113,11 @@ export class AgentContext {
       remainingContextTokens,
       calibrationRatio,
     };
-    syncBudgetDerivedFields(usage);
+    syncBudgetDerivedFields(
+      usage,
+      context,
+      this.contextPressureTokenCounts?.count ?? tokenCounter
+    );
     return usage;
   }
 
