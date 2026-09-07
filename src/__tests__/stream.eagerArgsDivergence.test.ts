@@ -136,7 +136,7 @@ function createDummyTool(name: string): StructuredToolInterface {
 
 function installToolExecuteResponder(): {
   toolExecuteCalls: t.ToolExecuteBatchRequest[];
-} {
+  } {
   const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
   jest
     .spyOn(events, 'safeDispatchCustomEvent')
