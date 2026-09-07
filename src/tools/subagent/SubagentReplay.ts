@@ -201,7 +201,7 @@ function isDirectPathTurnReference(
   return isString(entry.toolCallId) && isNonnegativeInteger(entry.turn);
 }
 
-function isToolNodeResumeState(
+export function isToolNodeResumeState(
   value: unknown
 ): value is SubagentToolNodeResumeState {
   if (value == null || typeof value !== 'object') {

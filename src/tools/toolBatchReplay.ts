@@ -2,6 +2,8 @@ import { Command, MemorySaver, isCommand } from '@langchain/langgraph';
 import { isBaseMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { SubagentToolNodeResumeState } from '@/tools/subagent/SubagentReplay';
+import { isToolNodeResumeState, stripSubagentResumeManifest } from '@/tools/subagent/SubagentReplay';
 import { isToolApprovalInterrupt } from '@/types/hitl';
 import { TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from '@/hooks/types';
 import {
@@ -20,12 +22,13 @@ const TOOL_BATCH_PAYLOAD_KEY = '__librechat_tool_batch_payload';
 const TOOL_BATCH_WRAPPER_KEY = '__librechat_tool_batch_wrapper';
 
 export interface SettledToolBatchResult {
-  proposal?: { name: string; args: Record<string, unknown> };
+  proposal: { name: string; args: Record<string, unknown> };
   output: BaseMessage | Command;
   additionalContexts: string[];
   resolvedArgs?: Record<string, unknown>;
   completionHandled?: boolean;
   referenceContent?: string;
+  turn?: number;
 }
 
 export interface ToolBatchReplayRecord {
@@ -33,12 +36,14 @@ export interface ToolBatchReplayRecord {
   batch: string;
   encoding: string;
   data: string;
+  turnState?: SubagentToolNodeResumeState;
 }
 
 interface ToolBatchReplayState {
   version: 1;
   approvalOwner?: string;
   records: ToolBatchReplayRecord[];
+  wrappedPayload?: boolean;
 }
 
 /** Use the same message/Command codec as LangGraph checkpoints. */
@@ -57,7 +62,7 @@ export function restoreToolReplayConfig(
   delete configurable[TOOL_BATCH_REPLAY_KEY];
   delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
   const state = getToolBatchReplayState(payload);
-  const publicPayload = stripToolBatchReplayState(payload);
+  const publicPayload = getPublicToolInterruptPayload(payload);
   const review = createToolApprovalReviewEvidence(
     interruptId,
     publicPayload,
@@ -93,7 +98,7 @@ export function getToolBatchReplayScope(
   const scope =
     config.configurable?.[TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY] ??
     config.configurable?.thread_id;
-  return typeof scope === 'string' ? scope : undefined;
+  return typeof scope === 'string' && scope.length > 0 ? scope : undefined;
 }
 
 /** Rebind only the checkpoint-proven source execution when a child fork is created. */
@@ -150,6 +155,7 @@ export function getToolBatchReplayState(
   const state = candidate as Partial<ToolBatchReplayState> | null;
   if (
     state?.version !== 1 ||
+    (state.wrappedPayload != null && typeof state.wrappedPayload !== 'boolean') ||
     (state.approvalOwner != null && typeof state.approvalOwner !== 'string') ||
     !Array.isArray(state.records) ||
     state.records.some((value: unknown) => {
@@ -161,7 +167,8 @@ export function getToolBatchReplayState(
         typeof record.owner !== 'string' ||
         typeof record.batch !== 'string' ||
         typeof record.encoding !== 'string' ||
-        typeof record.data !== 'string'
+        typeof record.data !== 'string' ||
+        (record.turnState != null && !isToolNodeResumeState(record.turnState))
       );
     })
   ) {
@@ -178,17 +185,26 @@ export function stripToolBatchReplayState(payload: unknown): unknown {
   ) {
     return payload;
   }
+  const state = getToolBatchReplayState(payload);
   const { [TOOL_BATCH_REPLAY_KEY]: _state, ...publicPayload } = payload;
-  if (TOOL_BATCH_WRAPPER_KEY in publicPayload && publicPayload[TOOL_BATCH_WRAPPER_KEY] === 1 && TOOL_BATCH_PAYLOAD_KEY in publicPayload) {
+  if (state?.wrappedPayload === true && TOOL_BATCH_PAYLOAD_KEY in publicPayload) {
     return publicPayload[TOOL_BATCH_PAYLOAD_KEY];
   }
   return publicPayload;
 }
 
+/** Decode outer execution metadata before shape-sensitive child wrappers. */
+export function getPublicToolInterruptPayload(payload: unknown): unknown {
+  return stripSubagentResumeManifest(
+    stripToolBatchReplayState(stripRunStepResumeState(payload))
+  );
+}
+
 export async function attachToolBatchReplayState(
   payload: unknown,
   owner: string,
-  batches: ReadonlyMap<string, ReadonlyMap<string, object>>
+  batches: ReadonlyMap<string, ReadonlyMap<string, object>>,
+  turnState?: SubagentToolNodeResumeState
 ): Promise<unknown> {
   const publicPayload = stripRunStepResumeState(payload);
   const previous = getToolBatchReplayState(publicPayload);
@@ -201,6 +217,7 @@ export async function attachToolBatchReplayState(
       batch,
       encoding,
       data: Buffer.from(bytes).toString('base64'),
+      ...(turnState == null ? {} : { turnState }),
     });
   }
   const approvalOwner =
@@ -218,6 +235,7 @@ export async function attachToolBatchReplayState(
       version: 1,
       approvalOwner,
       records,
+      wrappedPayload: previous?.wrappedPayload ?? !isRecord(publicPayload),
     } satisfies ToolBatchReplayState,
   };
   const runStepState = getRunStepResumeState(payload);
@@ -230,7 +248,7 @@ export async function restoreToolBatchReplayState(
   config: RunnableConfig,
   owner: string
 ): Promise<
-  Array<{ batch: string; results: Array<[string, SettledToolBatchResult]> }>
+  Array<{ batch: string; results: Array<[string, SettledToolBatchResult]>; turnState?: SubagentToolNodeResumeState }>
 > {
   const state = getToolBatchReplayState(config.configurable);
   if (state == null) {
@@ -270,9 +288,11 @@ export async function restoreToolBatchReplayState(
                 typeof result.completionHandled !== 'boolean') ||
               (result.referenceContent != null &&
                 typeof result.referenceContent !== 'string') ||
-              (result.proposal != null &&
-                (typeof result.proposal.name !== 'string' ||
-                  !isRecord(result.proposal.args))) ||
+              (result.turn != null && (!Number.isSafeInteger(result.turn) || result.turn < 0)) ||
+              !isRecord(result.proposal) ||
+              typeof result.proposal.name !== 'string' ||
+              result.proposal.name.length === 0 ||
+              !isRecord(result.proposal.args) ||
               (result.resolvedArgs != null && !isRecord(result.resolvedArgs))
             ) {
               throw new Error('Invalid settled tool batch results');
@@ -290,13 +310,14 @@ export async function restoreToolBatchReplayState(
               entry[0],
               {
                 ...result,
+                proposal: result.proposal,
                 output,
                 additionalContexts: result.additionalContexts,
               },
             ];
           }
         );
-        return { batch: record.batch, results };
+        return { batch: record.batch, results, turnState: record.turnState };
       })
   );
 }

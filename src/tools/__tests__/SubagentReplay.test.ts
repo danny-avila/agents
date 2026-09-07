@@ -10,6 +10,7 @@ import {
   stripRunStepResumeState,
 } from '@/tools/runStepResume';
 import type { RunStepResumeState } from '@/types';
+import { attachToolBatchReplayState, getPublicToolInterruptPayload, restoreToolReplayConfig, TOOL_BATCH_REPLAY_KEY } from '@/tools/toolBatchReplay';
 
 describe('SubagentReplay manifest', () => {
   const execution = {
@@ -75,6 +76,16 @@ describe('SubagentReplay manifest', () => {
       },
     ],
   };
+
+  it.each([null, 'confirm', ['a', 'b']])('preserves nested custom payload %j with parent replay state', async (payload) => {
+    const nested = attachSubagentResumeManifest(payload, { version: 1, executions: [execution] });
+    const wrapped = await attachToolBatchReplayState(nested, 'parent', new Map([['batch', new Map()]]));
+    const persisted = JSON.parse(JSON.stringify(wrapped));
+    expect(getPublicToolInterruptPayload(persisted)).toEqual(payload);
+    const config: Record<string, unknown> = {};
+    restoreToolReplayConfig(config, 'interrupt', persisted);
+    expect(config[TOOL_BATCH_REPLAY_KEY]).toMatchObject({ records: [{ owner: 'parent' }] });
+  });
 
   it('round-trips a private manifest without exposing it publicly', () => {
     const manifest = { version: 1 as const, executions: [execution] };

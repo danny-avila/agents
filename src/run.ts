@@ -39,7 +39,6 @@ import {
 } from '@/common';
 import {
   requireValidSubagentResumeManifest,
-  stripSubagentResumeManifest,
   SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from '@/tools/subagent/SubagentReplay';
@@ -77,6 +76,7 @@ import {
   TOOL_BATCH_REPLAY_KEY,
   restoreToolReplayConfig,
   stripToolBatchReplayState,
+  getPublicToolInterruptPayload,
 } from '@/tools/toolBatchReplay';
 import {
   resolveLangfuseDestinationKey,
@@ -273,9 +273,7 @@ function isLangGraphResumeMapForInterrupt(
 }
 
 function getInterruptHookSessionId(payload: unknown): string | undefined {
-  const publicPayload = stripSubagentResumeManifest(
-    stripRunStepResumeState(payload)
-  );
+  const publicPayload = getPublicToolInterruptPayload(payload);
   if (
     publicPayload == null ||
     typeof publicPayload !== 'object' ||
@@ -1283,9 +1281,7 @@ export class Run<_T extends t.BaseGraphState> {
         config,
         (inputs as Command).update
       );
-      const publicPayload = stripSubagentResumeManifest(
-        stripRunStepResumeState(this._interrupt?.payload)
-      );
+      const publicPayload = stripRunStepResumeState(this._interrupt?.payload);
       if (config.configurable != null) {
         restoreToolReplayConfig(config.configurable, this._interrupt?.interruptId, publicPayload);
       }
@@ -1896,9 +1892,7 @@ export class Run<_T extends t.BaseGraphState> {
     return {
       ...this._interrupt,
       payload: cloneToolApprovalInterruptPayload(
-        stripToolBatchReplayState(stripSubagentResumeManifest(
-          stripRunStepResumeState(this._interrupt.payload)
-        ))
+        getPublicToolInterruptPayload(this._interrupt.payload)
       ),
     } as t.RunInterruptResult<TPayload>;
   }
@@ -2020,9 +2014,9 @@ export class Run<_T extends t.BaseGraphState> {
   ): Promise<t.RunStreamConfig> {
     await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
     const interrupt = this._interrupt;
-    const resumeManifest = requireValidSubagentResumeManifest(
-      stripRunStepResumeState(interrupt?.payload)
-    );
+    const replayPayload = stripRunStepResumeState(interrupt?.payload);
+    const resumeManifest = requireValidSubagentResumeManifest(replayPayload) ??
+      requireValidSubagentResumeManifest(stripToolBatchReplayState(replayPayload));
     const resumeConfigurable = { ...callerConfig.configurable };
     delete resumeConfigurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     delete resumeConfigurable[TOOL_BATCH_REPLAY_KEY];
@@ -2032,9 +2026,7 @@ export class Run<_T extends t.BaseGraphState> {
     if (resumeManifest != null) {
       resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] = resumeManifest;
     }
-    const publicPayload = stripSubagentResumeManifest(
-      stripRunStepResumeState(interrupt?.payload)
-    );
+    const publicPayload = stripRunStepResumeState(interrupt?.payload);
     restoreToolReplayConfig(resumeConfigurable, interrupt?.interruptId, publicPayload);
     const manifestConfig = {
       ...callerConfig,

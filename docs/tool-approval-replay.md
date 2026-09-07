@@ -24,7 +24,12 @@ allowed action or repeat a sibling whose completed result was checkpointed.
    subagent adapter rebinds evidence from the manifest's proven source scope
    into that destination. Unrelated child and parent scopes are unchanged.
 7. Completed batches release their process-local acceleration cache. That cache
-   is not the durable source of truth.
+   is not the durable source of truth: selecting a checkpoint replaces any
+   newer local result for that batch, including when the checkpoint is empty.
+8. The checkpoint also retains per-tool usage counters and active-call turns.
+   Restored outputs and pending calls keep their original execution and
+   completion indices, with or without a hook registry. Historical per-call
+   turn entries are not copied into the active batch's checkpoint.
 
 The private checkpoint record is versioned. Its codec preserves LangChain
 messages; Command outputs are reconstructed before graph execution. Malformed
@@ -70,7 +75,10 @@ third-party tools as exactly-once across that crash window.
 - Nested checkpoint forks: rejection remains effective without the former
   hooks, and parent siblings remain independent of child approval evidence.
 - Codec and validation: messages, Commands, nested ownership, absent legacy
-  state and malformed records.
+  state and malformed records. Restored results require a proposal binding;
+  custom payloads that resemble private wrappers preserve their public shape.
+- Older-checkpoint selection overrides a newer local cache; empty execution
+  scopes remain isolated anonymous invocations.
 
 External-side-effect crash reconciliation and concurrent independent host
 ownership require the host/tool contract above; these tests do not prove those
