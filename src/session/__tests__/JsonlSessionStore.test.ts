@@ -143,6 +143,91 @@ describe('JsonlSessionStore', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it('uses cached session history across runs and falls back after mutable store exposure', async () => {
+    const mockRun = createMockRun('answer');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      sessionPath: join(dir, 'cached.jsonl'),
+      runId: 'template-run',
+      checkpointing: false,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: { provider: 'openAI' as never, model: 'test-model' },
+        instructions: 'test',
+      },
+    });
+    const getPath = jest.spyOn(JsonlSessionStore.prototype, 'getPath');
+    await session.run('first');
+    const firstMessages = getProcessedMessages(mockRun);
+    firstMessages[0].content = 'run-local change';
+    mockRun.processStream.mockClear();
+    await session.run('second');
+    expect(
+      getProcessedMessages(mockRun).map((message) => message.content)
+    ).toEqual(['first', 'answer', 'second']);
+    expect(getPath).not.toHaveBeenCalled();
+    const store = session.getSessionStore()!;
+    const entry = store.getPath()[0];
+    if (entry.type === 'message') {
+      entry.data.message.content = 'external edit';
+    }
+    mockRun.processStream.mockClear();
+    await session.run('third');
+    expect(getProcessedMessages(mockRun)[0].content).toBe('external edit');
+    expect(getPath).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the unexposed cache coherent through compaction, HITL resume, branching, and reopening', async () => {
+    mockSummarizer('summary of prior work');
+    const mockRun = createMockRun('answer');
+    const configs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      sessionPath: join(dir, 'cache-transitions.jsonl'),
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: { provider: 'openAI' as never, model: 'test-model' },
+        instructions: 'test',
+      },
+    });
+    await session.run('first');
+    await session.compact({ retainRecentTurns: 0 });
+    const getPath = jest.spyOn(JsonlSessionStore.prototype, 'getPath');
+    await session.resumeInterrupt([]);
+    const resumeConfig = configs.at(-1)!.graphConfig;
+    expect(
+      'initialSummary' in resumeConfig && resumeConfig.initialSummary
+    ).toEqual({
+      text: 'summary of prior work',
+      tokenCount: expect.any(Number),
+    });
+    mockRun.processStream.mockClear();
+    await session.run('after resume');
+    expect(
+      getProcessedMessages(mockRun).map((message) => message.content)
+    ).toEqual(['answer', 'after resume']);
+    expect(getPath).not.toHaveBeenCalled();
+
+    const diskSnapshot = await JsonlSessionStore.openPath(session.sessionPath!);
+    const summary = diskSnapshot
+      .getPath()
+      .find((entry) => entry.type === 'summary')!;
+    await session.branch(summary.id);
+    mockRun.processStream.mockClear();
+    await session.run('alternate');
+    expect(
+      getProcessedMessages(mockRun).map((message) => message.content)
+    ).toEqual(['alternate']);
+    await session.resumeSession(session.sessionPath);
+    mockRun.processStream.mockClear();
+    await session.run('reopened');
+    expect(
+      getProcessedMessages(mockRun).map((message) => message.content)
+    ).toEqual(['alternate', 'answer', 'reopened']);
+  });
+
   it('opens a file whose session_state line carries null data', async () => {
     const path = join(dir, 'null-state.jsonl');
     const store = await JsonlSessionStore.create({
@@ -1295,9 +1380,17 @@ describe('JsonlSessionStore', () => {
     });
     await store.appendFadingState({
       threadId: store.header.id,
-      fadingTier: { v: 1, budgetTokens: 'abc', masked: true } as unknown as t.FadingTier,
+      fadingTier: {
+        v: 1,
+        budgetTokens: 'abc',
+        masked: true,
+      } as unknown as t.FadingTier,
       fadingTiers: {
-        default: { v: 1, budgetTokens: Number.NaN, masked: true } as t.FadingTier,
+        default: {
+          v: 1,
+          budgetTokens: Number.NaN,
+          masked: true,
+        } as t.FadingTier,
       },
     });
     const fadingTier: t.FadingTier = {
@@ -2071,9 +2164,7 @@ describe('JsonlSessionStore', () => {
       .mockReturnValueOnce({})
       .mockReturnValueOnce({ default: staleTier })
       .mockReturnValue({});
-    mockRun.didResetFadingTier
-      .mockReturnValueOnce(true)
-      .mockReturnValue(false);
+    mockRun.didResetFadingTier.mockReturnValueOnce(true).mockReturnValue(false);
     mockRun.getFadingTierResetAgentIds
       .mockReturnValueOnce(['default'])
       .mockReturnValue([]);
@@ -2185,9 +2276,12 @@ describe('JsonlSessionStore', () => {
     const resetResult = new Promise<t.MessageContentComplex[]>((resolve) => {
       releaseReset = () => resolve([{ type: 'text', text: 'reset' }]);
     });
-    const escalationResult = new Promise<t.MessageContentComplex[]>((resolve) => {
-      releaseEscalation = () => resolve([{ type: 'text', text: 'escalated' }]);
-    });
+    const escalationResult = new Promise<t.MessageContentComplex[]>(
+      (resolve) => {
+        releaseEscalation = () =>
+          resolve([{ type: 'text', text: 'escalated' }]);
+      }
+    );
     mockRun.processStream
       .mockImplementationOnce(async () => {
         markResetStarted();
@@ -2261,9 +2355,7 @@ describe('JsonlSessionStore', () => {
       await session.run(`alternate ${i}`, { threadId: `thread-${i}` });
     }
     expect(
-      session
-        .getSessionStore()
-        ?.getFadingStates(session.threadId, 64)
+      session.getSessionStore()?.getFadingStates(session.threadId, 64)
     ).toHaveLength(65);
     const reopened = await createAgentSession({
       cwd: dir,
