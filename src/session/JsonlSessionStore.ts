@@ -35,6 +35,10 @@ import {
   serializeMessage,
   toJsonValue,
 } from './messageSerialization';
+import {
+  initializeSessionProjection,
+  shareSessionProjectionOwnership,
+} from './sessionProjection';
 import { createEntryId, createSessionId, createTimestamp } from './ids';
 
 const SESSION_VERSION = 1;
@@ -126,6 +130,7 @@ export class JsonlSessionStore {
     this.path = params.path;
     this.header = params.header;
     this.entries = sortEntries(params.entries);
+    initializeSessionProjection(this, this.entries);
   }
 
   static getDefaultRoot(): string {
@@ -573,6 +578,7 @@ export class JsonlSessionStore {
       name: options.name ?? this.header.name,
       parentSession: this.path,
     });
+    shareSessionProjectionOwnership(this, newStore);
     const pathEntries = target ? this.getPath(target.id) : [];
     for (const entry of pathEntries) {
       await newStore.appendExistingEntry(entry);

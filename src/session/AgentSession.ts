@@ -21,9 +21,12 @@ import type {
   SessionEntry,
   SessionForkOptions,
 } from './types';
-import { isFadingTier } from '@/messages/fading';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
+import {
+  deriveSessionMessages,
+  releaseSessionProjection,
+} from './sessionProjection';
 import { createSummarizeNode } from '@/summarization/node';
 import { resolveStreamLimits } from '@/llm/streamLimits';
 import { JsonlSessionStore } from './JsonlSessionStore';
@@ -31,6 +34,7 @@ import { AgentContext } from '@/agents/AgentContext';
 import { ContentTypes, GraphEvents } from '@/common';
 import { createRunId, createSessionId } from './ids';
 import { deriveMessages } from './deriveMessages';
+import { isFadingTier } from '@/messages/fading';
 import { createRunHandlers } from './handlers';
 import { Run } from '@/run';
 
@@ -377,7 +381,9 @@ function fadingGenerationKey(scopeKey: string, agentKey: string): string {
 
 function fadingGenerationScope(generationKey: string): string {
   const parsed: unknown = JSON.parse(generationKey);
-  return Array.isArray(parsed) && typeof parsed[0] === 'string' ? parsed[0] : '';
+  return Array.isArray(parsed) && typeof parsed[0] === 'string'
+    ? parsed[0]
+    : '';
 }
 
 /** What a run saw when it started, so its capture can tell stale from current. */
@@ -404,10 +410,7 @@ function mergeFadingTier(
   if (incoming == null) {
     return { ...current };
   }
-  const budgetTokens = Math.min(
-    current.budgetTokens,
-    incoming.budgetTokens
-  );
+  const budgetTokens = Math.min(current.budgetTokens, incoming.budgetTokens);
   const masked = current.masked || incoming.masked;
   const latched =
     current.latched === true ||
@@ -1010,6 +1013,9 @@ export class AgentSession {
   }
 
   getSessionStore(): JsonlSessionStore | undefined {
+    if (this.store) {
+      releaseSessionProjection(this.store);
+    }
     return this.store;
   }
 
@@ -1017,7 +1023,10 @@ export class AgentSession {
     return this.checkpointing.checkpointer;
   }
 
-  private getFadingState(threadId: string, checkpointNs = ''): {
+  private getFadingState(
+    threadId: string,
+    checkpointNs = ''
+  ): {
     fadingTier?: t.FadingTier;
     fadingTiers?: t.FadingTiers;
   } {
@@ -1058,8 +1067,7 @@ export class AgentSession {
 
   private trimAlternateFadingStates(): void {
     while (
-      this.alternateThreadFadingState.size >
-      MAX_ALTERNATE_THREAD_FADING_STATES
+      this.alternateThreadFadingState.size > MAX_ALTERNATE_THREAD_FADING_STATES
     ) {
       const oldestThreadId = this.alternateThreadFadingState.keys().next();
       if (oldestThreadId.done === true) {
@@ -1172,7 +1180,10 @@ export class AgentSession {
     };
     const advanceGeneration = (agentKey: string): void => {
       const key = fadingGenerationKey(scopeKey, agentKey);
-      this.fadingGenerations.set(key, (this.fadingGenerations.get(key) ?? 0) + 1);
+      this.fadingGenerations.set(
+        key,
+        (this.fadingGenerations.get(key) ?? 0) + 1
+      );
     };
     const mergeCapturedTier = (
       existing: t.FadingTier | undefined,
@@ -1218,7 +1229,11 @@ export class AgentSession {
       if (didResetTier) {
         advanceGeneration('');
       }
-      nextTier = mergeCapturedTier(current.fadingTier, incomingTier, didResetTier);
+      nextTier = mergeCapturedTier(
+        current.fadingTier,
+        incomingTier,
+        didResetTier
+      );
     }
     if (threadId === this.threadId && checkpointNs === '') {
       this.fadingTier = nextTier;
@@ -1408,8 +1423,8 @@ export class AgentSession {
       handlerResult.events.push(streamEvent);
       onEvent?.(streamEvent);
     };
-    const sessionState = deriveMessages(
-      isSessionThread ? (this.store?.getPath() ?? []) : []
+    const sessionState = deriveSessionMessages(
+      isSessionThread ? this.store : undefined
     );
     const fadingState = this.getFadingState(threadId, checkpointNs);
     let run: Run<t.IState> | undefined;
@@ -1690,7 +1705,9 @@ export class AgentSession {
       throw new Error('Cannot compact an ephemeral session');
     }
     const activePath = path ?? store.getPath();
-    const sessionState = deriveMessages(activePath);
+    const sessionState = path
+      ? deriveMessages(path)
+      : deriveSessionMessages(store);
     const messageEntries = activePath.filter(isMessageEntry);
     if (sessionState.messages.length === 0) {
       return undefined;
@@ -1819,8 +1836,8 @@ export class AgentSession {
       threadId,
       userHandlers: this.runConfig.customHandlers,
     });
-    const sessionState = deriveMessages(
-      isSessionThread ? (this.store?.getPath() ?? []) : []
+    const sessionState = deriveSessionMessages(
+      isSessionThread ? this.store : undefined
     );
     const fadingState = this.getFadingState(threadId, checkpointNs);
     let run: Run<t.IState> | undefined;
