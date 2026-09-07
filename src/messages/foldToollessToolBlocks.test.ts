@@ -570,6 +570,62 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(getTextContent(result[0])).not.toContain('function_call');
   });
 
+  test.each([
+    'apply_patch_call_output',
+    'local_shell_call_output',
+    'mcp_list_tools',
+    'program_output',
+    'shell_call_output',
+    'tool_search_output',
+  ])('folds replayable Responses output type %s', (type) => {
+    const messages = [
+      new AIMessage({
+        content: [],
+        additional_kwargs: {
+          tool_outputs: [{ type, output: 'result', result: 'result' }],
+        },
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+
+    expect(getTextContent(folded)).toContain('server_tool_output');
+    expect(getTextContent(folded)).toContain(type);
+  });
+
+  test('preserves parsed calls alongside authoritative Responses output', () => {
+    const messages = [
+      new AIMessage({
+        content: [{ type: 'text', text: 'I will use both tools.' }],
+        tool_calls: [
+          {
+            id: 'function-1',
+            name: 'lookup',
+            args: { query: 'roadmap' },
+            type: 'tool_call',
+          },
+        ],
+        additional_kwargs: {
+          tool_outputs: [
+            {
+              id: 'server-1',
+              type: 'code_interpreter_call',
+              status: 'completed',
+              outputs: [{ type: 'logs', logs: '4' }],
+            },
+          ],
+        },
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+    const text = getTextContent(folded);
+
+    expect(text).toContain('server_tool_output');
+    expect(text).toContain('code_interpreter_call');
+    expect(text).toContain('[tool_call] lookup({"query":"roadmap"})');
+  });
+
   test('preserves user authorship in mixed tool-result turns', () => {
     const messages = [
       new HumanMessage({

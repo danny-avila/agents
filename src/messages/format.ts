@@ -3763,11 +3763,17 @@ function flushTextChunks(
 }
 
 const OPENAI_RESPONSES_SERVER_TOOL_TYPES: ReadonlySet<string> = new Set([
+  'apply_patch_call_output',
   'code_interpreter_call',
   'computer_call',
   'file_search_call',
   'image_generation_call',
+  'local_shell_call_output',
   'mcp_call',
+  'mcp_list_tools',
+  'program_output',
+  'shell_call_output',
+  'tool_search_output',
   'web_search_call',
 ]);
 
@@ -4045,14 +4051,17 @@ function appendMessageContent(
     markBlockRetained();
   }
 
+  let responsesOutputContributed = false;
   if (!hasToolUseBlock) {
     const responsesOutput = getAuthoritativeResponsesToolOutput(msg);
     if (responsesOutput != null) {
+      const remainingCharsBefore = budget.remainingChars;
       appendFoldedLine(textChunks, budget, [
         'AI: [server_tool_output] ',
         serializeFoldedValue(responsesOutput),
       ]);
-      hasToolUseBlock = true;
+      responsesOutputContributed =
+        budget.remainingChars < remainingCharsBefore;
     }
   }
 
@@ -4061,10 +4070,12 @@ function appendMessageContent(
   const toolCalls = !hasToolUseBlock
     ? appendToolCalls(msg, role, textChunks, budget)
     : { contributed: false, complete: true };
-  if (toolCalls.contributed) {
+  if (toolCalls.contributed || responsesOutputContributed) {
     return {
       message: msg,
-      ...(!toolCalls.complete && { mappingAmbiguous: true }),
+      ...((responsesOutputContributed || !toolCalls.complete) && {
+        mappingAmbiguous: true,
+      }),
     };
   }
   return retainedContentPartIndices.size > 0
