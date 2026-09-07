@@ -22,7 +22,6 @@ import type {
 } from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import { isFadingTier } from '@/messages/fading';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import type { StandardGraph } from '@/graphs/Graph';
@@ -71,6 +70,10 @@ import {
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import {
+  createToolApprovalReviewEvidence,
+  TOOL_APPROVAL_REVIEW_CONFIG_KEY,
+} from '@/hitl/approvalReview';
+import {
   resolveLangfuseDestinationKey,
   resolveLangfuseTraceAnchorParent,
 } from '@/langfuseSpanRegistry';
@@ -104,6 +107,7 @@ import { seedRunInitialSessions } from '@/utils/toolSessions';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { createGraph } from '@/graphs/createGraph';
+import { isFadingTier } from '@/messages/fading';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { isBuiltRuntime } from '@/lazyRequire';
 import { initializeModel } from '@/llm/init';
@@ -1266,6 +1270,7 @@ export class Run<_T extends t.BaseGraphState> {
       recursionLimit,
       configurable: { ...callerConfig.configurable },
     };
+    delete config.configurable?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     if (!isResume) {
       delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
@@ -1276,6 +1281,16 @@ export class Run<_T extends t.BaseGraphState> {
         config,
         (inputs as Command).update
       );
+      const publicPayload = stripSubagentResumeManifest(
+        stripRunStepResumeState(this._interrupt?.payload)
+      );
+      const reviewEvidence = createToolApprovalReviewEvidence(
+        this._interrupt?.interruptId,
+        publicPayload
+      );
+      if (reviewEvidence != null && config.configurable != null) {
+        config.configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY] = reviewEvidence;
+      }
       if (graph.getStopContinuationExecutionId() === '') {
         graph.startStopContinuationExecution(nanoid());
         overwriteLegacyResumeState = this.hasCheckpointer;
@@ -2008,11 +2023,22 @@ export class Run<_T extends t.BaseGraphState> {
       stripRunStepResumeState(interrupt?.payload)
     );
     const resumeConfigurable = { ...callerConfig.configurable };
+    delete resumeConfigurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = nanoid();
     if (resumeManifest != null) {
       resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] = resumeManifest;
+    }
+    const publicPayload = stripSubagentResumeManifest(
+      stripRunStepResumeState(interrupt?.payload)
+    );
+    const reviewEvidence = createToolApprovalReviewEvidence(
+      interrupt?.interruptId,
+      publicPayload
+    );
+    if (reviewEvidence != null) {
+      resumeConfigurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY] = reviewEvidence;
     }
     const manifestConfig = {
       ...callerConfig,

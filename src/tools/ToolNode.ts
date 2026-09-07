@@ -68,6 +68,13 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
+  getReviewedToolApproval,
+  getToolApprovalReviewEvidence,
+  toolApprovalPayloadMatches,
+  toolApprovalProposalMatches,
+  TOOL_APPROVAL_REVIEW_CONFIG_KEY,
+} from '@/hitl/approvalReview';
+import {
   buildToolExecutionRequestPlan,
   coerceArgsForSchema,
   coerceRecordArgs,
@@ -111,15 +118,35 @@ import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { attachRunStepResumeState } from '@/tools/runStepResume';
 
-/** Host-facing batch requests must not carry the batch's breaker scope —
- * hosts spread `configurable` into their own run configs. */
-function stripRunBreakerScope(
+function stripToolApprovalReviewConfig(
   configurable: Record<string, unknown> | undefined
 ): Record<string, unknown> | undefined {
-  if (configurable == null || !(RUN_BREAKER_SCOPE_CONFIG_KEY in configurable)) {
+  if (
+    configurable == null ||
+    !(TOOL_APPROVAL_REVIEW_CONFIG_KEY in configurable)
+  ) {
     return configurable;
   }
-  const { [RUN_BREAKER_SCOPE_CONFIG_KEY]: _scope, ...rest } = configurable;
+  const {
+    [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: _review,
+    ...rest
+  } = configurable;
+  return rest;
+}
+
+/** Host-facing requests must not carry SDK-private execution state — hosts
+ * spread `configurable` into their own run configs. */
+function stripHostExecutionConfig(
+  configurable: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  const withoutReview = stripToolApprovalReviewConfig(configurable);
+  if (
+    withoutReview == null ||
+    !(RUN_BREAKER_SCOPE_CONFIG_KEY in withoutReview)
+  ) {
+    return withoutReview;
+  }
+  const { [RUN_BREAKER_SCOPE_CONFIG_KEY]: _scope, ...rest } = withoutReview;
   return rest;
 }
 import { convertInjectedMessages } from '@/messages/injected';
@@ -1307,11 +1334,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     runInput?: RunToolBatchContext<T>['runInput']
   ): Promise<unknown> {
     const lgConfig = config as LangGraphRunnableConfig;
-    const runtime: ToolRuntime<T> = {
+    const toolConfig: RunnableConfig = {
       ...config,
+      configurable: stripToolApprovalReviewConfig(
+        config.configurable as Record<string, unknown> | undefined
+      ),
+    };
+    const runtime: ToolRuntime<T> = {
+      ...toolConfig,
       state: runInput as ToolRuntime<T>['state'],
       toolCallId: call.id ?? '',
-      config,
+      config: toolConfig,
       context: lgConfig.context as ToolRuntime<T>['context'],
       store: (lgConfig.store ?? null) as ToolRuntime<T>['store'],
       writer:
@@ -2024,6 +2057,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           approvalReplaySessionId,
           approvalReplayKey
         );
+    const approvalReviewEvidence = getToolApprovalReviewEvidence(config);
+    const reviewedApproval = getReviewedToolApproval(
+      approvalReviewEvidence?.payload,
+      call.id
+    );
     const hasPostHook = hookRegistry?.hasHookFor('PostToolUse', runId) === true;
     const hasFailureHook =
       hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
@@ -2032,6 +2070,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       hookRegistry == null ||
       (!hasPreHook &&
         pendingApproval == null &&
+        reviewedApproval == null &&
         !hasPostHook &&
         !hasFailureHook)
     ) {
@@ -2106,7 +2145,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
 
     let effectiveCall = call;
-    if (hasPreHook || pendingApproval != null) {
+    if (hasPreHook || pendingApproval != null || reviewedApproval != null) {
       const preResult = await executeHooks({
         registry: hookRegistry,
         input: {
@@ -2162,7 +2201,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
         }
 
-        if (preResult.decision === 'ask') {
+        if (preResult.decision === 'ask' || reviewedApproval != null) {
           if (this.humanInTheLoop?.enabled !== true) {
             // Fail-closed: no HITL UI configured, so we can't actually
             // ask. Logged once via the existing helper.
@@ -2213,14 +2252,22 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           // same ask entry without dispatching the consumed hook again.
           // ToolNode disables LangSmith tracing, so the AsyncLocalStorage
           // frame must be re-established here.
+          const allowedDecisions =
+            preResult.decision === 'ask'
+              ? preResult.allowedDecisions
+              : reviewedApproval?.reviewConfig.allowed_decisions;
+          const askReason =
+            preResult.decision === 'ask'
+              ? preResult.reason
+              : reviewedApproval?.request.description;
           const askEntry: AskEntry = {
             entry: {
               call: effectiveCall,
               args: effectiveCall.args as Record<string, unknown>,
               stepId,
             },
-            reason: preResult.reason,
-            allowedDecisions: preResult.allowedDecisions,
+            reason: askReason,
+            allowedDecisions,
           };
           const payload = buildToolApprovalInterruptPayload([askEntry], runId);
           const resumeValue = AsyncLocalStorageProviderSingleton.runWithConfig(
@@ -2235,6 +2282,25 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             approvalReplaySessionId,
             approvalReplayKey
           );
+          const currentApproval = getReviewedToolApproval(payload, toolCallId);
+          if (
+            reviewedApproval != null &&
+            (currentApproval == null ||
+              !toolApprovalProposalMatches(currentApproval, reviewedApproval))
+          ) {
+            return persistOutput(
+              this.blockDirectCall({
+                call,
+                resolvedArgs,
+                reason:
+                  'Reviewed tool proposal changed before resume; retry approval',
+                hookRegistry,
+                runId,
+                threadId,
+              }),
+              effectiveCall.args as Record<string, unknown>
+            );
+          }
           const decisionByCallId = normalizeApprovalDecisions(
             [toolCallId],
             resumeValue
@@ -2246,9 +2312,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           const declaredType = (decision as { type?: unknown }).type;
 
           if (
-            preResult.allowedDecisions != null &&
+            allowedDecisions != null &&
             (typeof declaredType !== 'string' ||
-              !preResult.allowedDecisions.includes(
+              !allowedDecisions.includes(
                 declaredType as t.ToolApprovalDecisionType
               ))
           ) {
@@ -2256,7 +2322,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               this.blockDirectCall({
                 call,
                 resolvedArgs,
-                reason: `Decision "${typeof declaredType === 'string' ? declaredType : '<missing>'}" not in allowedDecisions [${preResult.allowedDecisions.join(', ')}] — failing closed`,
+                reason: `Decision "${typeof declaredType === 'string' ? declaredType : '<missing>'}" not in allowedDecisions [${allowedDecisions.join(', ')}] — failing closed`,
                 hookRegistry,
                 runId,
                 threadId,
@@ -2270,8 +2336,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               this.blockDirectCall({
                 call,
                 resolvedArgs,
-                reason:
-                  decision.reason ?? preResult.reason ?? 'Rejected by user',
+                reason: decision.reason ?? askReason ?? 'Rejected by user',
                 hookRegistry,
                 runId,
                 threadId,
@@ -2984,6 +3049,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       config,
       runId
     );
+    const approvalReviewEvidence = getToolApprovalReviewEvidence(config);
     const hasPendingApproval = preToolCalls.some(
       (entry) =>
         entry.call.id != null &&
@@ -2998,7 +3064,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     );
     if (
       hookRegistry != null &&
-      (hookRegistry.hasHookFor('PreToolUse', runId) || hasPendingApproval)
+      (hookRegistry.hasHookFor('PreToolUse', runId) ||
+        hasPendingApproval ||
+        approvalReviewEvidence != null)
     ) {
       /**
        * Pull each call's prestarted eager record BEFORE awaiting the hooks:
@@ -3264,6 +3332,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         if (hookResult.updatedInput != null) {
           applyInputOverride(entry, hookResult.updatedInput);
         }
+        const reviewedApproval = getReviewedToolApproval(
+          approvalReviewEvidence?.payload,
+          entry.call.id
+        );
+        if (reviewedApproval != null) {
+          askEntries.push({
+            entry,
+            reason: reviewedApproval.request.description,
+            allowedDecisions: reviewedApproval.reviewConfig.allowed_decisions,
+          });
+          continue;
+        }
         if (entry.call.id != null) {
           const preempted = preemptedEagerRecords.get(entry.call.id);
           if (preempted != null) {
@@ -3314,8 +3394,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
         }
 
+        const proposalMatches =
+          approvalReviewEvidence == null ||
+          toolApprovalPayloadMatches(payload, approvalReviewEvidence.payload);
+        if (!proposalMatches) {
+          for (const { entry } of askEntries) {
+            blockEntry(
+              entry,
+              'Reviewed tool proposal changed before resume; retry approval'
+            );
+          }
+        }
+        const decisionEntries = proposalMatches ? askEntries : [];
         const decisionByCallId = normalizeApprovalDecisions(
-          askEntries.map(({ entry }) => entry.call.id!),
+          decisionEntries.map(({ entry }) => entry.call.id!),
           resumeValue
         );
 
@@ -3323,7 +3415,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           entry,
           reason: askReason,
           allowedDecisions,
-        } of askEntries) {
+        } of decisionEntries) {
           const decision = decisionByCallId.get(entry.call.id!) ?? {
             type: 'reject' as const,
             reason: 'No decision provided for tool approval',
@@ -3689,8 +3781,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               agentId: this.executingAgentId,
               callerCapabilityProjection:
                 this.getCallerCapabilityProjectionSnapshot(),
-              configurable: stripRunBreakerScope(
-                  config.configurable as Record<string, unknown> | undefined
+              configurable: stripHostExecutionConfig(
+                config.configurable as Record<string, unknown> | undefined
               ),
               metadata: config.metadata as
                   | Record<string, unknown>
