@@ -1,4 +1,10 @@
 import { isProxy } from 'node:util/types';
+import type {
+  AIMessage,
+  BaseMessage,
+  ChatMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 
 export type ProviderToolCallKind =
   | 'tool'
@@ -1115,7 +1121,9 @@ export function appendProviderToolCallDescriptor(
   index.set(descriptor.callId, null);
 }
 
-function isExecutableCodePart(part: unknown): boolean {
+/** Google's built-in code execution emits an `executableCode` part with no call
+ *  id; its `codeExecutionResult` pairs by adjacency instead. */
+export function isExecutableCodePart(part: unknown): boolean {
   const record = getRecord(part);
   if (
     record == null ||
@@ -1171,4 +1179,221 @@ export function consumeProviderToolResultPair(
   }
   calls.delete(descriptor.toolCallId);
   return true;
+}
+
+function readOwnString(value: unknown, key: string): string | undefined {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor != null &&
+      'value' in descriptor &&
+      typeof descriptor.value === 'string' &&
+      descriptor.value !== '' &&
+      descriptor.value.length <= PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS
+      ? descriptor.value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readOwnValue(value: unknown, key: string): unknown {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor != null && 'value' in descriptor
+      ? descriptor.value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const LEGACY_FUNCTION_CALL_PREFIX = 'legacy_function:';
+
+export function getLegacyFunctionCallId(name: string): string | undefined {
+  const callId = `${LEGACY_FUNCTION_CALL_PREFIX}${name}`;
+  return callId.length <= PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS
+    ? callId
+    : undefined;
+}
+
+export type ProviderMessageRole =
+  | 'assistant'
+  | 'user'
+  | 'system'
+  | 'tool'
+  | 'function';
+
+/** The OpenAI converter forwards `assistant` / `user` / `system` / `developer`
+ *  / `tool` / `function`; the Google converter additionally reads `ai`,
+ *  `model` and `supervisor` as the model turn and `human` as the user. */
+const GENERIC_MESSAGE_ROLES: Readonly<Record<string, ProviderMessageRole>> = {
+  assistant: 'assistant',
+  ai: 'assistant',
+  model: 'assistant',
+  supervisor: 'assistant',
+  user: 'user',
+  human: 'user',
+  system: 'system',
+  developer: 'system',
+  tool: 'tool',
+  function: 'function',
+};
+
+/**
+ * Normalizes a message to the role a provider converter would send it as. A
+ * `ChatMessage` reports its type as `generic` and carries the wire role on
+ * `role`, so every classifier that keys on `getType()` alone silently skips
+ * generic assistant, tool and function messages the converters accept.
+ */
+export function getProviderMessageRole(
+  message: BaseMessage
+): ProviderMessageRole | undefined {
+  const type = message.getType();
+  switch (type) {
+  case 'ai':
+    return 'assistant';
+  case 'human':
+    return 'user';
+  case 'system':
+    return 'system';
+  case 'tool':
+    return 'tool';
+  case 'function':
+    return 'function';
+  case 'generic': {
+    const role = (message as Partial<ChatMessage>).role;
+    return typeof role === 'string' ? GENERIC_MESSAGE_ROLES[role] : undefined;
+  }
+  default:
+    return undefined;
+  }
+}
+
+export function getRawToolCallDescriptor(
+  toolCall: unknown
+): ProviderToolCallPartDescriptor | undefined {
+  const callId = readOwnString(toolCall, 'id');
+  if (callId == null) {
+    return undefined;
+  }
+  let name: string | undefined;
+  if (toolCall != null && typeof toolCall === 'object') {
+    try {
+      const property = Object.getOwnPropertyDescriptor(toolCall, 'function');
+      name =
+        property != null && 'value' in property
+          ? readOwnString(property.value, 'name')
+          : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return {
+    callId,
+    kind: 'tool',
+    sourceType: 'raw_tool_calls',
+    ...(name == null ? {} : { name }),
+  };
+}
+
+/**
+ * Appends every tool call an assistant message carries: parsed
+ * `AIMessage.tool_calls`, raw `additional_kwargs.tool_calls` (where OpenAI
+ * keeps calls when the parsed array is empty) and a legacy
+ * `additional_kwargs.function_call`. Content-block calls are the caller's to
+ * append, since only the caller knows whether the block is being replayed.
+ * Returns how many descriptors were recognized, so a caller can tell an
+ * invocation from a plain assistant turn without re-deriving the shapes.
+ */
+export function appendProviderMessageToolCalls(
+  message: BaseMessage,
+  calls: ProviderToolCallIndex
+): number {
+  if (getProviderMessageRole(message) !== 'assistant') {
+    return 0;
+  }
+  let recognized = 0;
+  for (const toolCall of (message as AIMessage).tool_calls ?? []) {
+    const descriptor = getProviderAIMessageToolCallDescriptor(toolCall);
+    if (descriptor != null) {
+      appendProviderToolCallDescriptor(calls, descriptor);
+      recognized += 1;
+    }
+  }
+
+  const rawToolCalls = getBoundedProviderPairingArrayProperty(
+    message.additional_kwargs,
+    'tool_calls'
+  );
+  if (rawToolCalls != null) {
+    for (const toolCall of rawToolCalls) {
+      const descriptor = getRawToolCallDescriptor(toolCall);
+      if (descriptor != null) {
+        appendProviderToolCallDescriptor(calls, descriptor);
+        recognized += 1;
+      }
+    }
+  }
+
+  const legacyFunctionCall = readOwnValue(
+    message.additional_kwargs,
+    'function_call'
+  );
+  const legacyFunctionName = readOwnString(legacyFunctionCall, 'name');
+  const legacyFunctionCallId =
+    legacyFunctionName == null
+      ? undefined
+      : getLegacyFunctionCallId(legacyFunctionName);
+  if (legacyFunctionCallId != null) {
+    appendProviderToolCallDescriptor(calls, {
+      callId: legacyFunctionCallId,
+      kind: 'tool',
+      name: legacyFunctionName,
+      sourceType: 'legacy_function_call',
+    });
+    recognized += 1;
+  }
+  return recognized;
+}
+
+/** Describes a whole-message tool result: a `ToolMessage`, a `FunctionMessage`,
+ *  or a generic message carrying the equivalent wire role. */
+export function getProviderToolMessageResultDescriptor(
+  message: BaseMessage
+): ProviderToolResultPartDescriptor | undefined {
+  const role = getProviderMessageRole(message);
+  if (role === 'function' && message.name != null) {
+    const toolCallId = getLegacyFunctionCallId(message.name);
+    return toolCallId == null
+      ? undefined
+      : {
+        type: 'function_message',
+        toolCallId,
+        compatibleCallKinds: ['tool'],
+        expectedToolNames: [message.name],
+      };
+  }
+  if (role !== 'tool') {
+    return undefined;
+  }
+  const toolMessage = message as ToolMessage & { toolCallId?: unknown };
+  const toolCallId =
+    typeof toolMessage.tool_call_id === 'string'
+      ? toolMessage.tool_call_id
+      : toolMessage.toolCallId;
+  return typeof toolCallId === 'string' &&
+    toolCallId !== '' &&
+    toolCallId.length <= PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS
+    ? {
+      type: 'tool_message',
+      toolCallId,
+      compatibleCallKinds: ['tool'],
+    }
+    : undefined;
 }

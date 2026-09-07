@@ -475,7 +475,7 @@ export type TokenBudgetBreakdown = {
   toolTokenCounts?: Record<string, number>;
   /** Names of counted tools that are deferred (`defer_loading`) and discovered. */
   deferredToolNames?: string[];
-  /** Calibrated retained tool results plus tool-only assistant messages; subset of messageTokens, not an additional budget category. */
+  /** Calibrated retained tool traffic: tool results plus assistant turns made only of tool calls, inline provider tool results and reasoning. A subset of messageTokens, not an additional budget category. */
   toolMessageTokens?: number;
   /** Per-tool result-message share; excludes assistant invocation overhead. */
   toolMessageTokenCounts?: Record<string, number>;

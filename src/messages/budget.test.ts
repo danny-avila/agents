@@ -11,7 +11,12 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { AgentLogEvent } from '@/types';
 import type * as t from '@/types';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
+import { stampSyntheticProviderMessage } from './provenance';
 import { GraphEvents } from '@/common';
+import {
+  compactSyntheticProviderContextMessage,
+  foldToolBlocksForToollessAgent,
+} from './format';
 import { toLangChainContent } from './langchain';
 import { syncBudgetDerivedFields } from './budget';
 
@@ -77,7 +82,6 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
 
   it.each([
     { type: 'text', text: 'explaining the result' },
-    { type: 'thinking', thinking: 'private reasoning' },
     {
       type: 'image_url',
       image_url: { url: 'https://example.com/image.png' },
@@ -99,6 +103,224 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
 
     expect(usage.breakdown.toolMessageTokens).toBe(10);
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({ read_file: 10 });
+  });
+
+  it.each([
+    { type: 'thinking', thinking: 'private reasoning', signature: 'sig' },
+    { type: 'redacted_thinking', data: 'opaque' },
+    { type: 'reasoning_content', reasoningText: { text: 'bedrock' } },
+    { type: 'reasoning', reasoning: 'google' },
+    { type: 'think', think: 'librechat' },
+  ])('keeps $type reasoning with the tool-only turn it precedes', (part) => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: toLangChainContent([
+          part,
+          { type: 'tool_use', id: 'reasoned', name: 'read_file', input: {} },
+        ]),
+        tool_calls: [{ id: 'reasoned', name: 'read_file', args: {} }],
+      }),
+      toolResult('reasoned'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(20);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ read_file: 10 });
+  });
+
+  it('counts an Anthropic server-tool turn as a tool-only invocation', () => {
+    const usage = snapshot();
+    const turn = new AIMessage({
+      content: toLangChainContent([
+        {
+          type: 'server_tool_use',
+          id: 'srvtoolu_1',
+          name: 'web_search',
+          input: { query: 'retained' },
+        },
+        {
+          type: 'web_search_tool_result',
+          tool_use_id: 'srvtoolu_1',
+          content: {
+            type: 'web_search_tool_result_error',
+            error_code: 'max_uses_exceeded',
+          },
+        },
+      ]),
+    });
+
+    syncBudgetDerivedFields(usage, [turn, new AIMessage('answer')], () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(10);
+    expect(usage.breakdown.toolMessageTokenCounts).toBeUndefined();
+  });
+
+  it('counts an MCP connector turn as a tool-only invocation', () => {
+    const usage = snapshot();
+    const turn = new AIMessage({
+      content: toLangChainContent([
+        {
+          type: 'mcp_tool_use',
+          id: 'mcptoolu_1',
+          name: 'search',
+          input: {},
+          server_name: 'docs',
+        },
+        {
+          type: 'mcp_tool_result',
+          tool_use_id: 'mcptoolu_1',
+          content: 'found',
+          is_error: false,
+        },
+      ]),
+    });
+
+    syncBudgetDerivedFields(usage, [turn], () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(10);
+  });
+
+  it('consumes an inline provider result so its id can be reused later', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: toLangChainContent([
+          {
+            type: 'mcp_tool_use',
+            id: 'shared-id',
+            name: 'connector_search',
+            input: {},
+            server_name: 'docs',
+          },
+          {
+            type: 'mcp_tool_result',
+            tool_use_id: 'shared-id',
+            content: 'found',
+            is_error: false,
+          },
+        ]),
+      }),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'shared-id', name: 'local_tool', args: {} }],
+      }),
+      toolResult('shared-id'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(30);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ local_tool: 10 });
+  });
+
+  it('counts a Google code-execution exchange as a tool-only invocation', () => {
+    const usage = snapshot();
+    const turn = new AIMessage({
+      content: toLangChainContent([
+        {
+          type: 'executableCode',
+          executableCode: { language: 'PYTHON', code: 'print(1)' },
+        },
+        {
+          type: 'codeExecutionResult',
+          codeExecutionResult: { outcome: 'OUTCOME_OK', output: '1' },
+        },
+      ]),
+    });
+
+    syncBudgetDerivedFields(usage, [turn, new AIMessage('answer')], () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(10);
+    expect(usage.breakdown.toolMessageTokenCounts).toBeUndefined();
+  });
+
+  it('attributes a user turn made only of tool results', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'split-a', name: 'lookup', args: {} },
+          { id: 'split-b', name: 'lookup', args: {} },
+        ],
+      }),
+      new HumanMessage({
+        content: toLangChainContent([
+          { type: 'tool_result', tool_use_id: 'split-a', content: 'first' },
+          { type: 'tool_result', tool_use_id: 'split-b', content: 'second' },
+        ]),
+      }),
+      new HumanMessage({
+        content: toLangChainContent([
+          { type: 'tool_result', tool_use_id: 'split-a', content: 'again' },
+          { type: 'text', text: 'and my question' },
+        ]),
+      }),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(20);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 10 });
+  });
+
+  it('counts tool history a tool-less destination received folded into a user turn', () => {
+    const folded = foldToolBlocksForToollessAgent([
+      new HumanMessage('question'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'folded', name: 'lookup', args: { q: 'x' } }],
+      }),
+      new ToolMessage({
+        content: 'r'.repeat(400),
+        tool_call_id: 'folded',
+        name: 'lookup',
+      }),
+      new AIMessage('done'),
+    ]);
+    expect(folded).toHaveLength(3);
+
+    const usage = snapshot();
+    syncBudgetDerivedFields(usage, folded, () => 10);
+    expect(usage.breakdown.toolMessageTokens).toBe(10);
+    expect(usage.breakdown.toolMessageTokenCounts).toBeUndefined();
+
+    const compacted = folded.map((message) =>
+      message.getType() === 'human' && message !== folded[0]
+        ? compactSyntheticProviderContextMessage(message as HumanMessage, 80)
+        : message
+    );
+    expect(compacted[1]).not.toBe(folded[1]);
+    const afterCompaction = snapshot();
+    syncBudgetDerivedFields(afterCompaction, compacted, () => 10);
+    expect(afterCompaction.breakdown.toolMessageTokens).toBe(10);
+  });
+
+  it('leaves a synthetic user turn without tool lineage in the conversation share', () => {
+    const usage = snapshot();
+    const cue = stampSyntheticProviderMessage(new HumanMessage('handoff cue'));
+
+    syncBudgetDerivedFields(usage, [cue, toolResult('a')], () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(10);
+  });
+
+  it('counts generic tool-role results', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'generic-result', name: 'lookup', args: {} }],
+      }),
+      new ChatMessage({ role: 'tool', content: 'result', name: 'lookup' }),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(20);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 10 });
   });
 
   it('counts whitespace-only inline invocations without structured calls', () => {
@@ -143,7 +365,12 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
       content: toLangChainContent([
         {
           type: 'tool_call',
-          tool_call: { type: 'tool_call', id: 'nested', name: 'lookup' },
+          tool_call: {
+            type: 'tool_call',
+            id: 'nested',
+            name: 'lookup',
+            args: {},
+          },
         },
       ]),
     });
@@ -158,7 +385,7 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 10 });
   });
 
-  it('keeps a mirrored structured name over an inline standard block', () => {
+  it('does not guess between conflicting names for one call id', () => {
     const usage = snapshot();
     const invocation = new AIMessage({
       content: toLangChainContent([
@@ -175,7 +402,7 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
 
     expect(usage.breakdown.toolMessageTokens).toBe(20);
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({
-      structured_name: 10,
+      unknown_tool: 10,
     });
   });
 
@@ -200,6 +427,31 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
       legacy_lookup: 10,
     });
   });
+
+  it.each(['model', 'ai', 'supervisor'])(
+    'treats a generic %s-role message as the model turn, as Google does',
+    (role) => {
+      const usage = snapshot();
+      const invocation = new ChatMessage({
+        role,
+        content: '',
+        additional_kwargs: {
+          function_call: { name: 'gemini_lookup', arguments: '{}' },
+        },
+      });
+
+      syncBudgetDerivedFields(
+        usage,
+        [invocation, new FunctionMessage({ content: 'result', name: '' })],
+        () => 10
+      );
+
+      expect(usage.breakdown.toolMessageTokens).toBe(20);
+      expect(usage.breakdown.toolMessageTokenCounts).toEqual({
+        gemini_lookup: 10,
+      });
+    }
+  );
 
   it('leaves non-assistant generic messages in the conversation share', () => {
     const usage = snapshot();
@@ -362,6 +614,83 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     });
   });
 
+  it('rounds an approximate counter instead of dropping the share', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'approx', name: 'lookup', args: {} }],
+      }),
+      toolResult('approx'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 12.5);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(25);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 13 });
+  });
+
+  it('keeps sub-token amounts through aggregation like the pruning path', () => {
+    const usage = snapshot();
+    const messages = [
+      toolResult('a', 'lookup'),
+      toolResult('b', 'lookup'),
+      toolResult('c', 'lookup'),
+      toolResult('d', 'lookup'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 0.25);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(1);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 1 });
+  });
+
+  it('attributes a reused call id to the call it currently answers', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'reused', name: 'first_tool', args: {} }],
+      }),
+      toolResult('reused'),
+      new HumanMessage('next'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'reused', name: 'second_tool', args: {} }],
+      }),
+      toolResult('reused'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({
+      first_tool: 10,
+      second_tool: 10,
+    });
+  });
+
+  it('forgets an unanswered call at the next user turn', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'dangling', name: 'abandoned_tool', args: {} }],
+      }),
+      new HumanMessage('never mind, do this instead'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'dangling', name: 'current_tool', args: {} }],
+      }),
+      toolResult('dangling'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({
+      current_tool: 10,
+    });
+  });
+
   it('distinguishes a known zero share from an unavailable counter', () => {
     const known = snapshot();
     syncBudgetDerivedFields(known, [new HumanMessage('hello')], () => 10);
@@ -402,7 +731,6 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
           Number.NaN,
           Number.POSITIVE_INFINITY,
           -1,
-          0.5,
           Number.MAX_SAFE_INTEGER + 1,
         ]) {
           const usage = snapshot();
