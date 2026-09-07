@@ -11,7 +11,12 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { AgentLogEvent } from '@/types';
 import type * as t from '@/types';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
+import { stampSyntheticProviderMessage } from './provenance';
 import { GraphEvents } from '@/common';
+import {
+  compactSyntheticProviderContextMessage,
+  foldToolBlocksForToollessAgent,
+} from './format';
 import { toLangChainContent } from './langchain';
 import { syncBudgetDerivedFields } from './budget';
 
@@ -177,6 +182,39 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     expect(usage.breakdown.toolMessageTokens).toBe(10);
   });
 
+  it('consumes an inline provider result so its id can be reused later', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: toLangChainContent([
+          {
+            type: 'mcp_tool_use',
+            id: 'shared-id',
+            name: 'connector_search',
+            input: {},
+            server_name: 'docs',
+          },
+          {
+            type: 'mcp_tool_result',
+            tool_use_id: 'shared-id',
+            content: 'found',
+            is_error: false,
+          },
+        ]),
+      }),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'shared-id', name: 'local_tool', args: {} }],
+      }),
+      toolResult('shared-id'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(30);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ local_tool: 10 });
+  });
+
   it('attributes a user turn made only of tool results', () => {
     const usage = snapshot();
     const messages = [
@@ -205,6 +243,47 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
 
     expect(usage.breakdown.toolMessageTokens).toBe(20);
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 10 });
+  });
+
+  it('counts tool history a tool-less destination received folded into a user turn', () => {
+    const folded = foldToolBlocksForToollessAgent([
+      new HumanMessage('question'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'folded', name: 'lookup', args: { q: 'x' } }],
+      }),
+      new ToolMessage({
+        content: 'r'.repeat(400),
+        tool_call_id: 'folded',
+        name: 'lookup',
+      }),
+      new AIMessage('done'),
+    ]);
+    expect(folded).toHaveLength(3);
+
+    const usage = snapshot();
+    syncBudgetDerivedFields(usage, folded, () => 10);
+    expect(usage.breakdown.toolMessageTokens).toBe(10);
+    expect(usage.breakdown.toolMessageTokenCounts).toBeUndefined();
+
+    const compacted = folded.map((message) =>
+      message.getType() === 'human' && message !== folded[0]
+        ? compactSyntheticProviderContextMessage(message as HumanMessage, 80)
+        : message
+    );
+    expect(compacted[1]).not.toBe(folded[1]);
+    const afterCompaction = snapshot();
+    syncBudgetDerivedFields(afterCompaction, compacted, () => 10);
+    expect(afterCompaction.breakdown.toolMessageTokens).toBe(10);
+  });
+
+  it('leaves a synthetic user turn without tool lineage in the conversation share', () => {
+    const usage = snapshot();
+    const cue = stampSyntheticProviderMessage(new HumanMessage('handoff cue'));
+
+    syncBudgetDerivedFields(usage, [cue, toolResult('a')], () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(10);
   });
 
   it('counts generic tool-role results', () => {

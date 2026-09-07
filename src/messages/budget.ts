@@ -17,6 +17,7 @@ import {
   getProviderToolMessageResultDescriptor,
   getProviderToolResultPartDescriptor,
 } from './toolResultTypes';
+import { getProviderMessageProvenance } from './provenance';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isReasoningContentBlock } from './core';
 import { emitAgentLog } from '@/utils/events';
@@ -112,6 +113,18 @@ function pairResult(
   return paired ? { paired, name } : { paired };
 }
 
+/**
+ * A user turn a provider transform built from tool history: a tool-less
+ * destination inheriting tool turns folds each call and its results into one
+ * synthetic `HumanMessage`, and compaction of that fold keeps the lineage. The
+ * role is user on the wire, the bytes are retained tool output, and the fold
+ * is what the provenance stamp records. Per-tool attribution is lost with it.
+ */
+function isFoldedToolHistory(message: BaseMessage): boolean {
+  const parts = getProviderMessageProvenance(message)?.parts;
+  return parts != null && parts.some((part) => part.attribution === 'tool');
+}
+
 interface InvocationScan {
   readonly recognizedCalls: number;
   readonly toolOnly: boolean;
@@ -135,20 +148,27 @@ function scanInvocation(
   }
   const parts: ReadonlyArray<string | MessageContentComplex> = message.content;
   let toolOnly = true;
+  let previousPart: string | MessageContentComplex | undefined;
   for (const part of parts) {
     if (typeof part === 'string') {
       toolOnly &&= BLANK_TEXT.test(part);
+      previousPart = part;
       continue;
     }
     const call = getProviderToolCallPartDescriptor(part);
     if (call != null) {
       appendProviderToolCallDescriptor(calls, call);
       recognizedCalls += 1;
+      previousPart = part;
       continue;
     }
-    if (getProviderToolResultPartDescriptor(part) != null) {
+    const result = getProviderToolResultPartDescriptor(part);
+    if (result != null) {
+      pairResult(result, calls, previousPart);
+      previousPart = part;
       continue;
     }
+    previousPart = part;
     if (isReasoningPart(part)) {
       continue;
     }
@@ -256,6 +276,10 @@ function computeToolMessageUsage(
       if (role === 'function') {
         pendingLegacyName = undefined;
       }
+      continue;
+    }
+    if (role === 'user' && isFoldedToolHistory(message)) {
+      total = safeCount(total + toCount(tokenCounter(message)));
       continue;
     }
     const userResultName =
