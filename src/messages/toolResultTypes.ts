@@ -1121,7 +1121,9 @@ export function appendProviderToolCallDescriptor(
   index.set(descriptor.callId, null);
 }
 
-function isExecutableCodePart(part: unknown): boolean {
+/** Google's built-in code execution emits an `executableCode` part with no call
+ *  id; its `codeExecutionResult` pairs by adjacency instead. */
+export function isExecutableCodePart(part: unknown): boolean {
   const record = getRecord(part);
   if (
     record == null ||

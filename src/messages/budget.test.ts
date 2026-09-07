@@ -215,6 +215,27 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({ local_tool: 10 });
   });
 
+  it('counts a Google code-execution exchange as a tool-only invocation', () => {
+    const usage = snapshot();
+    const turn = new AIMessage({
+      content: toLangChainContent([
+        {
+          type: 'executableCode',
+          executableCode: { language: 'PYTHON', code: 'print(1)' },
+        },
+        {
+          type: 'codeExecutionResult',
+          codeExecutionResult: { outcome: 'OUTCOME_OK', output: '1' },
+        },
+      ]),
+    });
+
+    syncBudgetDerivedFields(usage, [turn, new AIMessage('answer')], () => 10);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(10);
+    expect(usage.breakdown.toolMessageTokenCounts).toBeUndefined();
+  });
+
   it('attributes a user turn made only of tool results', () => {
     const usage = snapshot();
     const messages = [

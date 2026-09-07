@@ -16,6 +16,7 @@ import {
   getProviderToolCallPartDescriptor,
   getProviderToolMessageResultDescriptor,
   getProviderToolResultPartDescriptor,
+  isExecutableCodePart,
 } from './toolResultTypes';
 import { getProviderMessageProvenance } from './provenance';
 import { apportionTokenCounts } from '@/utils/tokens';
@@ -118,7 +119,11 @@ function pairResult(
  * destination inheriting tool turns folds each call and its results into one
  * synthetic `HumanMessage`, and compaction of that fold keeps the lineage. The
  * role is user on the wire, the bytes are retained tool output, and the fold
- * is what the provenance stamp records. Per-tool attribution is lost with it.
+ * is what the provenance stamp records. The counter measures whole messages,
+ * so per-tool attribution is lost with the fold, and any visible model text the
+ * fold carried alongside its calls (a "let me search" preamble, the fold's own
+ * scaffolding) is counted with it. That is a bounded over-count on a turn that
+ * exists only because of tool content; the alternative is reporting zero.
  */
 function isFoldedToolHistory(message: BaseMessage): boolean {
   const parts = getProviderMessageProvenance(message)?.parts;
@@ -158,6 +163,11 @@ function scanInvocation(
     const call = getProviderToolCallPartDescriptor(part);
     if (call != null) {
       appendProviderToolCallDescriptor(calls, call);
+      recognizedCalls += 1;
+      previousPart = part;
+      continue;
+    }
+    if (isExecutableCodePart(part)) {
       recognizedCalls += 1;
       previousPart = part;
       continue;
