@@ -3237,35 +3237,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.markToolsAsDiscovered(discoveredNames);
       }
 
-      /**
-       * Anthropic prompt-cache breakpoint on the tool definitions.
-       *
-       * Without this, the (often static) tool inventory shows up as
-       * fresh input on every turn — measured at ~28k tokens/turn for
-       * the local engine's coding-tool bundle, dominating per-turn
-       * cost even when message-level caching is on.
-       *
-       * Strategy: partition tools into [static, deferred] and stamp
-       * `cache_control: ephemeral` on the last static tool.
-       * Discovered deferred tools that arrive across turns sit *after*
-       * the breakpoint and don't invalidate the prefix.
-       */
-      const toolsForBinding = this.getPreparedToolsForBinding(agentContext);
-
-      let model =
-        this.overrideModel ??
-        initializeModel({
-          tools: toolsForBinding,
-          provider: agentContext.provider,
-          clientOptions: agentContext.clientOptions,
-        });
-
-      if (agentContext.systemRunnable) {
-        model = agentContext.systemRunnable
-          .pipe(model as Runnable)
-          .withConfig({ runName: AGENT_MODEL_CALL_RUN_NAME });
-      }
-
       if (agentContext.tokenCalculationPromise) {
         await agentContext.tokenCalculationPromise;
       }
@@ -3499,6 +3470,39 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (summarizeOnlyStep != null) {
           return summarizeOnlyStep;
         }
+      }
+
+      /**
+       * Anthropic prompt-cache breakpoint on the tool definitions.
+       *
+       * Without this, the (often static) tool inventory shows up as
+       * fresh input on every turn — measured at ~28k tokens/turn for
+       * the local engine's coding-tool bundle, dominating per-turn
+       * cost even when message-level caching is on.
+       *
+       * Strategy: partition tools into [static, deferred] and stamp
+       * `cache_control: ephemeral` on the last static tool.
+       * Discovered deferred tools that arrive across turns sit *after*
+       * the breakpoint and don't invalidate the prefix.
+       *
+       * Built only once a model call is certain: a summarize-only step
+       * returns above without one, and must not fail on a primary model
+       * it never invokes.
+       */
+      const toolsForBinding = this.getPreparedToolsForBinding(agentContext);
+
+      let model =
+        this.overrideModel ??
+        initializeModel({
+          tools: toolsForBinding,
+          provider: agentContext.provider,
+          clientOptions: agentContext.clientOptions,
+        });
+
+      if (agentContext.systemRunnable) {
+        model = agentContext.systemRunnable
+          .pipe(model as Runnable)
+          .withConfig({ runName: AGENT_MODEL_CALL_RUN_NAME });
       }
 
       let finalMessages = messagesToUse;
@@ -5521,6 +5525,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           return result;
         },
         default: () => [],
+      }),
+      /** Surfaced from the agent subgraph on a summarize-only run. */
+      manualSummary: Annotation<string | undefined>({
+        reducer: (_: string | undefined, b: string | undefined) => b,
+        default: () => undefined,
       }),
       runStepState: this.createRunStepStateAnnotation(),
     });

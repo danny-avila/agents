@@ -67,8 +67,8 @@ interface HarnessOptions {
   summarizationConfig?: t.SummarizationConfig;
   withBudget?: boolean;
   summarizerFailure?: Error;
-  /** A second agent reached by a direct edge from the summarizing one. */
-  successorAgent?: boolean;
+  /** Two agents, `first` and `second`; which one opted in and how they connect. */
+  multiAgent?: { summarizer: 'first' | 'second'; edgeType: 'direct' | 'handoff' };
 }
 
 async function createHarness(options: HarnessOptions): Promise<Harness> {
@@ -86,25 +86,32 @@ async function createHarness(options: HarnessOptions): Promise<Harness> {
     summarizeOnly: options.summarizeOnly ?? true,
     summarizationConfig: options.summarizationConfig,
   };
+  const plainAgent = {
+    provider: Providers.ANTHROPIC,
+    clientOptions: llmConfig,
+    ...(withBudget ? { maxContextTokens: 100_000 } : {}),
+  };
+  const multi = options.multiAgent;
   const graphConfig: t.RunConfig['graphConfig'] =
-    options.successorAgent === true
+    multi != null
       ? {
         type: 'multi-agent',
         agents: [
           {
             agentId: 'first',
-            provider: Providers.ANTHROPIC,
-            clientOptions: llmConfig,
-            ...agentFields,
+            ...plainAgent,
+            ...(multi.summarizer === 'first' ? agentFields : {}),
           },
           {
             agentId: 'second',
-            provider: Providers.ANTHROPIC,
-            clientOptions: llmConfig,
-            ...(withBudget ? { maxContextTokens: 100_000 } : {}),
+            ...plainAgent,
+            ...(multi.summarizer === 'second' ? agentFields : {}),
           },
         ],
-        edges: [{ from: ['first'], to: ['second'], edgeType: 'direct' }],
+        edges:
+            multi.edgeType === 'direct'
+              ? [{ from: ['first'], to: ['second'], edgeType: 'direct' }]
+              : [{ from: 'first', to: 'second', edgeType: 'handoff' }],
       }
       : {
         type: 'standard',
@@ -141,9 +148,7 @@ async function createHarness(options: HarnessOptions): Promise<Harness> {
   );
   const spy = jest
     .spyOn(init, 'initializeModel')
-    .mockReturnValue(
-      summarizer as unknown as ReturnType<typeof init.initializeModel>
-    );
+    .mockReturnValue(summarizer);
   return {
     run,
     agentModel,
@@ -317,10 +322,30 @@ describe('summarize-only runs', () => {
     }
   });
 
+  it('runs a summarizer reachable only through a handoff', async () => {
+    /** The summarizing agent is not one of the workflow's entry points, and
+     *  its predecessor never calls the model to hand off, so the run has to
+     *  start at the agent that opted in. */
+    const harness = await createHarness({
+      runId: 'summarize-only-handoff-target',
+      multiAgent: { summarizer: 'second', edgeType: 'handoff' },
+    });
+    try {
+      await harness.run.processStream({ messages: buildHistory(2) }, streamConfig);
+
+      expect(harness.summarizer.calls).toHaveLength(1);
+      expect(harness.completions).toHaveLength(1);
+      expect(harness.completions[0].agentId).toBe('second');
+      expect(harness.agentModel.calls).toHaveLength(0);
+    } finally {
+      harness.restore();
+    }
+  });
+
   it('never lets a chained successor agent call the model', async () => {
     const harness = await createHarness({
       runId: 'summarize-only-successor',
-      successorAgent: true,
+      multiAgent: { summarizer: 'first', edgeType: 'direct' },
     });
     try {
       await harness.run.processStream(

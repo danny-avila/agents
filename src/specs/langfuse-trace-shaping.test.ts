@@ -800,13 +800,28 @@ describe('shapeLangfuseSpan summarize-only output', () => {
     );
   });
 
-  it('prefers a real assistant reply over the summary channel', () => {
+  it('prefers the summary over an older reply the run retained', () => {
+    /** With an explicit recency window the tail stays in state, so the last
+     *  assistant message is history, not the compaction's result. */
+    const span = createSpan('LibreChat Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+      [INPUT]: JSON.stringify({ messages: [{ type: 'human', content: 'hi' }] }),
+      [OUTPUT]: JSON.stringify({
+        messages: [{ type: 'ai', content: 'An older retained reply.' }],
+        manualSummary: 'CHECKPOINT: the compaction result.',
+      }),
+    });
+    shapeLangfuseSpan(span);
+    expect(span.attributes[OUTPUT]).toBe('CHECKPOINT: the compaction result.');
+  });
+
+  it('ignores an empty summary channel', () => {
     const span = createSpan('LibreChat Agent', {
       [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
       [INPUT]: JSON.stringify({ messages: [{ type: 'human', content: 'hi' }] }),
       [OUTPUT]: JSON.stringify({
         messages: [{ type: 'ai', content: 'A real answer.' }],
-        manualSummary: 'stale summary',
+        manualSummary: '   ',
       }),
     });
     shapeLangfuseSpan(span);

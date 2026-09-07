@@ -1565,8 +1565,16 @@ export class MultiAgentGraph extends StandardGraph {
       });
     }
 
-    // Add starting edges for all starting nodes
-    for (const startNode of this.startingNodes) {
+    /** A summarize-only run also starts at the agent that opted in: one
+     *  reachable only through a handoff would otherwise never run, since its
+     *  predecessors are no-ops. The workflow's own entry points stay, as the
+     *  graph must keep every node reachable; they end without a model call. */
+    const startingNodes =
+      this.summarizeOnlyAgentId != null &&
+      !this.startingNodes.has(this.summarizeOnlyAgentId)
+        ? [...this.startingNodes, this.summarizeOnlyAgentId]
+        : this.startingNodes;
+    for (const startNode of startingNodes) {
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       /** @ts-ignore */
       builder.addEdge(START, startNode);

@@ -547,8 +547,10 @@ function shapeConversationPayload(span: MutableSpan): void {
     'user'
   );
   const output = parseAttributeValue(span.attributes[outputKey]);
+  /** A summarize-only run's summary is its answer; any assistant message
+   *  still in state is an older reply the run retained, not its output. */
   const answer =
-    findLastMessageText(output, 'assistant') ?? getManualSummary(output);
+    getManualSummary(output) ?? findLastMessageText(output, 'assistant');
   /** A generation that IS the trace root — a bare `model.invoke` with no
    *  wrapping chain, i.e. the activity-label path — is also the only
    *  observation carrying its own prompt: reducing its observation input
