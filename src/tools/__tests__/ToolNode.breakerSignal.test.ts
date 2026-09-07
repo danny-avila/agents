@@ -346,7 +346,7 @@ describe('ToolNode breaker signal composition', () => {
           ],
         }),
       ],
-    });
+    }, config);
     expect(terminalRuns).toBe(2);
     expect(terminalPreHooks).toBe(2);
   });
