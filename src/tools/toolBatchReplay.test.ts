@@ -23,6 +23,13 @@ const approval = {
 };
 
 describe('checkpoint-owned tool batch replay', () => {
+  it.each([null, 'confirm', ['one', 'two']])('preserves custom interrupt payload %j with settled results', async (payload) => {
+    const wrapped = await attachToolBatchReplayState(payload, 'owner', new Map([['batch', new Map([['call', {
+      output: new ToolMessage({ content: 'done', tool_call_id: 'call' }), additionalContexts: [],
+    }]])]]));
+    expect(getToolBatchReplayState(wrapped)?.records).toHaveLength(1);
+    expect(stripToolBatchReplayState(wrapped)).toEqual(payload);
+  });
   it('does not reinterpret corrupt approval evidence as permission to execute', () => {
     const configurable = {
       forged: 'retained',

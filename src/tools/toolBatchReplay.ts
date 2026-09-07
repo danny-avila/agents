@@ -16,6 +16,8 @@ import {
 } from '@/tools/runStepResume';
 
 export const TOOL_BATCH_REPLAY_KEY = '__librechat_tool_batch_replay';
+const TOOL_BATCH_PAYLOAD_KEY = '__librechat_tool_batch_payload';
+const TOOL_BATCH_WRAPPER_KEY = '__librechat_tool_batch_wrapper';
 
 export interface SettledToolBatchResult {
   proposal?: { name: string; args: Record<string, unknown> };
@@ -177,6 +179,9 @@ export function stripToolBatchReplayState(payload: unknown): unknown {
     return payload;
   }
   const { [TOOL_BATCH_REPLAY_KEY]: _state, ...publicPayload } = payload;
+  if (TOOL_BATCH_WRAPPER_KEY in publicPayload && publicPayload[TOOL_BATCH_WRAPPER_KEY] === 1 && TOOL_BATCH_PAYLOAD_KEY in publicPayload) {
+    return publicPayload[TOOL_BATCH_PAYLOAD_KEY];
+  }
   return publicPayload;
 }
 
@@ -186,13 +191,6 @@ export async function attachToolBatchReplayState(
   batches: ReadonlyMap<string, ReadonlyMap<string, object>>
 ): Promise<unknown> {
   const publicPayload = stripRunStepResumeState(payload);
-  if (
-    publicPayload == null ||
-    typeof publicPayload !== 'object' ||
-    Array.isArray(publicPayload)
-  ) {
-    return payload;
-  }
   const previous = getToolBatchReplayState(publicPayload);
   const records =
     previous?.records.filter((record) => record.owner !== owner) ?? [];
@@ -212,7 +210,10 @@ export async function attachToolBatchReplayState(
     return payload;
   }
   const result = {
-    ...publicPayload,
+    ...(isRecord(publicPayload) ? publicPayload : {
+      [TOOL_BATCH_WRAPPER_KEY]: 1,
+      [TOOL_BATCH_PAYLOAD_KEY]: publicPayload,
+    }),
     [TOOL_BATCH_REPLAY_KEY]: {
       version: 1,
       approvalOwner,

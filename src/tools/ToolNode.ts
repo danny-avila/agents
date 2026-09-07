@@ -890,7 +890,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const messages = Array.isArray(input) ? input as BaseMessage[] :
           (input as { messages?: BaseMessage[] }).messages;
         const assistantBatch = messages == null ? undefined : findAssistantBatch(messages);
-        const activeReplayKey = assistantBatch == null ? undefined : getAssistantBatchReplayKey(
+        const activeReplayKey = assistantBatch == null || getToolBatchReplayScope(config) == null ? undefined : getAssistantBatchReplayKey(
           assistantBatch, getToolBatchReplayScope(config)
         );
         const replayOwner = getToolBatchReplayOwner(
@@ -4895,7 +4895,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ? findAssistantBatch(sendMessages as BaseMessage[])
         : undefined;
       const sendReplayBatchKey =
-        sendAssistantBatch == null
+        sendAssistantBatch == null || getToolBatchReplayScope(config) == null
           ? undefined
           : getAssistantBatchReplayKey(
             sendAssistantBatch,
@@ -4962,7 +4962,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         throw new Error('ToolNode only accepts AIMessages as input.');
       }
       const aiMessage = assistantBatch.message;
-      replayBatchKey = getAssistantBatchReplayKey(
+      replayBatchKey = getToolBatchReplayScope(config) == null ? undefined : getAssistantBatchReplayKey(
         assistantBatch,
         getToolBatchReplayScope(config)
       );
@@ -5195,7 +5195,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             : [];
 
         const settledDirectResults =
-          this.settledDirectResultsByBatch.get(replayBatchKey);
+          replayBatchKey == null ? undefined : this.settledDirectResultsByBatch.get(replayBatchKey);
         const unhandledDirectCalls: ToolCall[] = [];
         const unhandledDirectOutputs: (BaseMessage | Command)[] = [];
         for (let i = 0; i < directCalls.length; i++) {
