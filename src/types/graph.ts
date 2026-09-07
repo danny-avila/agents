@@ -906,6 +906,15 @@ interface AgentInputFields {
    */
   discoveredTools?: string[];
   summarizationEnabled?: boolean;
+  /**
+   * Runs this agent as a summarize-only pass: the first model step requests
+   * summarization outright instead of consulting the trigger, and the step
+   * after the summary emits its context snapshot and ends the run without a
+   * model call. Hosts use it for user-initiated compaction, where the summary
+   * is the whole response. Requires `summarizationEnabled`; with it off the
+   * run ends immediately and produces nothing.
+   */
+  summarizeOnly?: boolean;
   summarizationConfig?: SummarizationConfig;
   /**
    * Optional host-supplied, user-visible guidance for compaction. The SDK

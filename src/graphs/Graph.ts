@@ -3086,6 +3086,81 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     });
   }
 
+  /**
+   * The two model steps of a summarize-only run, neither of which calls the
+   * model. The first requests the summary outright — no trigger consulted,
+   * because the user asked for it — and the second, entered after the
+   * summarize node, dispatches the post-summary usage snapshot (the host's
+   * gauge and summary baseline read it) and ends the run. Returns `null`
+   * for every other run so the ordinary step proceeds.
+   */
+  private async summarizeOnlyStep({
+    agentContext,
+    agentId,
+    messageCount,
+    contextUsage,
+    config,
+  }: {
+    agentContext: AgentContext;
+    agentId: string;
+    messageCount: number;
+    contextUsage: t.ContextUsageEvent | null;
+    config: RunnableConfig;
+  }): Promise<Partial<t.AgentSubgraphState> | null> {
+    if (agentContext.summarizeOnly !== true) {
+      return null;
+    }
+    const meta = { runId: this.runId, agentId };
+    if (agentContext.claimManualSummarization()) {
+      if (agentContext.summarizationEnabled !== true) {
+        emitAgentLog(
+          config,
+          'warn',
+          'graph',
+          'Summarize-only run skipped — summarization is not enabled',
+          undefined,
+          meta
+        );
+        return { messages: [] };
+      }
+      emitAgentLog(
+        config,
+        'info',
+        'graph',
+        'Manual summarization requested',
+        {
+          totalMessages: messageCount,
+          summaryVersion: agentContext.summaryVersion + 1,
+        },
+        meta
+      );
+      agentContext.markSummarizationTriggered(messageCount);
+      return {
+        summarizationRequest: {
+          remainingContextTokens: contextUsage?.remainingContextTokens ?? 0,
+          agentId: agentId || agentContext.agentId,
+          reason: 'manual',
+        },
+      };
+    }
+    if (contextUsage != null) {
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_CONTEXT_USAGE,
+        contextUsage,
+        config
+      );
+    }
+    emitAgentLog(
+      config,
+      'debug',
+      'graph',
+      'Summarize-only run complete — ending without a model call',
+      { summaryVersion: agentContext.summaryVersion },
+      meta
+    );
+    return { messages: [] };
+  }
+
   createCallModel(agentId = 'default') {
     return async (
       state: t.AgentSubgraphState,
@@ -3309,6 +3384,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         };
         syncBudgetDerivedFields(contextUsage);
 
+        const summarizeOnlyStep = await this.summarizeOnlyStep({
+          agentContext,
+          agentId,
+          messageCount: messages.length,
+          contextUsage,
+          config,
+        });
+        if (summarizeOnlyStep != null) {
+          return summarizeOnlyStep;
+        }
+
         const hasPrunedMessages =
           agentContext.summarizationEnabled === true &&
           Array.isArray(messagesToRefine) &&
@@ -3380,6 +3466,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               { runId: this.runId, agentId }
             );
           }
+        }
+      } else {
+        /** No pruner (no token counter or budget): the summarize-only run
+         *  still has to request its summary and stop, just without usage. */
+        const summarizeOnlyStep = await this.summarizeOnlyStep({
+          agentContext,
+          agentId,
+          messageCount: messages.length,
+          contextUsage: null,
+          config,
+        });
+        if (summarizeOnlyStep != null) {
+          return summarizeOnlyStep;
         }
       }
 
@@ -5147,6 +5246,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
       if (state.summarizationRequest != null) {
         return summarizeNode;
+      }
+      /** A summarize-only run never calls the model, so the step after the
+       *  summary has nothing to route: the summary itself is the result. */
+      if (agentContext.summarizeOnly === true) {
+        return END;
       }
       const decision = toolsCondition(
         state as t.BaseGraphState,

@@ -123,6 +123,7 @@ export class AgentContext {
       useLegacyContent,
       discoveredTools,
       summarizationEnabled,
+      summarizeOnly,
       summarizationConfig,
       compactionSemanticIndex,
       initialSummary,
@@ -158,6 +159,7 @@ export class AgentContext {
       useLegacyContent,
       discoveredTools,
       summarizationEnabled,
+      summarizeOnly,
       summarizationConfig,
       compactionSemanticIndex,
       contextPruningConfig,
@@ -383,6 +385,10 @@ export class AgentContext {
   useLegacyContent: boolean = false;
   /** Enables graph-level summarization for this agent */
   summarizationEnabled?: boolean;
+  /** Summarize-only run: request a summary on the first model step and end after it */
+  summarizeOnly?: boolean;
+  /** Whether the summarize-only run has already issued its one request */
+  private _manualSummarizationRequested: boolean = false;
   /** Summarization runtime settings used by graph pruning hooks */
   summarizationConfig?: t.SummarizationConfig;
   /** Host-supplied advisory guidance consumed only when compaction runs. */
@@ -480,6 +486,7 @@ export class AgentContext {
     useLegacyContent,
     discoveredTools,
     summarizationEnabled,
+    summarizeOnly,
     summarizationConfig,
     compactionSemanticIndex,
     contextPruningConfig,
@@ -508,6 +515,7 @@ export class AgentContext {
     useLegacyContent?: boolean;
     discoveredTools?: string[];
     summarizationEnabled?: boolean;
+    summarizeOnly?: boolean;
     summarizationConfig?: t.SummarizationConfig;
     compactionSemanticIndex?: t.CompactionSemanticIndex;
     contextPruningConfig?: t.ContextPruningConfig;
@@ -549,6 +557,7 @@ export class AgentContext {
 
     this.useLegacyContent = useLegacyContent ?? false;
     this.summarizationEnabled = summarizationEnabled;
+    this.summarizeOnly = summarizeOnly;
     this.summarizationConfig = summarizationConfig;
     if (compactionSemanticIndex != null) {
       this.compactionSemanticIndex = snapshotCompactionSemanticIndex(
@@ -1268,6 +1277,7 @@ export class AgentContext {
     this.summaryPrecedesMessages = this.durableSummaryPrecedesMessages;
     this._lastSummarizationMsgCount = 0;
     this._summarizationFailures = 0;
+    this._manualSummarizationRequested = false;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
     this.restoreContextBudgetAfterOverflow();
@@ -1615,6 +1625,20 @@ export class AgentContext {
    */
   markSummarizationTriggered(msgCount: number): void {
     this._lastSummarizationMsgCount = msgCount;
+  }
+
+  /**
+   * Claims the single summarization request a summarize-only run makes.
+   * True exactly once per run, on the first model step; the step that gets
+   * `false` is the one after the summary, which reports usage and ends
+   * without a model call. Always false when `summarizeOnly` is off.
+   */
+  claimManualSummarization(): boolean {
+    if (this.summarizeOnly !== true || this._manualSummarizationRequested) {
+      return false;
+    }
+    this._manualSummarizationRequested = true;
+    return true;
   }
 
   /**

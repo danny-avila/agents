@@ -1167,6 +1167,15 @@ export function createSummarizeNode({
     const runnableConfig = config ?? graph.config;
 
     const retainRecent = agentContext.summarizationConfig?.retainRecent;
+    /**
+     * A manual summary is the user asking for the whole history to become a
+     * checkpoint, so the default recency window does not apply to it: only
+     * a `retainRecent` the host configured explicitly keeps a tail.
+     */
+    const retainTurns =
+      request.reason === 'manual'
+        ? (retainRecent?.turns ?? 0)
+        : (retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS);
     const recencyTokenCounter =
       agentContext.contextPressureTokenCounts?.count ??
       agentContext.tokenCounter;
@@ -1175,7 +1184,7 @@ export function createSummarizeNode({
       tailStartIndex,
       usedIntraTurnFallback,
     } = splitAtRecencyBoundary(restoredMessages, {
-      turns: retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS,
+      turns: retainTurns,
       tokens: retainRecent?.tokens,
       tokenCounter: recencyTokenCounter,
       intraTurnTokens: resolveIntraTurnRetainTokens({
@@ -1213,7 +1222,7 @@ export function createSummarizeNode({
         'Summarization skipped — recency window retains all messages',
         {
           messagesRetained: messagesToRetain.length,
-          retainTurns: retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS,
+          retainTurns,
         },
         { runId: graph.runId, agentId: request.agentId }
       );

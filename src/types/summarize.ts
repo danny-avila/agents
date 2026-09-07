@@ -127,8 +127,11 @@ export interface SummarizationNodeInput {
    *   is compacting to recover. When summarization is not enabled, this
    *   variant performs no model call — the corrected budget alone is what the
    *   retry needs.
+   * - `manual`: the host asked for a summary outright (a summarize-only run).
+   *   The recency window is not applied unless the host configured
+   *   `retainRecent` explicitly, so the summary replaces the whole history.
    */
-  reason?: 'trigger' | 'overflow';
+  reason?: 'trigger' | 'overflow' | 'manual';
   /**
    * Whether an overflow recovery may spend a summarization model call.
    *
