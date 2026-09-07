@@ -210,6 +210,68 @@ describe('createContextPressureMeter', () => {
     expect(tokenCounter).toHaveBeenCalledTimes(2);
   });
 
+  it('does not cache messages carrying mutable raw tool calls', () => {
+    const message = new AIMessage('answer');
+    const tokenCounter = jest.fn(contentLength);
+    const cache = createExactTokenCountCache(tokenCounter);
+
+    cache.count(message);
+    message.additional_kwargs.tool_calls = [
+      {
+        id: 'raw-call',
+        type: 'function',
+        function: { name: 'lookup', arguments: '{}' },
+      },
+    ];
+    cache.count(message);
+    message.additional_kwargs.tool_calls[0]!.function.arguments =
+      '{"query":"changed"}';
+    cache.count(message);
+
+    expect(tokenCounter).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not invoke prototype proxy traps during cache checks', () => {
+    const message = new AIMessage('answer');
+    const tokenCounter = jest.fn(contentLength);
+    const cache = createExactTokenCountCache(tokenCounter);
+    let hasCalls = 0;
+    Object.setPrototypeOf(
+      message.additional_kwargs,
+      new Proxy(
+        {},
+        {
+          has: () => {
+            hasCalls += 1;
+            throw new Error('must not run');
+          },
+        }
+      )
+    );
+
+    cache.count(message);
+    cache.count(message);
+
+    expect(hasCalls).toBe(0);
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
+  });
+
+  it('recounts inherited revoked parsed tool-call proxies safely', () => {
+    const message = new AIMessage('answer');
+    const tokenCounter = jest.fn(contentLength);
+    const cache = createExactTokenCountCache(tokenCounter);
+    const { proxy, revoke } = Proxy.revocable([], {});
+    const inherited = Object.create(Object.getPrototypeOf(message));
+    Object.defineProperty(inherited, 'tool_calls', { value: proxy });
+    delete message.tool_calls;
+    Object.setPrototypeOf(message, inherited);
+    revoke();
+
+    expect(() => cache.count(message)).not.toThrow();
+    expect(() => cache.count(message)).not.toThrow();
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
+  });
+
   it('matches forced recounts across append, replace, reorder, and mutation', () => {
     const first = new HumanMessage({ id: 'first', content: 'one' });
     const second = new HumanMessage({ id: 'second', content: 'two' });
