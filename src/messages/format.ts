@@ -438,8 +438,16 @@ function extractReasoningContent(
     const thinking = (part as ThinkingContentText).thinking;
     return typeof thinking === 'string' ? thinking : '';
   }
+  if (part.type === 'thinking_delta') {
+    const thinking = readFoldedDataProperty(part, 'thinking');
+    return typeof thinking === 'string' ? thinking : '';
+  }
   if (part.type === ContentTypes.REASONING) {
     const reasoning = (part as GoogleReasoningContentText).reasoning;
+    return typeof reasoning === 'string' ? reasoning : '';
+  }
+  if (part.type === 'reasoning-delta') {
+    const reasoning = readFoldedDataProperty(part, 'reasoning');
     return typeof reasoning === 'string' ? reasoning : '';
   }
   if (part.type === ContentTypes.REASONING_CONTENT) {

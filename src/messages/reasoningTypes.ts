@@ -15,3 +15,9 @@ export function isReasoningContentBlock(block: { type?: unknown }): boolean {
     REASONING_CONTENT_BLOCK_TYPES.has(block.type)
   );
 }
+
+export function isAnthropicThinkingContentBlock(block: {
+  type?: unknown;
+}): boolean {
+  return block.type === 'thinking';
+}

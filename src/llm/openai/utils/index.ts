@@ -56,7 +56,7 @@ import {
   serializeToolCallInput,
 } from '@/messages/prune';
 import { toLangChainContent } from '@/messages/langchain';
-import { isReasoningContentBlock } from '@/messages/reasoningTypes';
+import { isAnthropicThinkingContentBlock } from '@/messages/reasoningTypes';
 
 export type { OpenAICallOptions, OpenAIChatInput };
 
@@ -385,7 +385,7 @@ export function _convertMessagesToOpenAIParams(
       content = message.content;
     } else {
       content = message.content.map((m) => {
-        if (isReasoningContentBlock(m)) {
+        if (isAnthropicThinkingContentBlock(m)) {
           hasReasoningBlock = true;
           return m;
         }

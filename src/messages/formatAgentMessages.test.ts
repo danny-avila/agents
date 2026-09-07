@@ -5956,6 +5956,31 @@ describe('formatAgentMessages', () => {
     );
   });
 
+  it('preserves reasoning text from persisted stream delta blocks', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking_delta', thinking: 'First thought. ' },
+          { type: 'reasoning-delta', reasoning: 'Second thought.' },
+          { type: ContentTypes.TEXT, text: 'Answer.' },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { preserveReasoningContent: true }
+    );
+
+    expect(result.messages[0].additional_kwargs.reasoning_content).toBe(
+      'First thought. Second thought.'
+    );
+  });
+
   it('should not reconstruct reasoning_content when preserveReasoningContent is explicitly false for DeepSeek', () => {
     const payload: TPayload = [
       {
