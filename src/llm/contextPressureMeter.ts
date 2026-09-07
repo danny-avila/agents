@@ -10,7 +10,7 @@ import {
   isSyntheticProviderContextMessage,
 } from '@/messages';
 import { createToolMessageUsageAccumulator } from '@/messages/budget';
-import { apportionTokenCounts } from '@/utils';
+import { readTokenMetadataProperty, apportionTokenCounts } from '@/utils';
 
 interface ContextPressureUsage {
   contextBudget?: number;
@@ -91,6 +91,21 @@ function readDataProperty(
     : { own: true, safe: false };
 }
 
+function readCacheMetadataProperty(
+  owner: object,
+  property: PropertyKey,
+  path: string
+): { safe: boolean; value?: unknown } {
+  try {
+    return {
+      safe: true,
+      value: readTokenMetadataProperty(owner, property, path),
+    };
+  } catch {
+    return { safe: false };
+  }
+}
+
 function getStableTokenSurface(
   message: BaseMessage
 ): StableTokenSurface | undefined {
@@ -107,10 +122,13 @@ function getStableTokenSurface(
   }
   const messageType = message.getType();
   const roleProperty = readDataProperty(message, 'role');
-  if (!roleProperty.safe || (!roleProperty.own && 'role' in message)) {
+  const resolvedRoleProperty = roleProperty.own
+    ? roleProperty
+    : readCacheMetadataProperty(message, 'role', 'message.role');
+  if (!resolvedRoleProperty.safe) {
     return undefined;
   }
-  const role = roleProperty.value;
+  const role = resolvedRoleProperty.value;
   if (role != null && typeof role !== 'string') {
     return undefined;
   }
@@ -131,11 +149,12 @@ function getStableTokenSurface(
     return undefined;
   }
   const additionalKwargs = rawAdditionalKwargs;
-  try {
-    if ('tool_calls' in additionalKwargs) {
-      return undefined;
-    }
-  } catch {
+  const rawToolCalls = readCacheMetadataProperty(
+    additionalKwargs,
+    'tool_calls',
+    'additional_kwargs.tool_calls'
+  );
+  if (!rawToolCalls.safe || rawToolCalls.value != null) {
     return undefined;
   }
   const typeProperty = readDataProperty(additionalKwargs, 'type');
@@ -147,13 +166,13 @@ function getStableTokenSurface(
       message as AIMessage,
       'tool_calls'
     );
-    if (
-      !toolCallsProperty.safe ||
-      (!toolCallsProperty.own && 'tool_calls' in message)
-    ) {
+    const resolvedToolCallsProperty = toolCallsProperty.own
+      ? toolCallsProperty
+      : readCacheMetadataProperty(message, 'tool_calls', 'message.tool_calls');
+    if (!resolvedToolCallsProperty.safe) {
       return undefined;
     }
-    const toolCalls = toolCallsProperty.value;
+    const toolCalls = resolvedToolCallsProperty.value;
     if (
       toolCalls != null &&
       (!Array.isArray(toolCalls) || isProxy(toolCalls) || toolCalls.length > 0)

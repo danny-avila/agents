@@ -352,6 +352,25 @@ describe('getTokenCountForMessage', () => {
     expect(duplicateCount).toBeGreaterThan(singleCount + 5_000);
   });
 
+  test('counts non-enumerable raw OpenAI function arguments', () => {
+    const message = new AIMessage('');
+    const rawFunction = { name: 'lookup', arguments: '' };
+    Object.defineProperty(rawFunction, 'arguments', {
+      value: `{"query":"${'x'.repeat(5_000)}"}`,
+    });
+    message.additional_kwargs.tool_calls = [
+      {
+        id: 'non-enumerable-call',
+        type: 'function',
+        function: rawFunction,
+      },
+    ];
+
+    expect(
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toBeGreaterThan(5_000);
+  });
+
   test('counts inherited raw OpenAI tool calls', () => {
     const message = new AIMessage('');
     Object.setPrototypeOf(message.additional_kwargs, {

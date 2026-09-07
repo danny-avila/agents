@@ -946,7 +946,7 @@ function getBoundedStructuredTokenCount(
   );
 }
 
-function readTokenMetadataProperty(
+export function readTokenMetadataProperty(
   value: object,
   key: PropertyKey,
   path: string
@@ -1293,27 +1293,43 @@ export function getTokenCountForMessage(
           'id',
           `${callPath}.id`
         );
+        const callType = readTokenMetadataProperty(
+          rawCall,
+          'type',
+          `${callPath}.type`
+        );
         const rawFunction = readTokenMetadataProperty(
           rawCall,
           'function',
           `${callPath}.function`
         );
+        let projectedFunction = rawFunction;
         if (rawFunction != null && typeof rawFunction === 'object') {
-          readTokenMetadataProperty(
+          if (hasUnsafeStructuredSerialization(rawFunction)) {
+            throw new UnsafeTokenMeasurementError({
+              reason: 'metadata_accessor',
+              path: `${callPath}.function`,
+            });
+          }
+          const name = readTokenMetadataProperty(
             rawFunction,
             'name',
             `${callPath}.function.name`
           );
-          readTokenMetadataProperty(
+          const args = readTokenMetadataProperty(
             rawFunction,
             'arguments',
             `${callPath}.function.arguments`
           );
+          projectedFunction = { name, arguments: args };
         }
         if (typeof callId === 'string' && representedToolCallIds.has(callId)) {
           continue;
         }
-        numTokens += getBoundedStructuredTokenCount(rawCall, countText);
+        numTokens += getBoundedStructuredTokenCount(
+          { id: callId, type: callType, function: projectedFunction },
+          countText
+        );
       }
     }
     let legacyFunctionCall: PropertyDescriptor | undefined;

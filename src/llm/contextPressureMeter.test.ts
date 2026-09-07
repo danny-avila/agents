@@ -231,6 +231,31 @@ describe('createContextPressureMeter', () => {
     expect(tokenCounter).toHaveBeenCalledTimes(3);
   });
 
+  it('does not invoke prototype proxy traps during cache checks', () => {
+    const message = new AIMessage('answer');
+    const tokenCounter = jest.fn(contentLength);
+    const cache = createExactTokenCountCache(tokenCounter);
+    let hasCalls = 0;
+    Object.setPrototypeOf(
+      message.additional_kwargs,
+      new Proxy(
+        {},
+        {
+          has: () => {
+            hasCalls += 1;
+            throw new Error('must not run');
+          },
+        }
+      )
+    );
+
+    cache.count(message);
+    cache.count(message);
+
+    expect(hasCalls).toBe(0);
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
+  });
+
   it('matches forced recounts across append, replace, reorder, and mutation', () => {
     const first = new HumanMessage({ id: 'first', content: 'one' });
     const second = new HumanMessage({ id: 'second', content: 'two' });
