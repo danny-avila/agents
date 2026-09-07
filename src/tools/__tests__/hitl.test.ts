@@ -158,7 +158,7 @@ type CompiledMessagesGraph = Runnable<unknown, { messages: BaseMessage[] }> & {
 /** Factory for a minimal `agent → tools → END` graph wrapping the ToolNode. */
 function buildHITLGraph(
   toolNode: ToolNode,
-  toolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }>,
+  toolCalls: Array<{ id?: string; name: string; args: Record<string, unknown> }>,
   checkpointer = new MemorySaver()
 ): CompiledMessagesGraph {
   const toolCallIds = new Set(toolCalls.map((call) => call.id));
@@ -4152,11 +4152,12 @@ describe('Codex review fixes', () => {
   );
 
   it.each([
-    { direct: true, changedOwner: false }, { direct: false, changedOwner: false },
-    { direct: true, changedOwner: true }, { direct: false, changedOwner: true },
+    { direct: true, changedOwner: false, replaceIds: false }, { direct: false, changedOwner: false, replaceIds: false },
+    { direct: true, changedOwner: true, replaceIds: false }, { direct: false, changedOwner: true, replaceIds: false },
+    { direct: true, changedOwner: true, replaceIds: true }, { direct: false, changedOwner: true, replaceIds: true },
   ])(
-    'restores a rewritten approval with fresh instances (direct=$direct, changedOwner=$changedOwner)',
-    async ({ direct, changedOwner }) => {
+    'restores a rewritten approval with fresh instances (direct=$direct, changedOwner=$changedOwner, replaceIds=$replaceIds)',
+    async ({ direct, changedOwner, replaceIds }) => {
       const checkpointer = new MemorySaver();
       const executed: string[] = [];
       const echo = tool(async ({ command }) => {
@@ -4226,7 +4227,14 @@ describe('Codex review fixes', () => {
       expect(executed).toEqual([]);
       const restored = await create(undefined, changedOwner ? 'different-agent' : 'a');
       if (changedOwner) {
-        await expect(restored.resume([{ type: 'reject' }], config)).rejects.toThrow('Tool approval execution owner changed');
+        const tuple = await checkpointer.getTuple(config);
+        const messages = tuple?.checkpoint.channel_values.messages as BaseMessage[];
+        const assistant = messages.find((message) => message.getType() === 'ai');
+        await expect(restored.resume([{ type: 'reject' }], config, undefined, replaceIds ? {
+          update: { messages: [new AIMessage({ id: assistant?.id, content: '', tool_calls: [
+            { id: 'replacement', name: 'echo', args: { command: 'unreviewed' } },
+          ] })] },
+        } : undefined)).rejects.toThrow('Tool approval execution owner changed');
         expect(executed).toEqual([]);
         return;
       }
@@ -4234,6 +4242,48 @@ describe('Codex review fixes', () => {
       expect(executed).toEqual(['reviewed']);
     }
   );
+
+  it.each([false, true])('preserves ID-less successes beside a rejected approval (mixed=%s)', async (mixed) => {
+    let executions = 0;
+    const work = tool(async () => { executions += 1; return `completed-${executions}`; }, {
+      name: 'work', description: 'work', schema: z.object({}),
+    });
+    const ask = tool(async () => 'approved', { name: 'ask', description: 'ask', schema: z.object({}) });
+    const checkpointer = new MemorySaver();
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', { hooks: [async (input) => ({ decision: input.toolName === 'ask' ? 'ask' : 'allow' })] });
+    const { Run } = await import('@/run');
+    const makeRun = async (hooks?: HookRegistry) => {
+      const run = await Run.create<t.IState>({
+        runId: `idless-${mixed}`,
+        graphConfig: { type: 'standard', agents: [{
+          agentId: 'a', provider: providers.OPENAI,
+          clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+          instructions: 'noop', maxContextTokens: 8000,
+        }], compileOptions: { checkpointer } },
+        humanInTheLoop: { enabled: true }, hooks,
+      });
+      const graph = buildHITLGraph(new ToolNode({
+        tools: [work, ask], agentId: 'a', eventDrivenMode: mixed,
+        directToolNames: new Set(['work']), hookRegistry: hooks,
+        toolCallStepIds: new Map([['ask', 'ask-step']]),
+        humanInTheLoop: { enabled: true },
+      }), [{ name: 'work', args: {} }, { name: 'work', args: {} }, { id: 'ask', name: 'ask', args: {} }], checkpointer);
+      run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+      return { run, graph };
+    };
+    const config = { configurable: { thread_id: `idless-${mixed}` }, version: 'v2' as const };
+    const original = await makeRun(registry);
+    await original.run.processStream({ messages: [] }, config);
+    expect(original.run.getInterrupt()?.payload).toMatchObject({ type: 'tool_approval' });
+    expect(executions).toBe(2);
+    const fresh = await makeRun();
+    await fresh.run.resume([{ type: 'reject' }], config);
+    const result = await fresh.graph.getState?.(config);
+    expect(executions).toBe(2);
+    expect(JSON.stringify(result)).toContain('completed-1');
+    expect(JSON.stringify(result)).toContain('completed-2');
+  });
 
   it('forwards child review evidence without blocking an unrelated parent sibling', async () => {
     const receivedConfigurables: Array<Record<string, unknown> | undefined> =

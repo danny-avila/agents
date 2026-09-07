@@ -24,7 +24,9 @@ allowed action or repeat a sibling whose completed result was checkpointed.
    subagent adapter rebinds evidence from the manifest's proven source scope
    into that destination, including durable pending writes that have not yet
    been consumed. Each child restores its own pending evidence. Unrelated child
-   and parent scopes are unchanged; a mismatched executing owner fails closed.
+   and parent scopes are unchanged. A foreign owner is accepted only as transit
+   through a trusted child tool, a matching parent batch record, and a validated
+   descendant manifest; changing tool-call IDs cannot bypass ownership checks.
 7. Completed batches release their process-local acceleration cache. That cache
    is not the durable source of truth: selecting a checkpoint replaces any
    newer local result for that batch, including when the checkpoint is empty.
@@ -34,9 +36,15 @@ allowed action or repeat a sibling whose completed result was checkpointed.
    turn entries are not copied into the active batch's checkpoint.
 9. Batch identity binds the assistant message and tool proposals, not transcript
    length: additional resume messages cannot repeat completed work. The
-   pre-batch output-reference snapshot and turn counter are restored before
-   resolution. Cached messages are rebound to the active reference scope;
-   completed siblings cannot change what pending siblings originally resolved.
+   pre-batch output-reference snapshot is a frozen input view, distinct from
+   the graph's shared live registry. Replay retains its original batch turn
+   without lowering the shared counter or discarding concurrent outputs.
+   Cached messages are rebound to the active reference scope; completed siblings
+   cannot change what pending siblings originally resolved. Current reference
+   size limits also apply to the frozen view.
+10. Direct calls without IDs use their original proposal position in the private
+    completion record. Filtering completed named calls cannot shift that identity;
+    successful ID-less outputs survive pauses without repeating their side effects.
 
 The private checkpoint record is versioned. Its codec preserves LangChain
 messages; Command outputs are reconstructed before graph execution. Malformed

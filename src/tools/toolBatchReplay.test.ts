@@ -26,6 +26,12 @@ const approval = {
 };
 
 describe('checkpoint-owned tool batch replay', () => {
+  it('does not downgrade a versioned approval with a missing owner to legacy evidence', () => {
+    expect(() => restoreToolReplayConfig({}, 'interrupt', {
+      ...approval, [TOOL_BATCH_REPLAY_KEY]: { version: 1, records: [] },
+    })).toThrow('Invalid tool approval checkpoint');
+    expect(() => restoreToolReplayConfig({}, 'interrupt', approval)).not.toThrow();
+  });
   it('durably rebinds only the proven owner across consecutive unconsumed forks', async () => {
     const owner = JSON.stringify(['source', '', 'agent']);
     const batch = JSON.stringify(['source', 'assistant', 'proposal']);

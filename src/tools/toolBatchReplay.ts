@@ -8,6 +8,7 @@ import {
   isToolNodeResumeState,
   isToolOutputReferenceState,
   stripSubagentResumeManifest,
+  requireValidSubagentResumeManifest,
 } from '@/tools/subagent/SubagentReplay';
 import { isToolApprovalInterrupt } from '@/types/hitl';
 import { TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from '@/hooks/types';
@@ -74,7 +75,8 @@ export function restoreToolReplayConfig(
     publicPayload,
     state?.approvalOwner
   );
-  if (isToolApprovalInterrupt(publicPayload) && review == null) {
+  if (isToolApprovalInterrupt(publicPayload) &&
+    (review == null || (state != null && state.approvalOwner == null))) {
     throw new Error('Invalid tool approval checkpoint');
   }
   if (state != null) {
@@ -105,6 +107,25 @@ export function getToolBatchReplayScope(
     config.configurable?.[TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY] ??
     config.configurable?.thread_id;
   return typeof scope === 'string' && scope.length > 0 ? scope : undefined;
+}
+
+/** Foreign approval evidence may only transit a checkpoint-proven child path. */
+export function isChildToolApprovalOwner(
+  config: RunnableConfig,
+  owner: string,
+  trustedParentCallIds: ReadonlySet<string>
+): boolean {
+  const manifest = requireValidSubagentResumeManifest(config.configurable);
+  if (manifest == null || trustedParentCallIds.size === 0) return false;
+  const identity: unknown = JSON.parse(owner);
+  if (!Array.isArray(identity) || identity.length !== 3 || identity[1] !== '') return false;
+  const pending = manifest.executions.filter((execution) => trustedParentCallIds.has(execution.parentToolCallId));
+  while (pending.length > 0) {
+    const execution = pending.pop()!;
+    if (execution.approvalExecutionScope === identity[0]) return true;
+    pending.push(...(execution.descendant?.executions ?? []));
+  }
+  return false;
 }
 
 /** Rebind only the checkpoint-proven source execution when a child fork is created. */
