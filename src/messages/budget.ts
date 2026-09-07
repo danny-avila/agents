@@ -261,7 +261,7 @@ function takeUserToolResultName(
 
 /** Counts retained tool exchanges without serializing arguments or result content. */
 export interface ToolMessageUsageAccumulator {
-  add(message: BaseMessage, rawTokens: number): void;
+  add(message: BaseMessage, getRawTokens: () => number): void;
   finish(
     calibrationRatio?: number
   ): Pick<
@@ -290,21 +290,21 @@ export function createToolMessageUsageAccumulator(
     resultTotal = addRaw(resultTotal, tokens);
   };
 
-  const add = (message: BaseMessage, rawTokens: number): void => {
-    const tokens = safeRawCount(rawTokens);
+  const add = (message: BaseMessage, getRawTokens: () => number): void => {
+    const readTokens = (): number => safeRawCount(getRawTokens());
     const role = getProviderMessageRole(message, provider);
     if (role === 'assistant') {
       const scan = scanInvocation(message, calls, provider);
       pendingLegacyName = readLegacyFunctionName(message);
       if (scan.recognizedCalls > 0 && scan.toolOnly) {
-        total = addRaw(total, tokens);
+        total = addRaw(total, readTokens());
       }
       return;
     }
     if (role === 'tool' || role === 'function') {
       const legacyName = role === 'function' ? pendingLegacyName : undefined;
       countResult(
-        tokens,
+        readTokens(),
         getToolMessageResultName(message, calls, legacyName, provider)
       );
       if (role === 'function') {
@@ -313,13 +313,13 @@ export function createToolMessageUsageAccumulator(
       return;
     }
     if (role === 'user' && isFoldedToolHistory(message)) {
-      total = addRaw(total, tokens);
+      total = addRaw(total, readTokens());
       return;
     }
     const userResultName =
       role === 'user' ? takeUserToolResultName(message, calls) : undefined;
     if (userResultName != null) {
-      countResult(tokens, userResultName);
+      countResult(readTokens(), userResultName);
       return;
     }
     if (role === 'user') {
@@ -366,7 +366,7 @@ function computeToolMessageUsage(
 > {
   const accumulator = createToolMessageUsageAccumulator(provider);
   for (const message of context) {
-    accumulator.add(message, tokenCounter(message));
+    accumulator.add(message, () => tokenCounter(message));
   }
   return accumulator.finish(calibrationRatio);
 }

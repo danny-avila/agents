@@ -49,23 +49,43 @@ describe('createContextPressureMeter', () => {
       toolMessageTokenCounts: undefined,
     });
     expect(meter.measure(projected).projectedMessageTokens).toBe(33);
-    /** Tool-share attribution needs raw local counts for every retained
-     *  message; the changed projection also recounts its baseline subtrahend. */
-    expect(tokenCounter).toHaveBeenCalledTimes(3);
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
   });
 
-  it('reuses stable exact counts across request-scoped meters', () => {
+  it('does not recount unchanged rich content for tool attribution', () => {
+    const retained = new HumanMessage({
+      content: [{ type: 'text', text: 'rich retained content' }],
+    });
+    const tokenCounter = jest.fn(contentLength);
+    const meter = createContextPressureMeter({
+      tokenCounter,
+      sourceMessages: [retained],
+      retainedMessages: [retained],
+      indexTokenCountMap: { 0: 20 },
+      contextUsage: {
+        contextBudget: 100,
+        effectiveInstructionTokens: 10,
+        remainingContextTokens: 70,
+        calibrationRatio: 1,
+      },
+      instructionTokens: 10,
+      calibrationRatio: 1,
+    });
+
+    expect(meter.measure([retained]).toolMessageTokens).toBe(0);
+    expect(tokenCounter).not.toHaveBeenCalled();
+  });
+
+  it('avoids recounting provider-grounded messages across meters', () => {
     const retained = Array.from(
       { length: 100 },
       (_, index) =>
         new HumanMessage({ id: `message-${index}`, content: 'retained' })
     );
     const tokenCounter = jest.fn(contentLength);
-    const tokenCountCache = createExactTokenCountCache(tokenCounter);
     const createMeter = (messages: BaseMessage[]) =>
       createContextPressureMeter({
         tokenCounter,
-        tokenCountCache,
         sourceMessages: messages,
         retainedMessages: messages,
         indexTokenCountMap: Object.fromEntries(
@@ -87,7 +107,7 @@ describe('createContextPressureMeter', () => {
     const appended = [...retained, new HumanMessage('new')];
     createMeter(appended).measure(appended);
 
-    expect(tokenCounter).toHaveBeenCalledTimes(101);
+    expect(tokenCounter).not.toHaveBeenCalled();
   });
 
   it('reuses exact counts across request-scoped meters when no stored counts exist', () => {
@@ -286,7 +306,7 @@ describe('createContextPressureMeter', () => {
       ]);
     }
 
-    expect(tokenCounter).toHaveBeenCalledTimes(113);
+    expect(tokenCounter).toHaveBeenCalledTimes(13);
   });
 
   it('uses a conservative ratio for fallback payloads', () => {

@@ -387,12 +387,15 @@ export function createContextPressureMeter({
         : undefined;
     const toolUsage = createToolMessageUsageAccumulator(provider);
     const toolUsageState: { error?: Error } = {};
-    const addToolUsage = (message: BaseMessage, rawTokens: number): void => {
+    const addToolUsage = (
+      message: BaseMessage,
+      getRawTokens: () => number
+    ): void => {
       if (toolUsageState.error != null) {
         return;
       }
       try {
-        toolUsage.add(message, rawTokens);
+        toolUsage.add(message, getRawTokens);
       } catch (error) {
         toolUsageState.error =
           error instanceof Error ? error : new Error(String(error));
@@ -439,17 +442,18 @@ export function createContextPressureMeter({
       const usedOrigins = new Set<number>();
       for (const message of messages) {
         const origin = origins.get(message);
-        const rawTokens = count(message);
-        addToolUsage(message, rawTokens);
+        let rawTokens: number | undefined;
+        const getRawTokens = (): number => (rawTokens ??= count(message));
+        addToolUsage(message, getRawTokens);
         if (origin == null || usedOrigins.has(origin)) {
-          newRawTokens += rawTokens;
+          newRawTokens += getRawTokens();
           continue;
         }
         usedOrigins.add(origin);
         const projectionDelta =
           message === baseline[origin].message
             ? 0
-            : rawTokens - baseline[origin].rawTokens;
+            : getRawTokens() - baseline[origin].rawTokens;
         projectedMessageTokens += Math.max(
           0,
           attribution.attributedByOrigin[origin] +
@@ -461,7 +465,7 @@ export function createContextPressureMeter({
       let rawTokens = REPLY_PRIMER_TOKENS;
       for (const message of messages) {
         const messageTokens = count(message);
-        addToolUsage(message, messageTokens);
+        addToolUsage(message, () => messageTokens);
         rawTokens += messageTokens;
       }
       projectedMessageTokens = Math.round(rawTokens * usageRatio);
