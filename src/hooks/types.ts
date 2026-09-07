@@ -252,13 +252,16 @@ export interface PreCompactHookInput extends BaseHookInput {
   /**
    * What triggered compaction. Matches `SummarizationTrigger.type` from the
    * agent's summarization config. `'default'` means no trigger was
-   * configured and compaction fired because messages were pruned.
+   * configured and compaction fired because messages were pruned;
+   * `'manual'` means the host asked for the summary outright and no trigger
+   * was evaluated.
    */
   trigger:
     | 'token_ratio'
     | 'remaining_tokens'
     | 'messages_to_refine'
     | 'default'
+    | 'manual'
     | (string & {});
 }
 

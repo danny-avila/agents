@@ -779,3 +779,52 @@ describe('shapeLangfuseSpan', () => {
     expect(span.attributes[DEPRECATED_TRACE_INPUT]).toBeUndefined();
   });
 });
+
+describe('shapeLangfuseSpan summarize-only output', () => {
+  it('reports the manual summary as the root output when no assistant replied', () => {
+    /** A summarize-only run ends with the retained tail (or nothing) in
+     *  state and no assistant message; the summary is its answer. */
+    const span = createSpan('LibreChat Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+      [INPUT]: JSON.stringify({
+        messages: [{ type: 'human', content: 'Compact this conversation' }],
+      }),
+      [OUTPUT]: JSON.stringify({
+        messages: [],
+        manualSummary: 'CHECKPOINT: the user asked about ClickHouse.',
+      }),
+    });
+    shapeLangfuseSpan(span);
+    expect(span.attributes[OUTPUT]).toBe(
+      'CHECKPOINT: the user asked about ClickHouse.'
+    );
+  });
+
+  it('prefers the summary over an older reply the run retained', () => {
+    /** With an explicit recency window the tail stays in state, so the last
+     *  assistant message is history, not the compaction's result. */
+    const span = createSpan('LibreChat Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+      [INPUT]: JSON.stringify({ messages: [{ type: 'human', content: 'hi' }] }),
+      [OUTPUT]: JSON.stringify({
+        messages: [{ type: 'ai', content: 'An older retained reply.' }],
+        manualSummary: 'CHECKPOINT: the compaction result.',
+      }),
+    });
+    shapeLangfuseSpan(span);
+    expect(span.attributes[OUTPUT]).toBe('CHECKPOINT: the compaction result.');
+  });
+
+  it('ignores an empty summary channel', () => {
+    const span = createSpan('LibreChat Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+      [INPUT]: JSON.stringify({ messages: [{ type: 'human', content: 'hi' }] }),
+      [OUTPUT]: JSON.stringify({
+        messages: [{ type: 'ai', content: 'A real answer.' }],
+        manualSummary: '   ',
+      }),
+    });
+    shapeLangfuseSpan(span);
+    expect(span.attributes[OUTPUT]).toBe('A real answer.');
+  });
+});

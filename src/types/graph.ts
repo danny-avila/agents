@@ -81,6 +81,13 @@ export type SystemCallbacks = {
 export type BaseGraphState = {
   messages: BaseMessage[];
   runStepState?: RunStepResumeState;
+  /**
+   * The summary a summarize-only run produced. Kept in state because such a
+   * run has no assistant reply: trace roots report it as the run's output
+   * instead of the retained tail or the raw state. Empty once any later run
+   * on the same checkpointed thread starts, so it never outlives its run.
+   */
+  manualSummary?: string;
 };
 
 export type AgentSubgraphState = BaseGraphState & {
@@ -906,6 +913,19 @@ interface AgentInputFields {
    */
   discoveredTools?: string[];
   summarizationEnabled?: boolean;
+  /**
+   * Runs this agent as a summarize-only pass: the first model step requests
+   * summarization outright instead of consulting the trigger, and the step
+   * after the summary emits its context snapshot and ends the run without a
+   * model call. Hosts use it for user-initiated compaction, where the summary
+   * is the whole response. Requires `summarizationEnabled`: a run that cannot
+   * attempt the summary rejects with `ManualSummarizationSkippedError`
+   * rather than ending with nothing, and one whose provider calls all fail
+   * keeps the history and reports the failure on the summary step. A
+   * multi-agent workflow compiles to the agent that opted in alone; no other
+   * agent runs.
+   */
+  summarizeOnly?: boolean;
   summarizationConfig?: SummarizationConfig;
   /**
    * Optional host-supplied, user-visible guidance for compaction. The SDK

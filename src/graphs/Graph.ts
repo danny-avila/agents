@@ -165,12 +165,15 @@ import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { initializeLangfuseTracing } from '@/instrumentation';
-import { shouldTriggerSummarization } from '@/summarization';
+import {
+  ManualSummarizationSkippedError,
+  shouldTriggerSummarization,
+} from '@/summarization';
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
+import { createRemoveAllMessage, messagesStateReducer  } from '@/messages/reducer';
 import { getTruncationStopReason } from '@/llm/truncation';
-import { messagesStateReducer } from '@/messages/reducer';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -1472,6 +1475,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   outputTruncatedIncomplete = false;
   /**
+   * The agent a summarize-only run summarizes with. Set from the first agent
+   * input that opted in; while set, the model step after the summary routes
+   * to END, and a multi-agent workflow compiles to this agent alone.
+   */
+  summarizeOnlyAgentId?: string;
+  /**
    * `stopReason` from a `PreemptBoundary` hook that halted the turn.
    *
    * Clearing the registry halt is what keeps the sealed turn alive, but the
@@ -1559,6 +1568,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         indexTokenCountMap,
         toolExecution
       );
+      if (agentConfig.summarizeOnly === true) {
+        this.summarizeOnlyAgentId ??= agentContext.agentId;
+      }
       if (calibrationRatio != null && calibrationRatio > 0) {
         agentContext.calibrationRatio = calibrationRatio;
       }
@@ -1581,7 +1593,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.agentContexts.set(agentConfig.agentId, agentContext);
     }
 
-    this.defaultAgentId = agents[0].agentId;
+    /** The run's agent: root trace identity and Langfuse routing follow it,
+     *  so a summarize-only run is attributed to the agent that summarizes. */
+    this.defaultAgentId = this.summarizeOnlyAgentId ?? agents[0].agentId;
+  }
+
+  /**
+   * A compaction applies its remove-all inside the agent subgraph, so the
+   * subgraph's result carries only the retained tail, and an outer reducer
+   * would merge that tail back into the history it already holds. Re-issuing
+   * the remove-all across the boundary keeps a checkpointed outer state as
+   * compacted as the subgraph's. A run that produced no summary changed
+   * nothing and passes through.
+   */
+  protected propagateManualCompaction<
+    S extends { messages: BaseMessage[]; manualSummary?: string },
+  >(result: S): S {
+    if (
+      this.summarizeOnlyAgentId == null ||
+      result.manualSummary == null ||
+      result.manualSummary.length === 0
+    ) {
+      return result;
+    }
+    return { ...result, messages: [createRemoveAllMessage(), ...result.messages] };
   }
 
   /** Rotates the Langfuse identities that must never cross fresh executions. */
@@ -3093,6 +3128,79 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     });
   }
 
+  /**
+   * The two model steps of a summarize-only run, neither of which calls the
+   * model. The first requests the summary outright — no trigger consulted,
+   * because the user asked for it — and the second, entered after the
+   * summarize node, dispatches the post-summary usage snapshot (the host's
+   * gauge and summary baseline read it) and ends the run. Returns `null`
+   * for every other run so the ordinary step proceeds.
+   */
+  private async summarizeOnlyStep({
+    agentContext,
+    agentId,
+    messageCount,
+    contextUsage,
+    config,
+  }: {
+    agentContext: AgentContext;
+    agentId: string;
+    messageCount: number;
+    contextUsage: t.ContextUsageEvent | null;
+    config: RunnableConfig;
+  }): Promise<Partial<t.AgentSubgraphState> | null> {
+    if (agentContext.summarizeOnly !== true) {
+      return null;
+    }
+    const meta = { runId: this.runId, agentId };
+    if (agentContext.claimManualSummarization()) {
+      if (agentContext.summarizationEnabled !== true) {
+        throw new ManualSummarizationSkippedError(
+          'disabled',
+          'Compaction skipped: summarization is not enabled for this agent'
+        );
+      }
+      emitAgentLog(
+        config,
+        'info',
+        'graph',
+        'Manual summarization requested',
+        {
+          totalMessages: messageCount,
+          summaryVersion: agentContext.summaryVersion + 1,
+        },
+        meta
+      );
+      agentContext.markSummarizationTriggered(messageCount);
+      return {
+        summarizationRequest: {
+          remainingContextTokens: contextUsage?.remainingContextTokens ?? 0,
+          agentId: agentId || agentContext.agentId,
+          reason: 'manual',
+        },
+        /** A checkpointed thread may still hold the previous compaction's
+         *  summary; only the one this run produces may be reported. */
+        manualSummary: '',
+      };
+    }
+    if (contextUsage != null) {
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_CONTEXT_USAGE,
+        contextUsage,
+        config
+      );
+    }
+    emitAgentLog(
+      config,
+      'debug',
+      'graph',
+      'Summarize-only run complete — ending without a model call',
+      { summaryVersion: agentContext.summaryVersion },
+      meta
+    );
+    return { messages: [] };
+  }
+
   createCallModel(agentId = 'default') {
     return async (
       state: t.AgentSubgraphState,
@@ -3148,35 +3256,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const discoveredNames = extractToolDiscoveries(messages);
       if (discoveredNames.length > 0) {
         agentContext.markToolsAsDiscovered(discoveredNames);
-      }
-
-      /**
-       * Anthropic prompt-cache breakpoint on the tool definitions.
-       *
-       * Without this, the (often static) tool inventory shows up as
-       * fresh input on every turn — measured at ~28k tokens/turn for
-       * the local engine's coding-tool bundle, dominating per-turn
-       * cost even when message-level caching is on.
-       *
-       * Strategy: partition tools into [static, deferred] and stamp
-       * `cache_control: ephemeral` on the last static tool.
-       * Discovered deferred tools that arrive across turns sit *after*
-       * the breakpoint and don't invalidate the prefix.
-       */
-      const toolsForBinding = this.getPreparedToolsForBinding(agentContext);
-
-      let model =
-        this.overrideModel ??
-        initializeModel({
-          tools: toolsForBinding,
-          provider: agentContext.provider,
-          clientOptions: agentContext.clientOptions,
-        });
-
-      if (agentContext.systemRunnable) {
-        model = agentContext.systemRunnable
-          .pipe(model as Runnable)
-          .withConfig({ runName: AGENT_MODEL_CALL_RUN_NAME });
       }
 
       if (agentContext.tokenCalculationPromise) {
@@ -3316,6 +3395,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         };
         syncBudgetDerivedFields(contextUsage);
 
+        const summarizeOnlyStep = await this.summarizeOnlyStep({
+          agentContext,
+          agentId,
+          messageCount: messages.length,
+          contextUsage,
+          config,
+        });
+        if (summarizeOnlyStep != null) {
+          return summarizeOnlyStep;
+        }
+
         const hasPrunedMessages =
           agentContext.summarizationEnabled === true &&
           Array.isArray(messagesToRefine) &&
@@ -3388,6 +3478,52 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             );
           }
         }
+      } else {
+        /** No pruner (no token counter or budget): the summarize-only run
+         *  still has to request its summary and stop, just without usage. */
+        const summarizeOnlyStep = await this.summarizeOnlyStep({
+          agentContext,
+          agentId,
+          messageCount: messages.length,
+          contextUsage: null,
+          config,
+        });
+        if (summarizeOnlyStep != null) {
+          return summarizeOnlyStep;
+        }
+      }
+
+      /**
+       * Anthropic prompt-cache breakpoint on the tool definitions.
+       *
+       * Without this, the (often static) tool inventory shows up as
+       * fresh input on every turn — measured at ~28k tokens/turn for
+       * the local engine's coding-tool bundle, dominating per-turn
+       * cost even when message-level caching is on.
+       *
+       * Strategy: partition tools into [static, deferred] and stamp
+       * `cache_control: ephemeral` on the last static tool.
+       * Discovered deferred tools that arrive across turns sit *after*
+       * the breakpoint and don't invalidate the prefix.
+       *
+       * Built only once a model call is certain: a summarize-only step
+       * returns above without one, and must not fail on a primary model
+       * it never invokes.
+       */
+      const toolsForBinding = this.getPreparedToolsForBinding(agentContext);
+
+      let model =
+        this.overrideModel ??
+        initializeModel({
+          tools: toolsForBinding,
+          provider: agentContext.provider,
+          clientOptions: agentContext.clientOptions,
+        });
+
+      if (agentContext.systemRunnable) {
+        model = agentContext.systemRunnable
+          .pipe(model as Runnable)
+          .withConfig({ runName: AGENT_MODEL_CALL_RUN_NAME });
       }
 
       let finalMessages = messagesToUse;
@@ -5142,7 +5278,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.config = config;
       this.restoreRunStepResumeState(state.runStepState);
       const result = await invoke();
-      return { ...result, runStepState: this.createRunStepResumeState() };
+      /** An ordinary run on a checkpointed thread inherits the last
+       *  compaction's summary in state; it is not this run's output. */
+      const clearsManualSummary =
+        this.summarizeOnlyAgentId == null &&
+        typeof state.manualSummary === 'string' &&
+        state.manualSummary.length > 0;
+      return {
+        ...result,
+        ...(clearsManualSummary ? { manualSummary: '' } : {}),
+        runStepState: this.createRunStepResumeState(),
+      };
     };
 
     const routeMessage = (
@@ -5160,6 +5306,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
       if (state.summarizationRequest != null) {
         return summarizeNode;
+      }
+      /** A summarize-only run never calls the model, so the step after the
+       *  summary has nothing to route: the summary itself is the result. */
+      if (this.summarizeOnlyAgentId != null) {
+        return END;
       }
       const decision = toolsCondition(
         state as t.BaseGraphState,
@@ -5197,6 +5348,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           _: t.SummarizationNodeInput | undefined,
           b: t.SummarizationNodeInput | undefined
         ) => b,
+        default: () => undefined,
+      }),
+      manualSummary: Annotation<string | undefined>({
+        reducer: (_: string | undefined, b: string | undefined) => b,
         default: () => undefined,
       }),
       runStepState: this.createRunStepStateAnnotation(),
@@ -5408,15 +5563,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         },
         default: () => [],
       }),
+      /** Surfaced from the agent subgraph on a summarize-only run. */
+      manualSummary: Annotation<string | undefined>({
+        reducer: (_: string | undefined, b: string | undefined) => b,
+        default: () => undefined,
+      }),
       runStepState: this.createRunStepStateAnnotation(),
     });
+    const compactingAgentNode = async (
+      state: t.AgentSubgraphState,
+      config?: RunnableConfig
+    ): Promise<Partial<t.AgentSubgraphState>> =>
+      this.propagateManualCompaction(await agentNode.invoke(state, config));
     const workflow = new StateGraph(StateAnnotation)
       .addNode(
         this.defaultAgentId,
-        agentNode as Runnable<
-          t.AgentSubgraphState,
-          Partial<t.AgentSubgraphState>
-        >,
+        this.summarizeOnlyAgentId != null
+          ? compactingAgentNode
+          : (agentNode as Runnable<
+              t.AgentSubgraphState,
+              Partial<t.AgentSubgraphState>
+            >),
         { ends: [END] }
       )
       .addEdge(START, this.defaultAgentId);

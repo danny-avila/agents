@@ -1584,11 +1584,17 @@ export class Run<_T extends t.BaseGraphState> {
           }).catch((): undefined => undefined);
         }
 
+        /** A summarize-only run is complete once its summary exists: there
+         *  is no assistant reply for a Stop hook to demand, and its one
+         *  summarization claim is spent, so it admits no continuation. */
+        const continuationAdmissible = graph.summarizeOnlyAgentId == null;
         if (this.hookRegistry?.hasHookFor('StopFinalize', this.id) === true) {
           const stopInjected =
             stopResult == null ? [] : materializeStopContinuation(stopResult);
           const continuationPrevented =
-            stopReason != null || stopResult?.preventContinuation === true;
+            !continuationAdmissible ||
+            stopReason != null ||
+            stopResult?.preventContinuation === true;
           const finalized = await executeHooks({
             registry: this.hookRegistry,
             input: {
@@ -1622,7 +1628,9 @@ export class Run<_T extends t.BaseGraphState> {
         }
 
         const requestsContinuation =
-          stopReason == null && stopResult?.stopDecision === 'block';
+          continuationAdmissible &&
+          stopReason == null &&
+          stopResult?.stopDecision === 'block';
         if (requestsContinuation && stopResult != null) {
           const injected = materializeStopContinuation(stopResult);
           if (injected.length > 0) {
