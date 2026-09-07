@@ -599,6 +599,17 @@ describe('provider tool-result pairing index', () => {
     expect(consumeProviderToolResultPair(result(), calls)).toBe(false);
   });
 
+  it('deduplicates three equivalent wire representations and consumes once', () => {
+    const calls: ProviderToolCallIndex = new Map();
+    appendProviderToolCallDescriptor(calls, call('ai_tool_calls'));
+    appendProviderToolCallDescriptor(calls, call('raw_tool_calls'));
+    appendProviderToolCallDescriptor(calls, call('tool_call'));
+
+    expect(calls.get('call-id')).not.toBeNull();
+    expect(consumeProviderToolResultPair(result(), calls)).toBe(true);
+    expect(consumeProviderToolResultPair(result(), calls)).toBe(false);
+  });
+
   it('marks same-representation duplicates and conflicts ambiguous', () => {
     const duplicateCalls: ProviderToolCallIndex = new Map();
     appendProviderToolCallDescriptor(duplicateCalls, call('tool_call'));

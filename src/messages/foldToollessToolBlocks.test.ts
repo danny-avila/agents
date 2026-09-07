@@ -13,6 +13,7 @@ import {
 } from './format';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { toLangChainContent } from './langchain';
+import { Providers } from '@/common';
 
 /** Concatenated text across a message's content (string or structured array). */
 function getTextContent(msg: {
@@ -419,6 +420,14 @@ describe('foldToolBlocksForToollessAgent', () => {
             },
           },
         ]),
+        tool_calls: [
+          {
+            id: 'srvtoolu_1',
+            name: 'web_search',
+            args: { query: 'retained' },
+            type: 'tool_call',
+          },
+        ],
       }),
     ];
 
@@ -430,6 +439,7 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(isSyntheticProviderContextMessage(result[0])).toBe(true);
     expect(getTextContent(result[0])).toContain('server_tool_use');
     expect(getTextContent(result[0])).toContain('web_search_tool_result');
+    expect(getTextContent(result[0])).not.toContain('[tool_call]');
   });
 
   test('preserves authorship in mixed server-tool assistant turns', () => {
@@ -470,6 +480,54 @@ describe('foldToolBlocksForToollessAgent', () => {
 
     expect(result).not.toBe(messages);
     expect(getTextContent(result[0])).toContain('AI: [executableCode]');
+  });
+
+  test('folds oversized standard tool-result arrays', () => {
+    const content = Array.from({ length: 257 }, (_, index) => ({
+      type: 'text',
+      text: `result-${index}`,
+    }));
+    const messages = [
+      new HumanMessage({
+        content: [{ type: 'tool_result', tool_use_id: 'call-1', content }],
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(result).not.toBe(messages);
+    expect(result[0]).toBeInstanceOf(HumanMessage);
+    expect(isSyntheticProviderContextMessage(result[0])).toBe(true);
+  });
+
+  test('preserves native OpenAI server-tool turns without bound client tools', () => {
+    const messages = [
+      new AIMessage({
+        content: [
+          {
+            type: 'server_tool_call',
+            id: 'server-1',
+            name: 'code_interpreter',
+            args: { code: 'print(2 + 2)' },
+          },
+          {
+            type: 'server_tool_call_result',
+            toolCallId: 'server-1',
+            status: 'success',
+            output: { stdout: '4' },
+          },
+          { type: 'text', text: 'The result is 4.' },
+        ],
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(
+      messages,
+      undefined,
+      Providers.OPENAI
+    );
+
+    expect(result).toBe(messages);
   });
 
   test('detects v1 standard-content tool_call blocks (no AIMessage.tool_calls)', () => {

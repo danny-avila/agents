@@ -3671,7 +3671,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const before = transformed;
           transformed = trackProviderMessageOrigins(
             before,
-            foldToolBlocksForToollessAgent(before, config)
+            foldToolBlocksForToollessAgent(
+              before,
+              config,
+              agentContext.provider
+            )
           );
           if (agentContext.useLegacyContent) {
             const beforeLegacyFormat = transformed;

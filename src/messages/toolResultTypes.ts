@@ -33,7 +33,7 @@ export interface ProviderToolResultPartDescriptor {
 
 export interface ProviderToolCallIndexEntry {
   readonly descriptor: ProviderToolCallPartDescriptor;
-  secondarySourceType?: string;
+  secondarySourceTypes?: Set<string>;
 }
 
 export type ProviderToolCallIndex = Map<
@@ -753,6 +753,33 @@ export function getProviderToolResultPartDescriptor(
   return undefined;
 }
 
+const PROVIDER_TOOL_CALL_CONTENT_TYPES: ReadonlySet<string> = new Set([
+  'tool_call',
+  'tool_use',
+  'server_tool_use',
+  'mcp_tool_use',
+  'server_tool_call',
+  'toolCall',
+  'toolUse',
+  'executableCode',
+]);
+
+export function isProviderToolCallContentPart(part: unknown): boolean {
+  const record = getRecord(part);
+  const type = record == null ? undefined : readString(record, 'type');
+  return type != null && PROVIDER_TOOL_CALL_CONTENT_TYPES.has(type);
+}
+
+export function isProviderToolContentPart(part: unknown): boolean {
+  const record = getRecord(part);
+  const type = record == null ? undefined : readString(record, 'type');
+  return (
+    type != null &&
+    (PROVIDER_TOOL_CALL_CONTENT_TYPES.has(type) ||
+      TOOL_RESULT_ENVELOPE_FIELDS[type] != null)
+  );
+}
+
 function optionalName(
   record: Record<string, unknown>
 ): { readonly name?: string } | undefined {
@@ -1071,17 +1098,16 @@ export function appendProviderToolCallDescriptor(
   if (existing === null) {
     return;
   }
-  const isDualRepresentation =
-    existing.secondarySourceType == null &&
-    existing.descriptor.sourceType !== descriptor.sourceType &&
-    (existing.descriptor.sourceType === 'ai_tool_calls' ||
-      descriptor.sourceType === 'ai_tool_calls');
-  if (
+  const sourceTypes =
+    existing.secondarySourceTypes ??
+    new Set<string>([existing.descriptor.sourceType]);
+  const isEquivalentRepresentation =
     existing.descriptor.kind === descriptor.kind &&
     existing.descriptor.name === descriptor.name &&
-    isDualRepresentation
-  ) {
-    existing.secondarySourceType = descriptor.sourceType;
+    !sourceTypes.has(descriptor.sourceType);
+  if (isEquivalentRepresentation) {
+    sourceTypes.add(descriptor.sourceType);
+    existing.secondarySourceTypes = sourceTypes;
     return;
   }
   index.set(descriptor.callId, null);

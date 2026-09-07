@@ -44,7 +44,8 @@ import {
   getProviderToolCallPartDescriptor,
   getProviderToolResultPartDescriptor,
   hasStructurallyValidAnthropicWebSearchResultContent,
-  isExecutableCodePart,
+  isProviderToolCallContentPart,
+  isProviderToolContentPart,
 } from './toolResultTypes';
 import {
   hasBijectiveProviderContentPartMapping,
@@ -3830,6 +3831,7 @@ function appendMessageContent(
       typeof blockTypeValue === 'string' ? blockTypeValue : undefined;
     const blockRole =
       getProviderToolResultPartDescriptor(block) != null ? 'Tool' : role;
+    hasToolUseBlock ||= isProviderToolCallContentPart(block);
 
     if (
       blockType !== 'tool_use' &&
@@ -4302,7 +4304,10 @@ export function ensureThinkingBlockInMessages(
  *  `toolUse` / `toolResult`). Missing the parent AI message is not just a
  *  passthrough: folding its ToolMessage alone would leave an orphan
  *  `assistant(tool_calls) -> user(...)` sequence. */
-function messageHasToolContent(msg: BaseMessage): boolean {
+function messageHasToolContent(
+  msg: BaseMessage,
+  provider?: ProviderName
+): boolean {
   if (isToolMessage(msg)) {
     return true;
   }
@@ -4315,16 +4320,26 @@ function messageHasToolContent(msg: BaseMessage): boolean {
     return true;
   }
   if (Array.isArray(msg.content)) {
+    let hasOpenAINativeServerContent = false;
     for (const block of msg.content as ExtendedMessageContent[]) {
+      const type = readFoldedDataProperty(block, 'type');
+      const isNativeOpenAIServerContent =
+        provider === Providers.OPENAI &&
+        (type === 'server_tool_call' ||
+          type === 'server_tool_call_result' ||
+          type === 'server_tool_result');
+      hasOpenAINativeServerContent ||= isNativeOpenAIServerContent;
       if (
         typeof block === 'object' &&
-        (getProviderToolCallPartDescriptor(block) != null ||
-          getProviderToolResultPartDescriptor(block) != null ||
-          isExecutableCodePart(block) ||
+        !isNativeOpenAIServerContent &&
+        (isProviderToolContentPart(block) ||
           readFoldedDataProperty(block, 'tool_call') != null)
       ) {
         return true;
       }
+    }
+    if (hasOpenAINativeServerContent) {
+      return false;
     }
   }
   return false;
@@ -4386,7 +4401,8 @@ function getFoldedMessageRole(msg: BaseMessage): 'AI' | 'Tool' {
  */
 export function foldToolBlocksForToollessAgent(
   messages: BaseMessage[],
-  config?: RunnableConfig
+  config?: RunnableConfig,
+  provider?: ProviderName
 ): BaseMessage[] {
   let result: BaseMessage[] | null = null;
   let foldedCount = 0;
@@ -4394,7 +4410,7 @@ export function foldToolBlocksForToollessAgent(
   let i = 0;
   while (i < messages.length) {
     const msg = messages[i];
-    if (!messageHasToolContent(msg)) {
+    if (!messageHasToolContent(msg, provider)) {
       result?.push(msg);
       i++;
       continue;
