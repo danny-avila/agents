@@ -1468,8 +1468,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   outputTruncatedIncomplete = false;
   /**
    * The agent a summarize-only run summarizes with. Set from the first agent
-   * input that opted in; while set, every other agent's model step is a
-   * no-op and the workflow drains to END after the summary.
+   * input that opted in; while set, the model step after the summary routes
+   * to END, and a multi-agent workflow compiles to this agent alone.
    */
   summarizeOnlyAgentId?: string;
   /**

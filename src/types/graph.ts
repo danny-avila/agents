@@ -921,9 +921,9 @@ interface AgentInputFields {
    * is the whole response. Requires `summarizationEnabled`: a run that cannot
    * attempt the summary rejects with `ManualSummarizationSkippedError`
    * rather than ending with nothing, and one whose provider calls all fail
-   * keeps the history and reports the failure on the summary step. In a
-   * multi-agent graph only the agent that opted in runs; every successor is
-   * a no-op.
+   * keeps the history and reports the failure on the summary step. A
+   * multi-agent workflow compiles to the agent that opted in alone; no other
+   * agent runs.
    */
   summarizeOnly?: boolean;
   summarizationConfig?: SummarizationConfig;
