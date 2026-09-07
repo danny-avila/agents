@@ -43,11 +43,11 @@ import {
   StreamLimitExceededError,
 } from '@/llm/streamLimits';
 import { GraphEvents, Providers, StepTypes } from '@/common';
+import * as eagerArgs from '@/tools/eagerEventExecution';
 import { ChatModelStreamHandler } from '@/stream';
 import { ToolNode } from '@/tools/ToolNode';
 import { HandlerRegistry } from '@/events';
 import * as events from '@/utils/events';
-import * as eagerArgs from '@/tools/eagerEventExecution';
 
 function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
   const runSteps = new Map<string, t.RunStep>();
