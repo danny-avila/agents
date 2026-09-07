@@ -3546,6 +3546,7 @@ interface FoldedSourceMessage {
    * string content or tool-call metadata contributed as a whole. */
   readonly retainedContentPartIndices?: ReadonlySet<number>;
   readonly mappingAmbiguous?: boolean;
+  readonly additionalAttributions?: readonly ProviderMessageAttribution[];
 }
 
 function getFoldedSourceAttribution(
@@ -3667,6 +3668,9 @@ function getSyntheticProviderContextProvenanceParts(
     if (parts.length === sourcePartStart) {
       parts.push({ attribution: fallbackAttribution });
     }
+    for (const attribution of source.additionalAttributions ?? []) {
+      parts.push({ attribution });
+    }
   }
   return mergeAdjacentProviderProvenanceParts(parts);
 }
@@ -3766,6 +3770,7 @@ const OPENAI_RESPONSES_SERVER_TOOL_TYPES: ReadonlySet<string> = new Set([
   'apply_patch_call_output',
   'code_interpreter_call',
   'computer_call',
+  'custom_tool_call',
   'file_search_call',
   'image_generation_call',
   'local_shell_call_output',
@@ -3777,9 +3782,14 @@ const OPENAI_RESPONSES_SERVER_TOOL_TYPES: ReadonlySet<string> = new Set([
   'web_search_call',
 ]);
 
+interface AuthoritativeResponsesToolOutput {
+  readonly output: readonly unknown[];
+  readonly preservesOrder: boolean;
+}
+
 function getAuthoritativeResponsesToolOutput(
   message: BaseMessage
-): readonly unknown[] | undefined {
+): AuthoritativeResponsesToolOutput | undefined {
   const responseOutput = getBoundedProviderPairingArrayProperty(
     message.response_metadata,
     'output'
@@ -3788,10 +3798,8 @@ function getAuthoritativeResponsesToolOutput(
     message.additional_kwargs,
     'tool_outputs'
   );
-  const output =
-    responseOutput != null && responseOutput.length > 0
-      ? responseOutput
-      : toolOutputs;
+  const preservesOrder = responseOutput != null && responseOutput.length > 0;
+  const output = preservesOrder ? responseOutput : toolOutputs;
   if (output == null || output.length === 0) {
     return undefined;
   }
@@ -3805,7 +3813,69 @@ function getAuthoritativeResponsesToolOutput(
       serverToolOutput.push(output[index]);
     }
   }
-  return serverToolOutput.length > 0 ? serverToolOutput : undefined;
+  if (serverToolOutput.length === 0) {
+    return undefined;
+  }
+  return {
+    output: preservesOrder ? output : serverToolOutput,
+    preservesOrder,
+  };
+}
+
+function appendOrderedResponsesOutput(
+  output: readonly unknown[],
+  textChunks: string[],
+  budget: FoldContextBudget
+): { contributed: boolean; complete: boolean } {
+  const remainingCharsBefore = budget.remainingChars;
+  let complete = true;
+  for (const item of output) {
+    if (!consumeFoldedWork(textChunks, budget)) {
+      complete = false;
+      break;
+    }
+    const type = readFoldedDataProperty(item, 'type');
+    if (type === 'message') {
+      const content = readFoldedDataProperty(item, 'content');
+      if (!Array.isArray(content)) {
+        continue;
+      }
+      for (const part of content) {
+        const partType = readFoldedDataProperty(part, 'type');
+        const value =
+          partType === 'refusal'
+            ? readFoldedDataProperty(part, 'refusal')
+            : readFoldedDataProperty(part, 'text');
+        if (typeof value === 'string' && value) {
+          appendFoldedLine(textChunks, budget, ['AI: ', value]);
+        }
+      }
+      continue;
+    }
+    if (type === 'function_call') {
+      const name = readFoldedDataProperty(item, 'name');
+      const args = readFoldedDataProperty(item, 'arguments');
+      appendFoldedLine(textChunks, budget, [
+        `AI: [tool_call] ${typeof name === 'string' ? name : ''}(`,
+        typeof args === 'string' ? args : serializeFoldedValue(args ?? {}),
+        ')',
+      ]);
+      continue;
+    }
+    if (
+      typeof type === 'string' &&
+      OPENAI_RESPONSES_SERVER_TOOL_TYPES.has(type)
+    ) {
+      appendFoldedLine(textChunks, budget, [
+        'AI: [server_tool_output] ',
+        serializeFoldedValue(item),
+      ]);
+    }
+  }
+  return {
+    contributed: budget.remainingChars < remainingCharsBefore,
+    complete,
+  };
 }
 
 /**
@@ -3827,6 +3897,21 @@ function appendMessageContent(
   budget: FoldContextBudget
 ): FoldedSourceMessage | undefined {
   const { content } = msg;
+  const responsesOutput = getAuthoritativeResponsesToolOutput(msg);
+  if (responsesOutput?.preservesOrder === true) {
+    const orderedOutput = appendOrderedResponsesOutput(
+      responsesOutput.output,
+      textChunks,
+      budget
+    );
+    return orderedOutput.contributed
+      ? {
+        message: msg,
+        mappingAmbiguous: true,
+        additionalAttributions: ['tool'],
+      }
+      : undefined;
+  }
 
   if (typeof content === 'string') {
     const remainingCharsBefore = budget.remainingChars;
@@ -3836,11 +3921,10 @@ function appendMessageContent(
         consumeFoldedWork(textChunks, budget) &&
         appendFoldedLine(textChunks, budget, [`${role}: `, content]);
     }
-    const responsesOutput = getAuthoritativeResponsesToolOutput(msg);
     if (responsesOutput != null) {
       appendFoldedLine(textChunks, budget, [
         'AI: [server_tool_output] ',
-        serializeFoldedValue(responsesOutput),
+        serializeFoldedValue(responsesOutput.output),
       ]);
     }
     const toolCalls = appendToolCalls(msg, role, textChunks, budget);
@@ -3849,6 +3933,9 @@ function appendMessageContent(
         message: msg,
         ...((!contentComplete || !toolCalls.complete) && {
           mappingAmbiguous: true,
+        }),
+        ...(responsesOutput != null && {
+          additionalAttributions: ['tool'] as const,
         }),
       }
       : undefined;
@@ -4053,12 +4140,11 @@ function appendMessageContent(
 
   let responsesOutputContributed = false;
   if (!hasToolUseBlock) {
-    const responsesOutput = getAuthoritativeResponsesToolOutput(msg);
     if (responsesOutput != null) {
       const remainingCharsBefore = budget.remainingChars;
       appendFoldedLine(textChunks, budget, [
         'AI: [server_tool_output] ',
-        serializeFoldedValue(responsesOutput),
+        serializeFoldedValue(responsesOutput.output),
       ]);
       responsesOutputContributed =
         budget.remainingChars < remainingCharsBefore;
@@ -4075,6 +4161,9 @@ function appendMessageContent(
       message: msg,
       ...((responsesOutputContributed || !toolCalls.complete) && {
         mappingAmbiguous: true,
+      }),
+      ...(responsesOutputContributed && {
+        additionalAttributions: ['tool'] as const,
       }),
     };
   }

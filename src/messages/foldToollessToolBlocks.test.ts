@@ -529,7 +529,7 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(result).toBe(messages);
   });
 
-  test('folds authoritative Responses v0 server output for another provider', () => {
+  test('folds authoritative Responses v0 output in source order', () => {
     const messages = [
       new AIMessage({
         content: 'The calculation completed.',
@@ -547,7 +547,12 @@ describe('foldToolBlocksForToollessAgent', () => {
               id: 'message-1',
               type: 'message',
               role: 'assistant',
-              content: [{ type: 'output_text', text: 'duplicate text' }],
+              content: [
+                {
+                  type: 'output_text',
+                  text: 'The calculation completed.',
+                },
+              ],
             },
             {
               id: 'function-1',
@@ -566,8 +571,58 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(getTextContent(result[0])).toContain('server_tool_output');
     expect(getTextContent(result[0])).toContain('code_interpreter_call');
     expect(getTextContent(result[0])).toContain('The calculation completed.');
-    expect(getTextContent(result[0])).not.toContain('duplicate text');
-    expect(getTextContent(result[0])).not.toContain('function_call');
+    const text = getTextContent(result[0]);
+    expect(text).toContain('The calculation completed.');
+    expect(text).toContain('[tool_call] lookup({})');
+    expect(text.indexOf('code_interpreter_call')).toBeLessThan(
+      text.indexOf('The calculation completed.')
+    );
+    expect(text.indexOf('The calculation completed.')).toBeLessThan(
+      text.indexOf('[tool_call] lookup')
+    );
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model' },
+        { attribution: 'tool' },
+      ],
+    });
+  });
+
+  test('folds Responses custom tool calls from authoritative output', () => {
+    const messages = [
+      new AIMessage({
+        content: 'Running the custom tool.',
+        response_metadata: {
+          output: [
+            {
+              id: 'message-1',
+              type: 'message',
+              role: 'assistant',
+              content: [
+                { type: 'output_text', text: 'Running the custom tool.' },
+              ],
+            },
+            {
+              id: 'custom-1',
+              call_id: 'call-1',
+              type: 'custom_tool_call',
+              name: 'execute',
+              input: 'print(2 + 2)',
+            },
+          ],
+        },
+      }),
+    ];
+
+    const [folded] = foldToolBlocksForToollessAgent(messages);
+    const text = getTextContent(folded);
+
+    expect(text).toContain('server_tool_output');
+    expect(text).toContain('custom_tool_call');
+    expect(text).toContain('execute');
+    expect(text).toContain('print(2 + 2)');
   });
 
   test.each([
