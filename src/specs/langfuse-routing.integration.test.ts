@@ -15,7 +15,14 @@ import {
   resolveLangfuseDestinationKey,
   resolveLangfuseTraceAnchorParent,
 } from '@/langfuseSpanRegistry';
-import { Constants, ContentTypes, Providers, TitleMethod } from '@/common';
+import {
+  Constants,
+  ContentTypes,
+  GraphEvents,
+  Providers,
+  TitleMethod,
+} from '@/common';
+import { LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY } from '@/langfuseToolOutputTracing';
 import { withLangfuseRuntimeScope } from '@/langfuseRuntimeScope';
 import { initializeLangfuseTracing } from '@/instrumentation';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
@@ -590,6 +597,204 @@ describe('Langfuse per-run routing integration', () => {
     });
   });
 
+  it.each([false, true])(
+    'routes parallel host-executed queries with metadata and redaction (eager=%s)',
+    async (eager) => {
+      const otherToolEnd = jest.fn();
+      await Promise.all(
+        ['host-a', 'host-b', 'host-disabled'].map(async (tenantId, index) => {
+          const queryTool = tool(
+            async () => [
+              'private rows',
+              {
+                privateAttachment: 'private attachment',
+                [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+                  query_returned_rows: index + 1,
+                },
+              },
+            ],
+            {
+              name: 'query',
+              description: 'Query fixture',
+              schema: z.object({}),
+              responseFormat: 'content_and_artifact',
+            }
+          );
+          const run = await Run.create<t.IState>({
+            runId: `routing-${tenantId}`,
+            graphConfig: {
+              type: 'standard',
+              llmConfig: {
+                provider: Providers.OPENAI,
+                streaming: true,
+                streamUsage: false,
+              },
+              toolDefinitions: [
+                {
+                  name: 'failed_query',
+                  description: 'Failed query fixture',
+                  parameters: { type: 'object', properties: {} },
+                },
+                {
+                  name: 'query',
+                  description: 'Query fixture',
+                  parameters: { type: 'object', properties: {} },
+                },
+                {
+                  name: 'unannotated',
+                  description: 'Tool without safe metadata',
+                  parameters: { type: 'object', properties: {} },
+                },
+              ],
+            },
+            langfuse: {
+              ...tenantLangfuse(tenantId),
+              enabled: tenantId !== 'host-disabled',
+              toolOutputTracing: { enabled: index === 1 },
+            },
+            eagerEventToolExecution: { enabled: eager },
+            returnContent: true,
+            skipCleanup: true,
+            customHandlers: {
+              [GraphEvents.ON_TOOL_EXECUTE]: {
+                handle: async (_event, rawData) => {
+                  const data = rawData as t.ToolExecuteBatchRequest;
+                  data.resolve(
+                    await Promise.all(
+                      data.toolCalls.map(async (call) => {
+                        if (call.name === 'failed_query') {
+                          return {
+                            toolCallId: call.id,
+                            status: 'error' as const,
+                            content: 'private failed output',
+                            errorMessage: 'private host error',
+                            artifact: {
+                              [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+                                query_error_category: 'timeout',
+                              },
+                            },
+                          };
+                        }
+                        if (call.name === 'unannotated') {
+                          return {
+                            toolCallId: call.id,
+                            status: 'success' as const,
+                            content: 'private unannotated output',
+                          };
+                        }
+                        const result = await queryTool.invoke(
+                          {
+                            name: call.name,
+                            args: call.args,
+                            id: call.id,
+                            type: 'tool_call',
+                          },
+                          { callbacks: [], metadata: data.metadata }
+                        );
+                        return {
+                          toolCallId: call.id,
+                          status: 'success' as const,
+                          content: result.content,
+                          artifact: result.artifact,
+                        };
+                      })
+                    )
+                  );
+                },
+              },
+            },
+          });
+          run.Graph?.overrideTestModel(['Querying', 'Done'], 1, [
+            {
+              id: `failed-${tenantId}`,
+              name: 'failed_query',
+              args: {},
+              type: 'tool_call',
+            },
+            {
+              id: `call-${tenantId}`,
+              name: 'query',
+              args: {},
+              type: 'tool_call',
+            },
+            {
+              id: `plain-${tenantId}`,
+              name: 'unannotated',
+              args: {},
+              type: 'tool_call',
+            },
+          ]);
+          await run.processStream(
+            { messages: [new HumanMessage('Query')] },
+            {
+              ...callerConfig,
+              callbacks: [
+                { name: 'other-observer', handleToolEnd: otherToolEnd },
+              ],
+            }
+          );
+        })
+      );
+      expect(startsForTenant('host-disabled')).toHaveLength(0);
+      expect(
+        spanStarts.filter((span) => span.name === 'unannotated')
+      ).toHaveLength(0);
+      expect(otherToolEnd).not.toHaveBeenCalled();
+      for (const [index, tenantId] of ['host-a', 'host-b'].entries()) {
+        const failedStarts = startsForTenant(tenantId).filter(
+          (span) => span.name === 'failed_query'
+        );
+        expect(failedStarts).toHaveLength(1);
+        expect(failedStarts[0].traceId).toBe(
+          traceIdFromSeed(`routing-${tenantId}`)
+        );
+        const failed = endedSpans.find(
+          (entry) => entry.spanContext().spanId === failedStarts[0].spanId
+        );
+        expect(
+          failed?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]
+        ).toBe('ERROR');
+        expect(
+          failed?.attributes[
+            LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE
+          ]
+        ).toBe('Error: Host tool execution failed');
+        expect(JSON.stringify(failed?.attributes)).not.toContain('private');
+        expect(
+          failed?.attributes[
+            'langfuse.observation.metadata.query_error_category'
+          ]
+        ).toContain('timeout');
+        const starts = startsForTenant(tenantId).filter(
+          (span) => span.name === 'query'
+        );
+        expect(starts).toHaveLength(1);
+        expect(starts[0].traceId).toBe(traceIdFromSeed(`routing-${tenantId}`));
+        const span = endedSpans.find(
+          (entry) => entry.spanContext().spanId === starts[0].spanId
+        );
+        expect(
+          span?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]
+        ).not.toBe('ERROR');
+        expect(
+          JSON.parse(
+            String(
+              span?.attributes[
+                'langfuse.observation.metadata.query_returned_rows'
+              ]
+            )
+          )
+        ).toBe(index + 1);
+        expect(span?.attributes['langfuse.observation.output']).not.toContain(
+          'private rows'
+        );
+        expect(JSON.stringify(span?.attributes)).not.toContain(
+          'private attachment'
+        );
+      }
+    }
+  );
+
   it('keeps caller run names from replacing the graph operation name', async () => {
     const tenantId = 'tenant-caller-run-name';
     const run = await Run.create<t.IState>({
@@ -1082,9 +1287,7 @@ describe('Langfuse per-run routing integration', () => {
     );
     expect(root).toBeDefined();
     expect(
-      root?.attributes[
-        LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE
-      ]
+      root?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]
     ).toContain('terminal admission unavailable');
   });
 

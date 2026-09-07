@@ -31,6 +31,7 @@ const mockProcessorStarts: Array<{
   traceId: string;
 }> = [];
 const mockSpanAttributeSets: Array<Record<string, unknown>> = [];
+const mockEndedSpanAttributes: Array<Record<string, unknown>> = [];
 let mockSpansStarted = 0;
 let mockSpansEnded = 0;
 let mockProviderInput:
@@ -46,7 +47,7 @@ let mockProviderInput:
     }
   | undefined;
 
-const createMockSpan = (traceIdOverride?: string) => {
+const createMockSpan = (traceIdOverride?: string, name = 'test-span') => {
   mockSpansStarted += 1;
   const traceId =
     traceIdOverride ??
@@ -59,6 +60,7 @@ const createMockSpan = (traceIdOverride?: string) => {
       for (const processor of mockProviderInput?.spanProcessors ?? []) {
         processor.onEnd?.(span);
       }
+      mockEndedSpanAttributes.push({ ...span.attributes });
     }),
     spanContext: jest.fn(() => ({
       traceId,
@@ -67,9 +69,11 @@ const createMockSpan = (traceIdOverride?: string) => {
     })),
     setAttributes: jest.fn((attributes: Record<string, unknown>) => {
       mockSpanAttributeSets.push(attributes);
+      Object.assign(span.attributes, attributes);
     }),
     setStatus: jest.fn(),
     attributes: {},
+    name,
   };
   for (const processor of mockProviderInput?.spanProcessors ?? []) {
     processor.onStart?.(span, otelContext.active());
@@ -77,7 +81,9 @@ const createMockSpan = (traceIdOverride?: string) => {
   return span;
 };
 
-const mockStartSpan = jest.fn(() => createMockSpan());
+const mockStartSpan = jest.fn((name: string) =>
+  createMockSpan(undefined, name)
+);
 const mockStartActiveSpan = jest.fn(
   (
     _name: string,
@@ -85,7 +91,9 @@ const mockStartActiveSpan = jest.fn(
     activeContext: Parameters<typeof otelTrace.getSpanContext>[0],
     callback: (span: ReturnType<typeof createMockSpan>) => unknown
   ) =>
-    callback(createMockSpan(otelTrace.getSpanContext(activeContext)?.traceId))
+    callback(
+      createMockSpan(otelTrace.getSpanContext(activeContext)?.traceId, _name)
+    )
 );
 const mockForceFlush = jest.fn();
 const mockShutdown = jest.fn();
@@ -124,6 +132,7 @@ describe('Langfuse callback composition', () => {
     jest.clearAllMocks();
     mockProcessorStarts.length = 0;
     mockSpanAttributeSets.length = 0;
+    mockEndedSpanAttributes.length = 0;
     mockSpansStarted = 0;
     mockSpansEnded = 0;
     delete process.env.LANGFUSE_PUBLIC_KEY;
@@ -839,6 +848,66 @@ describe('Langfuse callback composition', () => {
     );
 
     expect(observedPolicy?.enabled).toBe(false);
+  });
+
+  it('promotes trusted ToolMessage artifact metadata before redacting callback output', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY } = await import(
+      '@/langfuseToolOutputTracing'
+    );
+    const langfuse = {
+      publicKey: 'pk-query-metadata',
+      secretKey: 'sk-query-metadata',
+      toolOutputTracing: {
+        redactedToolNames: ['run_select_query'],
+      },
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    const queryTool = tool(
+      async () => [
+        '{"data":[{"private_column":"customer value"}]}',
+        {
+          [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+            query_database_system: 'clickhouse',
+            query_status: 'success',
+            query_returned_rows: 1,
+          },
+        },
+      ],
+      {
+        name: 'run_select_query',
+        description: 'Run a test query.',
+        schema: z.object({ query: z.string() }),
+        responseFormat: 'content_and_artifact',
+      }
+    );
+
+    await queryTool.invoke(
+      {
+        name: 'run_select_query',
+        args: { query: 'SELECT private_column FROM customer_table' },
+        id: 'query-call',
+        type: 'tool_call',
+      },
+      { callbacks: handler != null ? [handler] : [] }
+    );
+
+    expect(mockEndedSpanAttributes).toContainEqual(
+      expect.objectContaining({
+        [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_database_system`]:
+          'clickhouse',
+        [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_status`]:
+          'success',
+        [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_returned_rows`]: 1,
+        [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]:
+          '[tool output redacted]',
+      })
+    );
+    expect(JSON.stringify(mockEndedSpanAttributes)).not.toContain(
+      'customer value'
+    );
   });
 
   it('attaches configured trace attributes to Langfuse callback spans', async () => {
