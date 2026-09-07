@@ -27,10 +27,11 @@ import { ToolNode } from '@/tools/ToolNode';
  * When such a tool shares a tool-call batch with a NON-idempotent
  * sibling (send_email, billing), LangGraph's resume contract — re-run
  * the whole interrupted node from the top — would otherwise execute the
- * sibling once on the first pass and AGAIN on resume, duplicating the
- * side effect. Declaring the interrupter in `interruptingToolNames`
- * schedules it ahead of its siblings, so the batch unwinds before any
- * sibling runs and the sibling executes exactly once (on resume).
+ * sibling before the pause. Settled-result replay prevents a second
+ * execution on resume, while declaring the interrupter in
+ * `interruptingToolNames` provides the stronger ordering guarantee: the
+ * batch unwinds before any sibling runs and the sibling executes only after
+ * resume.
  *
  * Runs entirely in-memory (StateGraph + MemorySaver) — no LLM, no Run
  * machinery — so it exercises the ToolNode batch-execution change
@@ -141,8 +142,8 @@ describe('ask_user_question batched with a sibling tool', () => {
     }
   });
 
-  describe('baseline (no guard) — documents the defect the guard closes', () => {
-    it('double-executes an unguarded direct sibling on resume', async () => {
+  describe('baseline (no guard) — replay-safe without deferred ordering', () => {
+    it('reuses an unguarded direct sibling that settled before resume', async () => {
       const sideEffect = jest.fn(() => 'EXECUTED');
       const node = new ToolNode({
         tools: [makeAskTool(), makeSideEffectTool(sideEffect)],
@@ -160,8 +161,8 @@ describe('ask_user_question batched with a sibling tool', () => {
       expect(sideEffect).toHaveBeenCalledTimes(1);
 
       await graph.invoke(new Command({ resume: { answer: 'yes' } }), config);
-      // LangGraph re-runs the batch → the side effect fires a SECOND time.
-      expect(sideEffect).toHaveBeenCalledTimes(2);
+      // LangGraph re-runs the batch, but ToolNode reuses the settled result.
+      expect(sideEffect).toHaveBeenCalledTimes(1);
     });
   });
 
