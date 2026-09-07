@@ -11,6 +11,7 @@ import type * as t from '@/types';
 import {
   appendProviderMessageToolCalls,
   appendProviderToolCallDescriptor,
+  consumeProviderToolResultPair,
   getProviderMessageRole,
   getProviderToolCallPartDescriptor,
   getProviderToolMessageResultDescriptor,
@@ -24,13 +25,23 @@ import { ContentTypes } from '@/common';
 const UNKNOWN_TOOL = 'unknown_tool';
 const BLANK_TEXT = /^\s*$/u;
 
-/** Rejects counts a subset claim cannot be derived from. Callers must degrade
- *  rather than propagate: this runs on the live pre-invoke path. */
+/** Guards an aggregate: sums of rounded counts must stay safe integers.
+ *  Callers must degrade rather than propagate: this runs on the live pre-invoke path. */
 function safeCount(value: number): number {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new RangeError('Invalid tool context token count');
   }
   return value;
+}
+
+/** Accepts what the `TokenCounter` contract allows, an approximate `number`
+ *  such as `length / 4`, by rounding it, and rejects only what no subset claim
+ *  can be derived from: NaN, infinities, negatives and values past the safe range. */
+function toCount(value: number): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new RangeError('Invalid tool context token count');
+  }
+  return safeCount(Math.round(value));
 }
 
 let warnedUnavailableToolShare = false;
@@ -79,13 +90,26 @@ function readLegacyFunctionName(message: BaseMessage): string | undefined {
   return typeof name === 'string' && name.length > 0 ? name : undefined;
 }
 
-function getPairedToolName(
+interface ResultPairing {
+  readonly paired: boolean;
+  readonly name?: string;
+}
+
+/** Pairs a result with its call the way the wire walkers do: the call is
+ *  validated for kind and name and then consumed, so a provider that reuses a
+ *  call id in a later turn is attributed to the current call rather than
+ *  poisoning the id, and the bounded index never fills with answered calls. */
+function pairResult(
   descriptor: ProviderToolResultPartDescriptor,
-  calls: ProviderToolCallIndex
-): string | undefined {
-  return descriptor.toolCallId == null
-    ? undefined
-    : calls.get(descriptor.toolCallId)?.descriptor.name;
+  calls: ProviderToolCallIndex,
+  previousPart?: unknown
+): ResultPairing {
+  const name =
+    descriptor.toolCallId == null
+      ? undefined
+      : calls.get(descriptor.toolCallId)?.descriptor.name;
+  const paired = consumeProviderToolResultPair(descriptor, calls, previousPart);
+  return paired ? { paired, name } : { paired };
 }
 
 interface InvocationScan {
@@ -141,10 +165,10 @@ function getToolMessageResultName(
   pendingLegacyName: string | undefined
 ): string {
   const descriptor = getProviderToolMessageResultDescriptor(message);
-  const paired =
-    descriptor == null ? undefined : getPairedToolName(descriptor, calls);
-  if (paired != null) {
-    return paired;
+  const pairing =
+    descriptor == null ? undefined : pairResult(descriptor, calls);
+  if (pairing?.name != null) {
+    return pairing.name;
   }
   if (message.name != null && message.name.length > 0) {
     return message.name;
@@ -153,29 +177,41 @@ function getToolMessageResultName(
 }
 
 /**
- * A user turn made only of `tool_result` parts the converters accept in that
- * position: the split `AIMessage(tool_call)` + `HumanMessage(tool_result)`
- * history. The counter measures whole messages, so the turn is attributed to
- * its one paired tool, or to `unknown_tool` when its parts name several.
- * Returns undefined for any other user turn.
+ * A user turn made only of `tool_result` parts that each pair with a pending
+ * call, the split `AIMessage(tool_call)` + `HumanMessage(tool_result)` history
+ * the converters accept. Pairing runs against a candidate copy and commits only
+ * when every part pairs, as the recency walker does; anything else is an
+ * ordinary user turn. The counter measures whole messages, so the turn is
+ * attributed to its one paired tool, or to `unknown_tool` when parts name
+ * several. Returns undefined for any other user turn.
  */
-function getUserToolResultName(
+function takeUserToolResultName(
   message: BaseMessage,
   calls: ProviderToolCallIndex
 ): string | undefined {
   if (typeof message.content === 'string' || message.content.length === 0) {
     return undefined;
   }
+  const candidate: ProviderToolCallIndex = new Map(calls);
   let name: string | undefined;
   let mixed = false;
+  let previousPart: unknown;
   for (const part of message.content) {
     const descriptor = getProviderToolResultPartDescriptor(part);
     if (descriptor?.allowHumanMessagePairing !== true) {
       return undefined;
     }
-    const paired = getPairedToolName(descriptor, calls);
-    mixed ||= name != null && paired !== name;
-    name = paired;
+    const pairing = pairResult(descriptor, candidate, previousPart);
+    if (!pairing.paired) {
+      return undefined;
+    }
+    mixed ||= name != null && pairing.name !== name;
+    name = pairing.name;
+    previousPart = part;
+  }
+  calls.clear();
+  for (const [callId, entry] of candidate) {
+    calls.set(callId, entry);
   }
   return mixed || name == null ? UNKNOWN_TOOL : name;
 }
@@ -195,7 +231,7 @@ function computeToolMessageUsage(
   let total = 0;
   let resultTotal = 0;
   const countResult = (message: BaseMessage, name: string): void => {
-    const tokens = safeCount(tokenCounter(message));
+    const tokens = toCount(tokenCounter(message));
     total = safeCount(total + tokens);
     if (tokens === 0) {
       return;
@@ -210,7 +246,7 @@ function computeToolMessageUsage(
       const scan = scanInvocation(message, calls);
       pendingLegacyName = readLegacyFunctionName(message);
       if (scan.recognizedCalls > 0 && scan.toolOnly) {
-        total = safeCount(total + safeCount(tokenCounter(message)));
+        total = safeCount(total + toCount(tokenCounter(message)));
       }
       continue;
     }
@@ -223,10 +259,13 @@ function computeToolMessageUsage(
       continue;
     }
     const userResultName =
-      role === 'user' ? getUserToolResultName(message, calls) : undefined;
+      role === 'user' ? takeUserToolResultName(message, calls) : undefined;
     if (userResultName != null) {
       countResult(message, userResultName);
       continue;
+    }
+    if (role === 'user') {
+      calls.clear();
     }
     pendingLegacyName = undefined;
   }
@@ -266,12 +305,12 @@ function syncToolMessageShare(
   if (breakdown.toolMessageTokens == null) {
     return;
   }
-  const total = safeCount(breakdown.toolMessageTokens);
-  const clamped = Math.min(total, safeCount(breakdown.messageTokens));
+  const total = toCount(breakdown.toolMessageTokens);
+  const clamped = Math.min(total, toCount(breakdown.messageTokens));
   if (clamped !== total && breakdown.toolMessageTokenCounts != null) {
     let resultTotal = 0;
     for (const count of Object.values(breakdown.toolMessageTokenCounts)) {
-      resultTotal = safeCount(resultTotal + safeCount(count));
+      resultTotal = safeCount(resultTotal + toCount(count));
     }
     const factor = total > 0 ? clamped / total : 0;
     const target = Math.min(clamped, Math.round(resultTotal * factor));

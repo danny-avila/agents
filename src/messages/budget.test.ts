@@ -328,6 +328,31 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     });
   });
 
+  it.each(['model', 'ai', 'supervisor'])(
+    'treats a generic %s-role message as the model turn, as Google does',
+    (role) => {
+      const usage = snapshot();
+      const invocation = new ChatMessage({
+        role,
+        content: '',
+        additional_kwargs: {
+          function_call: { name: 'gemini_lookup', arguments: '{}' },
+        },
+      });
+
+      syncBudgetDerivedFields(
+        usage,
+        [invocation, new FunctionMessage({ content: 'result', name: '' })],
+        () => 10
+      );
+
+      expect(usage.breakdown.toolMessageTokens).toBe(20);
+      expect(usage.breakdown.toolMessageTokenCounts).toEqual({
+        gemini_lookup: 10,
+      });
+    }
+  );
+
   it('leaves non-assistant generic messages in the conversation share', () => {
     const usage = snapshot();
     const bystander = new ChatMessage({ role: 'user', content: 'aside' });
@@ -489,6 +514,68 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     });
   });
 
+  it('rounds an approximate counter instead of dropping the share', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'approx', name: 'lookup', args: {} }],
+      }),
+      toolResult('approx'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 12.5);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(26);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 13 });
+  });
+
+  it('attributes a reused call id to the call it currently answers', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'reused', name: 'first_tool', args: {} }],
+      }),
+      toolResult('reused'),
+      new HumanMessage('next'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'reused', name: 'second_tool', args: {} }],
+      }),
+      toolResult('reused'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({
+      first_tool: 10,
+      second_tool: 10,
+    });
+  });
+
+  it('forgets an unanswered call at the next user turn', () => {
+    const usage = snapshot();
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'dangling', name: 'abandoned_tool', args: {} }],
+      }),
+      new HumanMessage('never mind, do this instead'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'dangling', name: 'current_tool', args: {} }],
+      }),
+      toolResult('dangling'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 10);
+
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({
+      current_tool: 10,
+    });
+  });
+
   it('distinguishes a known zero share from an unavailable counter', () => {
     const known = snapshot();
     syncBudgetDerivedFields(known, [new HumanMessage('hello')], () => 10);
@@ -529,7 +616,6 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
           Number.NaN,
           Number.POSITIVE_INFINITY,
           -1,
-          0.5,
           Number.MAX_SAFE_INTEGER + 1,
         ]) {
           const usage = snapshot();

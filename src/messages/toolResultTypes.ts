@@ -1227,9 +1227,16 @@ export type ProviderMessageRole =
   | 'tool'
   | 'function';
 
+/** The OpenAI converter forwards `assistant` / `user` / `system` / `developer`
+ *  / `tool` / `function`; the Google converter additionally reads `ai`,
+ *  `model` and `supervisor` as the model turn and `human` as the user. */
 const GENERIC_MESSAGE_ROLES: Readonly<Record<string, ProviderMessageRole>> = {
   assistant: 'assistant',
+  ai: 'assistant',
+  model: 'assistant',
+  supervisor: 'assistant',
   user: 'user',
+  human: 'user',
   system: 'system',
   developer: 'system',
   tool: 'tool',
