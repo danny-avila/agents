@@ -2,6 +2,7 @@ import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
+import { rebindToolBatchReplayScope } from '@/tools/toolBatchReplay';
 import {
   AIMessage,
   BaseMessage,
@@ -2611,6 +2612,13 @@ export class SubagentExecutor {
       if (this.humanInTheLoop?.enabled === true) {
         childConfigurable[TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY] =
           approvalExecutionScope;
+        if (resumeExecution != null) {
+          rebindToolBatchReplayScope(
+            childConfigurable,
+            resumeExecution.approvalExecutionScope,
+            approvalExecutionScope
+          );
+        }
       }
       if (resumeExecution?.descendant != null) {
         childConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] =

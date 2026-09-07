@@ -50,6 +50,7 @@ import { HookRegistry, createToolPolicyHook } from '@/hooks';
 import * as events from '@/utils/events';
 import { askUserQuestion } from '@/hitl';
 import { ToolNode } from '../ToolNode';
+import { TOOL_BATCH_REPLAY_KEY, getToolBatchReplayState } from '../toolBatchReplay';
 
 async function flushAsyncWork(): Promise<void> {
   await Promise.resolve();
@@ -157,7 +158,8 @@ type CompiledMessagesGraph = Runnable<unknown, { messages: BaseMessage[] }> & {
 /** Factory for a minimal `agent → tools → END` graph wrapping the ToolNode. */
 function buildHITLGraph(
   toolNode: ToolNode,
-  toolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }>
+  toolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }>,
+  checkpointer = new MemorySaver()
 ): CompiledMessagesGraph {
   const toolCallIds = new Set(toolCalls.map((call) => call.id));
   const builder = new StateGraph(MessagesAnnotation)
@@ -190,7 +192,7 @@ function buildHITLGraph(
     .addEdge('agent', 'tools')
     .addEdge('tools', END);
   return builder.compile({
-    checkpointer: new MemorySaver(),
+    checkpointer,
   }) as unknown as CompiledMessagesGraph;
 }
 
@@ -252,7 +254,15 @@ async function resumeGraph<TResume>(
   }
   return graph.invoke(
     resumeFromInterrupt(interrupted, resume),
-    checkpointConfig
+    {
+      ...checkpointConfig,
+      configurable: {
+        ...checkpointConfig.configurable,
+        [TOOL_BATCH_REPLAY_KEY]: isInterrupted<unknown>(interrupted)
+          ? getToolBatchReplayState(interrupted.__interrupt__[0]?.value)
+          : undefined,
+      },
+    }
   );
 }
 
@@ -1192,6 +1202,8 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
               value: {
                 type: 'tool_approval',
                 hook_session_id: 'persisted-hook-session',
+                action_requests: [],
+                review_configs: [],
               },
             },
           ],
@@ -3455,7 +3467,43 @@ describe('Codex review fixes', () => {
     expect(executed).toEqual([reviewedName]);
   });
 
-  it('reuses a settled direct sibling when a later event tool interrupts', async () => {
+  it('waits for a started sibling before checkpointing an approval pause', async () => {
+    let release: () => void = () => { throw new Error('not initialized'); };
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    let executions = 0;
+    const slow = tool(async () => {
+      await barrier;
+      executions += 1;
+      return 'completed';
+    }, { name: 'slow', description: 'controlled side effect', schema: z.object({}) });
+    const ask = tool(async () => 'approved', { name: 'ask', description: 'approval', schema: z.object({}) });
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', { hooks: [async (input) => ({ decision: input.toolName === 'ask' ? 'ask' : 'allow' })] });
+    const node = new ToolNode({ tools: [ask, slow], directToolNames: new Set(['ask', 'slow']),
+      hookRegistry: registry, humanInTheLoop: { enabled: true } });
+    const graph = buildHITLGraph(node, [
+      { id: 'ask_call', name: 'ask', args: {} }, { id: 'slow_call', name: 'slow', args: {} },
+    ]);
+    let paused = false;
+    const pending = graph.invoke({ messages: [] }, { configurable: { thread_id: 'settle-before-pause' } })
+      .then((result) => { paused = true; return result; });
+    await flushAsyncWork();
+    expect(paused).toBe(false);
+    expect(executions).toBe(0);
+    release();
+    const interrupted = await pending;
+    expect(executions).toBe(1);
+    expect(isInterrupted(interrupted)).toBe(true);
+    if (!isInterrupted<unknown>(interrupted)) {
+      throw new Error('Expected approval pause');
+    }
+    const state = getToolBatchReplayState(interrupted.__interrupt__[0].value);
+    expect(state?.records).toHaveLength(1);
+  });
+
+  it.each([
+    { fresh: false, mutate: false }, { fresh: true, mutate: false }, { fresh: true, mutate: true },
+  ])('reuses a settled direct sibling when a later event tool interrupts (fresh=$fresh, mutate=$mutate)', async ({ fresh, mutate }) => {
     let directExecutions = 0;
     const completedCallIds: string[] = [];
     const dispatchedEventNames: string[] = [];
@@ -3510,7 +3558,7 @@ describe('Codex review fixes', () => {
             : { decision: 'allow' },
       ],
     });
-    const node = new ToolNode({
+    const createNode = () => new ToolNode({
       tools: [directTool, createSchemaStub('remote_event')],
       toolMap: new Map([
         ['local_direct', directTool],
@@ -3526,7 +3574,8 @@ describe('Codex review fixes', () => {
       hookRegistry: registry,
       humanInTheLoop: { enabled: true },
     });
-    const graph = buildHITLGraph(node, [
+    const checkpointer = new MemorySaver();
+    const calls = [
       {
         id: 'call_direct',
         name: 'local_direct',
@@ -3537,7 +3586,8 @@ describe('Codex review fixes', () => {
         name: 'remote_event',
         args: { command: 'remote' },
       },
-    ]);
+    ];
+    const graph = buildHITLGraph(createNode(), calls, checkpointer);
     const config = { configurable: { thread_id: 'mixed-direct-event-replay' } };
 
     const interrupted = await graph.invoke({ messages: [] }, config);
@@ -3546,12 +3596,45 @@ describe('Codex review fixes', () => {
       1
     );
 
-    const resumed = (await resumeGraph(
-      graph,
-      interrupted,
-      [{ type: 'approve' }],
-      config
-    )) as { messages: BaseMessage[] };
+    let resumed: { messages: BaseMessage[] };
+    if (fresh) {
+      const restoredGraph = buildHITLGraph(createNode(), calls, checkpointer);
+      const { Run } = await import('@/run');
+      const restoredRun = await Run.create<t.IState>({
+        runId: 'a-different-process-run-id',
+        graphConfig: {
+          type: 'standard',
+          agents: [{
+            agentId: 'a', provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop', maxContextTokens: 8000,
+          }],
+          compileOptions: { checkpointer },
+        },
+        humanInTheLoop: { enabled: true },
+      });
+      restoredRun.graphRunnable = restoredGraph as unknown as t.CompiledStateWorkflow;
+      if (mutate) {
+        const checkpoint = await checkpointer.getTuple(config);
+        const messages = checkpoint?.checkpoint.channel_values.messages as BaseMessage[];
+        const original = messages.find((message) => message.getType() === 'ai');
+        await expect(restoredRun.resume([{ type: 'approve' }], { ...config, version: 'v2' }, undefined, {
+          update: { messages: [new AIMessage({
+            id: original?.id, content: '', tool_calls: calls.map((call) => call.id === 'call_direct' ?
+              { ...call, args: { command: 'different operation' } } : call),
+          })] },
+        })).rejects.toThrow('Cannot change an already completed tool call');
+        expect(directExecutions).toBe(1);
+        expect(dispatchedEventNames).toEqual([]);
+        return;
+      }
+      await restoredRun.resume([{ type: 'approve' }], { ...config, version: 'v2' });
+      await restoredRun.resume([{ type: 'approve' }], { ...config, version: 'v2' });
+      const state = await restoredGraph.getState?.(config);
+      resumed = (state as { values: { messages: BaseMessage[] } }).values;
+    } else {
+      resumed = await resumeGraph(graph, interrupted, [{ type: 'approve' }], config) as { messages: BaseMessage[] };
+    }
 
     expect(directExecutions).toBe(1);
     expect(completedCallIds.filter((id) => id === 'call_direct')).toHaveLength(
@@ -4066,7 +4149,83 @@ describe('Codex review fixes', () => {
     }
   );
 
-  it('forwards review evidence only through the trusted built-in subagent hop', async () => {
+  it.each([true, false])(
+    'restores a rewritten approval with fresh Run and ToolNode instances (direct=%s)',
+    async (direct) => {
+      const checkpointer = new MemorySaver();
+      const executed: string[] = [];
+      const echo = tool(async ({ command }) => {
+        executed.push(command);
+        return command;
+      }, {
+        name: 'echo',
+        description: 'echo a reviewed command',
+        schema: z.object({ command: z.string() }),
+      });
+      if (!direct) {
+        jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(async (event, data) => {
+          if (event !== 'on_tool_execute') {
+            return;
+          }
+          const request = data as {
+            toolCalls: t.ToolCallRequest[];
+            resolve: (results: t.ToolExecuteResult[]) => void;
+          };
+          request.resolve(request.toolCalls.map((call) => {
+            const command = String(call.args.command);
+            executed.push(command);
+            return { toolCallId: call.id, content: command, status: 'success' };
+          }));
+        });
+      }
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [async () => ({ decision: 'ask', updatedInput: { command: 'reviewed' } })],
+      });
+      const { Run } = await import('@/run');
+      const create = async (hooks?: HookRegistry) => {
+        const node = new ToolNode({
+          tools: [echo],
+          eventDrivenMode: true,
+          ...(direct ? { directToolNames: new Set(['echo']) } : {}),
+          agentId: 'a',
+          toolCallStepIds: new Map([['call_1', 'step_1']]),
+          hookRegistry: hooks,
+          humanInTheLoop: { enabled: true },
+        });
+        const run = await Run.create<t.IState>({
+          runId: `fresh-approval-${direct}`,
+          graphConfig: {
+            type: 'standard',
+            agents: [{
+              agentId: 'a', provider: providers.OPENAI,
+              clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+              instructions: 'noop', maxContextTokens: 8000,
+            }],
+            compileOptions: { checkpointer },
+          },
+          hooks,
+          humanInTheLoop: { enabled: true },
+        });
+        run.graphRunnable = buildHITLGraph(node, [
+          { id: 'call_1', name: 'echo', args: { command: 'original' } },
+        ], checkpointer) as unknown as t.CompiledStateWorkflow;
+        return run;
+      };
+      const config = { configurable: { thread_id: `fresh-approval-${direct}` }, version: 'v2' as const };
+      const original = await create(registry);
+      await original.processStream({ messages: [] }, config);
+      expect(original.getInterrupt()?.payload).toMatchObject({
+        action_requests: [{ arguments: { command: 'reviewed' } }],
+      });
+      expect(executed).toEqual([]);
+      const restored = await create();
+      await restored.resume([{ type: 'approve' }], config);
+      expect(executed).toEqual(['reviewed']);
+    }
+  );
+
+  it('forwards child review evidence without blocking an unrelated parent sibling', async () => {
     const receivedConfigurables: Array<Record<string, unknown> | undefined> =
       [];
     const subagentTool = tool(
@@ -4087,9 +4246,15 @@ describe('Codex review fixes', () => {
       getSettledOutput: async () => undefined,
       persistSettledOutput: async () => undefined,
     };
+    let siblingExecutions = 0;
+    const sibling = tool(async () => {
+      siblingExecutions += 1;
+      return 'parent result';
+    }, { name: 'parent_sibling', description: 'parent sibling', schema: z.object({}) });
     const node = new ToolNode({
-      tools: [subagentTool],
-      directToolNames: new Set([Constants.SUBAGENT]),
+      tools: [subagentTool, sibling],
+      directToolNames: new Set([Constants.SUBAGENT, 'parent_sibling']),
+      interruptingToolNames: new Set([Constants.SUBAGENT]),
     });
     const graph = buildHITLGraph(node, [
       {
@@ -4097,6 +4262,7 @@ describe('Codex review fixes', () => {
         name: Constants.SUBAGENT,
         args: { description: 'inspect logs', subagent_type: 'researcher' },
       },
+      { id: 'parent_sibling_call', name: 'parent_sibling', args: {} },
     ]);
     const reviewEvidence = createToolApprovalReviewEvidence('interrupt_1', {
       type: 'tool_approval',
@@ -4128,6 +4294,7 @@ describe('Codex review fixes', () => {
     );
 
     expect(receivedConfigurables).toHaveLength(1);
+    expect(siblingExecutions).toBe(1);
     expect(receivedConfigurables[0]?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY]).toBe(
       reviewEvidence
     );

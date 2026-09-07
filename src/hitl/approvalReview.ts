@@ -17,6 +17,7 @@ export const TOOL_APPROVAL_REVIEW_CONFIG_KEY =
 export interface ToolApprovalReviewEvidence {
   interruptId: string;
   payload: ToolApprovalInterruptPayload;
+  owner?: string;
 }
 
 export interface ReviewedToolApproval {
@@ -80,7 +81,8 @@ function hasValidApprovalShape(payload: ToolApprovalInterruptPayload): boolean {
 /** Build trusted review evidence from the interrupt restored by `Run`. */
 export function createToolApprovalReviewEvidence(
   interruptId: string | undefined,
-  payload: unknown
+  payload: unknown,
+  owner?: string
 ): ToolApprovalReviewEvidence | undefined {
   if (
     typeof interruptId !== 'string' ||
@@ -93,24 +95,39 @@ export function createToolApprovalReviewEvidence(
   return {
     interruptId,
     payload: cloneToolApprovalInterruptPayload(payload),
+    ...(owner == null ? {} : { owner }),
   };
 }
 
 /** Read only well-shaped evidence from a ToolNode's runnable config. */
 export function getToolApprovalReviewEvidence(
-  config: RunnableConfig
+  config: RunnableConfig,
+  owner?: string
 ): ToolApprovalReviewEvidence | undefined {
   const candidate = config.configurable?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
   if (candidate == null || typeof candidate !== 'object') {
     return undefined;
   }
-  const { interruptId, payload } = candidate as {
+  const {
+    interruptId,
+    payload,
+    owner: evidenceOwner,
+  } = candidate as {
     interruptId?: unknown;
     payload?: unknown;
+    owner?: unknown;
   };
+  if (
+    evidenceOwner != null &&
+    (typeof evidenceOwner !== 'string' ||
+      (owner != null && owner !== evidenceOwner))
+  ) {
+    return undefined;
+  }
   return createToolApprovalReviewEvidence(
     typeof interruptId === 'string' ? interruptId : undefined,
-    payload
+    payload,
+    typeof evidenceOwner === 'string' ? evidenceOwner : undefined
   );
 }
 

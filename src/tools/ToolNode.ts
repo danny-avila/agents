@@ -48,6 +48,7 @@ import type {
   ToolApprovalReplayKey,
 } from '@/hooks';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
+import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
 import {
@@ -117,17 +118,29 @@ import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { attachRunStepResumeState } from '@/tools/runStepResume';
+import {
+  TOOL_BATCH_REPLAY_KEY,
+  getToolBatchReplayOwner,
+  getToolBatchReplayScope,
+  attachToolBatchReplayState,
+  restoreToolBatchReplayState,
+} from '@/tools/toolBatchReplay';
 
 function stripToolApprovalReviewConfig(
   configurable: Record<string, unknown> | undefined
 ): Record<string, unknown> | undefined {
   if (
     configurable == null ||
-    !(TOOL_APPROVAL_REVIEW_CONFIG_KEY in configurable)
+    !(TOOL_APPROVAL_REVIEW_CONFIG_KEY in configurable) &&
+    !(TOOL_BATCH_REPLAY_KEY in configurable)
   ) {
     return configurable;
   }
-  const { [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: _review, ...rest } = configurable;
+  const {
+    [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: _review,
+    [TOOL_BATCH_REPLAY_KEY]: _replay,
+    ...rest
+  } = configurable;
   return rest;
 }
 
@@ -233,6 +246,8 @@ type RunToolBatchContext<T = unknown> = {
   additionalContextsSink?: string[];
   /** Stable identity of the assistant tool-call batch across HITL replay. */
   replayBatchKey?: string;
+  /** Tool-call identities owned by this ToolNode invocation. */
+  approvalScopeCallIds?: ReadonlySet<string>;
   /**
    * Graph state the ToolNode was invoked with, threaded from `run()`
    * so `tool.invoke` can forward it as langgraph 1.4's `runtime.state`
@@ -260,12 +275,7 @@ function withSubagentReplayBatch(
   };
 }
 
-type SettledDirectToolResult = {
-  output: BaseMessage | Command;
-  additionalContexts: string[];
-  resolvedArgs?: Record<string, unknown>;
-  completionHandled?: boolean;
-};
+type SettledDirectToolResult = SettledToolBatchResult;
 
 /**
  * Batch-local record of who owns each failed call's completion event.
@@ -446,11 +456,9 @@ function findAssistantBatch(
 
 function getAssistantBatchReplayKey(
   batch: AssistantBatch,
-  runId: string | undefined,
   threadId: string | undefined
 ): string {
   return JSON.stringify([
-    runId ?? null,
     threadId ?? null,
     batch.message.id ?? null,
     batch.index,
@@ -879,23 +887,50 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       name: name ?? TOOL_NODE_RUN_NAME,
       tags,
       func: async (input, config) => {
+        const messages = Array.isArray(input) ? input as BaseMessage[] :
+          (input as { messages?: BaseMessage[] }).messages;
+        const assistantBatch = messages == null ? undefined : findAssistantBatch(messages);
+        const activeReplayKey = assistantBatch == null ? undefined : getAssistantBatchReplayKey(
+          assistantBatch, getToolBatchReplayScope(config)
+        );
+        const replayOwner = getToolBatchReplayOwner(
+          config,
+          this.executingAgentId ?? this.agentId ?? ''
+        );
+        const restoredBatches = await restoreToolBatchReplayState(config, replayOwner);
+        for (const { batch, results } of restoredBatches) {
+          if (batch !== activeReplayKey) {
+            continue;
+          }
+          if (!this.settledDirectResultsByBatch.has(batch)) {
+            this.settledDirectResultsByBatch.set(batch, new Map(results));
+          }
+        }
         const state = input as T & Pick<t.BaseGraphState, 'runStepState'>;
         restoreRunStepResumeState?.(state.runStepState, config);
         let result: T;
         try {
           result = await this.run(input, config);
         } catch (error) {
-          if (!isGraphInterrupt(error) || createRunStepResumeState == null) {
+          if (!isGraphInterrupt(error)) {
             throw error;
           }
-          const resumeState = createRunStepResumeState();
+          const resumeState = createRunStepResumeState?.();
+          const activeResults = activeReplayKey == null ? undefined : this.settledDirectResultsByBatch.get(activeReplayKey);
+          const activeBatches = activeReplayKey == null || activeResults == null
+            ? new Map<string, Map<string, SettledDirectToolResult>>()
+            : new Map([[activeReplayKey, activeResults]]);
           throw new GraphInterrupt(
-            error.interrupts.map((pendingInterrupt) => ({
-              ...pendingInterrupt,
-              value: attachRunStepResumeState(
+            await Promise.all(error.interrupts.map(async (pendingInterrupt) => {
+              const value = await attachToolBatchReplayState(
                 pendingInterrupt.value,
-                resumeState
-              ),
+                replayOwner,
+                activeBatches
+              );
+              return {
+                ...pendingInterrupt,
+                value: resumeState == null ? value : attachRunStepResumeState(value, resumeState),
+              };
             }))
           );
         }
@@ -2061,11 +2096,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           approvalReplaySessionId,
           approvalReplayKey
         );
-    const approvalReviewEvidence = getToolApprovalReviewEvidence(config);
+    const approvalReviewEvidence = getToolApprovalReviewEvidence(config,
+      getToolBatchReplayOwner(config, this.executingAgentId ?? this.agentId ?? ''));
     const reviewedApproval = getReviewedToolApproval(
       approvalReviewEvidence?.payload,
       call.id
     );
+    const approvalEvidenceAppliesToBatch =
+      approvalReviewEvidence?.payload.action_requests.some((request) =>
+        batchContext.approvalScopeCallIds == null
+          ? request.tool_call_id === call.id
+          : batchContext.approvalScopeCallIds.has(request.tool_call_id)
+      ) === true;
     const hasPostHook = hookRegistry?.hasHookFor('PostToolUse', runId) === true;
     const hasFailureHook =
       hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
@@ -2192,7 +2234,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             matchQuery: call.name,
             onceReplayKey: approvalReplayKey,
             onceReplaySessionId: approvalReplaySessionId,
-          }).catch(() => undefined);
+          }).catch((): AggregatedHookResult | undefined => approvalReviewEvidence == null ? undefined : {
+            decision: 'deny',
+            reason: 'Approval policy could not be evaluated on resume',
+            additionalContexts: [], injectedMessages: [], errors: [],
+          });
 
       if (preResult != null) {
         // Forward any additionalContext strings hooks returned into
@@ -2242,7 +2288,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
          * approval that LangGraph did not preserve. A current hook can ask
          * again; otherwise never let that unreviewed sibling execute. */
         if (
-          approvalReviewEvidence != null &&
+          approvalEvidenceAppliesToBatch &&
           reviewedApproval == null &&
           !isTrustedSubagentReviewHop &&
           preResult.decision !== 'ask'
@@ -3113,7 +3159,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       config,
       runId
     );
-    const approvalReviewEvidence = getToolApprovalReviewEvidence(config);
+    const approvalReviewEvidence = getToolApprovalReviewEvidence(config,
+      getToolBatchReplayOwner(config, this.executingAgentId ?? this.agentId ?? ''));
     const hasPendingApproval = preToolCalls.some(
       (entry) =>
         entry.call.id != null &&
@@ -3386,6 +3433,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            */
           if (hookResult.updatedInput != null) {
             applyInputOverride(entry, hookResult.updatedInput);
+          } else {
+            const reviewed = getReviewedToolApproval(approvalReviewEvidence?.payload, entry.call.id);
+            if (reviewed != null) {
+              entry.args = this.coerceEventToolArgs(entry.call.name, reviewed.request.arguments);
+              if (entry.call.id != null) {
+                unresolvedByCallId.delete(entry.call.id);
+              }
+            }
           }
           askEntries.push({
             entry,
@@ -3403,6 +3458,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           entry.call.id
         );
         if (reviewedApproval != null) {
+          if (hookResult.updatedInput == null) {
+            entry.args = this.coerceEventToolArgs(
+              entry.call.name,
+              reviewedApproval.request.arguments
+            );
+            if (entry.call.id != null) {
+              unresolvedByCallId.delete(entry.call.id);
+            }
+          }
           askEntries.push({
             entry,
             reason: reviewedApproval.request.description,
@@ -4531,6 +4595,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       result: SettledDirectToolResult
     ): SettledDirectToolResult => {
       baseContext.additionalContextsSink?.push(...result.additionalContexts);
+      const refMeta = isBaseMessage(result.output) ? result.output.additional_kwargs as t.ToolMessageRefMetadata : undefined;
+      if (refMeta?._refKey != null && result.referenceContent != null) {
+        this.toolOutputRegistry?.set(baseContext.batchScopeId, refMeta._refKey, result.referenceContent);
+      }
       if (
         call.id != null &&
         result.resolvedArgs != null &&
@@ -4549,6 +4617,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           ? settledBatchResults?.get(call.id)
           : undefined;
       if (cachedResult != null) {
+        if (cachedResult.proposal != null && (cachedResult.proposal.name !== call.name ||
+          !recordArgsEqual(cachedResult.proposal.args, call.args as Record<string, unknown>))) {
+          throw new Error('Cannot change an already completed tool call during approval replay');
+        }
         return restoreResult(call, cachedResult);
       }
       const additionalContexts: string[] = [];
@@ -4562,10 +4634,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           ? undefined
           : baseContext.resolvedArgsByCallId?.get(call.id);
       const result: SettledDirectToolResult = {
+        proposal: structuredClone({ name: call.name, args: call.args as Record<string, unknown> }),
         output,
         additionalContexts,
         ...(resolvedArgs == null ? {} : { resolvedArgs }),
       };
+      const refMeta = isBaseMessage(output) ? output.additional_kwargs as t.ToolMessageRefMetadata : undefined;
+      if (refMeta?._refKey != null) {
+        result.referenceContent = this.toolOutputRegistry?.get(refMeta._refScope, refMeta._refKey);
+      }
       cacheResult(call, result);
       return restoreResult(call, result);
     };
@@ -4576,10 +4653,21 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       directCalls.some((call) => interrupting.has(call.name));
 
     if (!hasInterrupting) {
-      const results = await Promise.all(
+      const results = await Promise.allSettled(
         directCalls.map((call, i) => runOne(call, i))
       );
-      return results.map((result) => result.output);
+      this.throwIfBreakerTripped(config);
+      const failed = results.find((result) => result.status === 'rejected' && !isGraphInterrupt(result.reason)) ??
+        results.find((result) => result.status === 'rejected');
+      if (failed?.status === 'rejected') {
+        throw failed.reason;
+      }
+      return results.map((result) => {
+        if (result.status === 'rejected') {
+          throw result.reason;
+        }
+        return result.value.output;
+      });
     }
 
     const outputs: (BaseMessage | Command)[] = new Array(directCalls.length);
@@ -4771,9 +4859,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      * every subsequent registry call on this batch.
      */
     const incomingRunId = config.configurable?.run_id as string | undefined;
-    const incomingThreadId = config.configurable?.thread_id as
-      | string
-      | undefined;
     const batchScopeId = incomingRunId ?? `\0anon-${this.anonBatchCounter++}`;
     const turn = this.toolOutputRegistry?.nextTurn(batchScopeId) ?? 0;
     let outputs: (BaseMessage | Command)[];
@@ -4814,8 +4899,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           ? undefined
           : getAssistantBatchReplayKey(
             sendAssistantBatch,
-            incomingRunId,
-            incomingThreadId
+            getToolBatchReplayScope(config)
           );
       const sendOutput = await this.runDirectToolWithLifecycleHooks(
         input.lg_tool_call,
@@ -4880,8 +4964,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const aiMessage = assistantBatch.message;
       replayBatchKey = getAssistantBatchReplayKey(
         assistantBatch,
-        incomingRunId,
-        incomingThreadId
+        getToolBatchReplayScope(config)
       );
 
       if (this.loadRuntimeTools) {
@@ -5037,6 +5120,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const directIndices = directEntries.map((e) => e.batchIndex);
         const eventCalls = eventEntries.map((e) => e.call);
         const eventIndices = eventEntries.map((e) => e.batchIndex);
+        const approvalScopeCallIds = new Set(
+          filteredCalls.flatMap((call) => (call.id == null ? [] : [call.id]))
+        );
 
         /**
          * Snapshot the event calls' args against the *pre-batch*
@@ -5102,6 +5188,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 preBatchSnapshot,
                 additionalContextsSink: directAdditionalContexts,
                 replayBatchKey,
+                approvalScopeCallIds,
                 runInput: input as T,
               }
             )
@@ -5189,6 +5276,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const preBatchSnapshot =
           this.toolOutputRegistry?.snapshot(batchScopeId);
         const directAdditionalContexts: string[] = [];
+        const approvalScopeCallIds = new Set(
+          filteredCalls.flatMap((call) => (call.id == null ? [] : [call.id]))
+        );
         const toolOutputs = await this.runDirectBatchInterruptSafe(
           filteredCalls,
           filteredCalls.map((_call, i) => i),
@@ -5201,6 +5291,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             preBatchSnapshot,
             additionalContextsSink: directAdditionalContexts,
             replayBatchKey,
+            approvalScopeCallIds,
             runInput: input as T,
           }
         );

@@ -71,9 +71,13 @@ import {
 } from '@/langfuseConfig';
 import {
   cloneToolApprovalInterruptPayload,
-  createToolApprovalReviewEvidence,
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
 } from '@/hitl/approvalReview';
+import {
+  TOOL_BATCH_REPLAY_KEY,
+  restoreToolReplayConfig,
+  stripToolBatchReplayState,
+} from '@/tools/toolBatchReplay';
 import {
   resolveLangfuseDestinationKey,
   resolveLangfuseTraceAnchorParent,
@@ -1268,6 +1272,7 @@ export class Run<_T extends t.BaseGraphState> {
       configurable: { ...callerConfig.configurable },
     };
     delete config.configurable?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+    delete config.configurable?.[TOOL_BATCH_REPLAY_KEY];
     if (!isResume) {
       delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
@@ -1281,12 +1286,8 @@ export class Run<_T extends t.BaseGraphState> {
       const publicPayload = stripSubagentResumeManifest(
         stripRunStepResumeState(this._interrupt?.payload)
       );
-      const reviewEvidence = createToolApprovalReviewEvidence(
-        this._interrupt?.interruptId,
-        publicPayload
-      );
-      if (reviewEvidence != null && config.configurable != null) {
-        config.configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY] = reviewEvidence;
+      if (config.configurable != null) {
+        restoreToolReplayConfig(config.configurable, this._interrupt?.interruptId, publicPayload);
       }
       if (graph.getStopContinuationExecutionId() === '') {
         graph.startStopContinuationExecution(nanoid());
@@ -1895,9 +1896,9 @@ export class Run<_T extends t.BaseGraphState> {
     return {
       ...this._interrupt,
       payload: cloneToolApprovalInterruptPayload(
-        stripSubagentResumeManifest(
+        stripToolBatchReplayState(stripSubagentResumeManifest(
           stripRunStepResumeState(this._interrupt.payload)
-        )
+        ))
       ),
     } as t.RunInterruptResult<TPayload>;
   }
@@ -2024,6 +2025,7 @@ export class Run<_T extends t.BaseGraphState> {
     );
     const resumeConfigurable = { ...callerConfig.configurable };
     delete resumeConfigurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+    delete resumeConfigurable[TOOL_BATCH_REPLAY_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = nanoid();
@@ -2033,13 +2035,7 @@ export class Run<_T extends t.BaseGraphState> {
     const publicPayload = stripSubagentResumeManifest(
       stripRunStepResumeState(interrupt?.payload)
     );
-    const reviewEvidence = createToolApprovalReviewEvidence(
-      interrupt?.interruptId,
-      publicPayload
-    );
-    if (reviewEvidence != null) {
-      resumeConfigurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY] = reviewEvidence;
-    }
+    restoreToolReplayConfig(resumeConfigurable, interrupt?.interruptId, publicPayload);
     const manifestConfig = {
       ...callerConfig,
       configurable: resumeConfigurable,
