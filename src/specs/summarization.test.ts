@@ -286,6 +286,21 @@ function logTurn(
   );
 }
 
+function addDeterministicSummarizationPressure(
+  conversationHistory: BaseMessage[],
+  label: string
+): void {
+  const pressure = `${label} stable compaction evidence. `.repeat(300);
+  conversationHistory.push(
+    new HumanMessage(
+      `Retain this deterministic context for the summarization check. ${pressure}`
+    ),
+    new AIMessage(
+      `Recorded the deterministic context for the summarization check. ${pressure}`
+    )
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic Summarization Tests
 // ---------------------------------------------------------------------------
@@ -564,7 +579,7 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
       'What is 355 / 113? Use the calculator. This should approximate pi.',
       streamConfig
     );
-    logTurn('T5', conversationHistory);
+    logTurn('T5', conversationHistory, `parts=${contentParts.length}`);
 
     // Turn 6: if still no summarization, squeeze harder
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
@@ -588,14 +603,19 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
         'Calculate 999 * 999 with the calculator. Also compute 123456789 % 97.',
         streamConfig
       );
-      logTurn('T6', conversationHistory);
+      logTurn('T6', conversationHistory, `parts=${contentParts.length}`);
     }
 
-    // Turn 7: absolute minimum context if still nothing
+    // Provider output length varies, so add deterministic history rather than
+    // shrinking below the minimum viable instruction and tool-schema budget.
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(1200));
+      addDeterministicSummarizationPressure(
+        conversationHistory,
+        'anthropic-heavy'
+      );
+      ({ run, contentParts } = await createRun(3200));
       await runTurn({ run, conversationHistory }, 'What is 1+1?', streamConfig);
-      logTurn('T7', conversationHistory);
+      logTurn('T7', conversationHistory, `parts=${contentParts.length}`);
     }
 
     console.log(
@@ -842,52 +862,11 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
     );
 
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(3400);
-      await runTurn(
-        { run, conversationHistory },
-        'Compute 7! (factorial of 7) with calculator.',
-        streamConfig
+      addDeterministicSummarizationPressure(
+        conversationHistory,
+        'anthropic-cross-provider'
       );
-    }
-
-    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(3300);
-      await runTurn(
-        { run, conversationHistory },
-        'What is 256 * 256? Calculator.',
-        streamConfig
-      );
-    }
-
-    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(3200);
-      await runTurn(
-        { run, conversationHistory },
-        'Compute 100 + 200 with calculator.',
-        streamConfig
-      );
-    }
-
-    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(3100);
-      await runTurn(
-        { run, conversationHistory },
-        'What is 50 * 50? Calculator.',
-        streamConfig
-      );
-    }
-
-    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
       run = await createRun(3000);
-      await runTurn(
-        { run, conversationHistory },
-        'Compute 11 * 13 with calculator.',
-        streamConfig
-      );
-    }
-
-    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(1000);
       await runTurn(
         { run, conversationHistory },
         'What is 9 * 9? Calculator.',
@@ -1026,7 +1005,11 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
       'What is 2 * 512? Use the calculator.',
       streamConfig
     );
-    logTurn('T4-think', conversationHistory);
+    logTurn(
+      'T4-think',
+      conversationHistory,
+      `parts=${contentParts.length}`
+    );
 
     // Turn 5: tighter context to trigger summarization
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
@@ -1036,18 +1019,31 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
         'What is 999 * 999? Use the calculator.',
         streamConfig
       );
-      logTurn('T5-think', conversationHistory);
+      logTurn(
+        'T5-think',
+        conversationHistory,
+        `parts=${contentParts.length}`
+      );
     }
 
-    // Turn 6: squeeze harder if needed
+    // Provider output length varies, so add deterministic history rather than
+    // shrinking below the minimum viable instruction and tool-schema budget.
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(1000));
+      addDeterministicSummarizationPressure(
+        conversationHistory,
+        'anthropic-thinking'
+      );
+      ({ run, contentParts } = await createRun(2500));
       await runTurn(
         { run, conversationHistory },
         'What is 42 * 42? Use the calculator.',
         streamConfig
       );
-      logTurn('T6-think', conversationHistory);
+      logTurn(
+        'T6-think',
+        conversationHistory,
+        `parts=${contentParts.length}`
+      );
     }
 
     console.log(
@@ -1408,34 +1404,20 @@ const hasOpenAI = hasEnv('OPENAI_API_KEY');
     );
     logTurn('T5', conversationHistory);
 
-    // Squeeze hard — OpenAI tool-schema overhead is lower than Anthropic,
-    // so we need tighter budgets to force pruning + summarization.
-    run = await createRun(800);
-    await runTurn(
-      { run, conversationHistory },
-      'Calculate 999999 / 7 with calculator. Remind me of prior results too.',
-      streamConfig
-    );
-    logTurn('T6', conversationHistory);
-
+    // Provider output length varies, so add deterministic history rather than
+    // shrinking below the minimum viable instruction and tool-schema budget.
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(600);
+      addDeterministicSummarizationPressure(
+        conversationHistory,
+        'openai-calculator'
+      );
+      run = await createRun(2000);
       await runTurn(
         { run, conversationHistory },
-        'What is 50 + 50? Calculator.',
+        'Calculate 999999 / 7 with calculator. Remind me of prior results too.',
         streamConfig
       );
-      logTurn('T7', conversationHistory);
-    }
-
-    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(400);
-      await runTurn(
-        { run, conversationHistory },
-        'What is 1+1? Calculator.',
-        streamConfig
-      );
-      logTurn('T8', conversationHistory);
+      logTurn('T6', conversationHistory);
     }
 
     console.log(
