@@ -45,6 +45,8 @@ describe('createContextPressureMeter', () => {
       availableMessageTokens: 90,
       contextBudget: 100,
       effectiveInstructionTokens: 10,
+      toolMessageTokens: 0,
+      toolMessageTokenCounts: undefined,
     });
     expect(meter.measure(projected).projectedMessageTokens).toBe(33);
     /** Stored counts cover the baseline; only the changed projection and its
@@ -309,6 +311,42 @@ describe('createContextPressureMeter', () => {
       availableMessageTokens: 12,
       contextBudget: 17,
       effectiveInstructionTokens: 5,
+      toolMessageTokens: 0,
+      toolMessageTokenCounts: undefined,
     });
+  });
+
+  it('measures tool share during the provider-payload pass', () => {
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call-1', name: 'lookup', args: {} }],
+      }),
+      new ToolMessage({
+        content: 'result',
+        tool_call_id: 'call-1',
+      }),
+    ];
+    const tokenCounter = jest.fn(() => 0.5);
+    const meter = createContextPressureMeter({
+      tokenCounter,
+      sourceMessages: messages,
+      retainedMessages: messages,
+      indexTokenCountMap: {},
+      contextUsage: {
+        contextBudget: 100,
+        effectiveInstructionTokens: 10,
+        remainingContextTokens: 90,
+        calibrationRatio: 1,
+      },
+      instructionTokens: 10,
+      calibrationRatio: 1,
+    });
+
+    expect(meter.measure(messages)).toMatchObject({
+      toolMessageTokens: 1,
+      toolMessageTokenCounts: { lookup: 1 },
+    });
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
   });
 });

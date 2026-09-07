@@ -1,5 +1,6 @@
 import {
   AIMessage,
+  ChatMessage,
   FunctionMessage,
   HumanMessage,
   ToolMessage,
@@ -19,9 +20,9 @@ describe('resolveIntraTurnRetainTokens', () => {
         maxContextTokens: 100_000,
       })
     ).toBe(4_096);
-    expect(
-      resolveIntraTurnRetainTokens({ maxContextTokens: 100_000 })
-    ).toBe(16_000);
+    expect(resolveIntraTurnRetainTokens({ maxContextTokens: 100_000 })).toBe(
+      16_000
+    );
   });
 
   it('disables the fallback without a usable context budget', () => {
@@ -116,6 +117,21 @@ describe('splitAtRecencyBoundary', () => {
       expect(result.tail[0]).toBe(messages[4]);
       expect(result.tail).toHaveLength(6);
     });
+  });
+
+  it('uses the serving provider to classify generic turn boundaries', () => {
+    const genericAssistant = new ChatMessage({
+      role: 'assistant',
+      content: 'model turn',
+    });
+    const messages = [new HumanMessage('question'), genericAssistant];
+
+    expect(
+      splitAtRecencyBoundary(messages, { turns: 1, provider: 'openai' }).tail
+    ).toEqual(messages);
+    expect(
+      splitAtRecencyBoundary(messages, { turns: 1, provider: 'bedrock' }).tail
+    ).toEqual([genericAssistant]);
   });
 
   describe('disabled (turns: 0)', () => {

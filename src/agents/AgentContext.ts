@@ -2140,7 +2140,9 @@ export class AgentContext {
     syncBudgetDerivedFields(
       usage,
       context,
-      this.contextPressureTokenCounts?.count ?? tokenCounter
+      this.contextPressureTokenCounts?.count ?? tokenCounter,
+      undefined,
+      this.provider
     );
     return usage;
   }

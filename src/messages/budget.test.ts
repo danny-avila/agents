@@ -10,15 +10,15 @@ import {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { AgentLogEvent } from '@/types';
 import type * as t from '@/types';
-import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
-import { stampSyntheticProviderMessage } from './provenance';
-import { GraphEvents } from '@/common';
 import {
   compactSyntheticProviderContextMessage,
   foldToolBlocksForToollessAgent,
 } from './format';
-import { toLangChainContent } from './langchain';
+import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
+import { stampSyntheticProviderMessage } from './provenance';
 import { syncBudgetDerivedFields } from './budget';
+import { toLangChainContent } from './langchain';
+import { GraphEvents } from '@/common';
 
 function snapshot(
   messageTokens = 1_000,
@@ -630,19 +630,57 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 13 });
   });
 
-  it('keeps sub-token amounts through aggregation like the pruning path', () => {
+  it('rounds approximate counts after aggregating the retained tool share', () => {
     const usage = snapshot();
     const messages = [
-      toolResult('a', 'lookup'),
-      toolResult('b', 'lookup'),
-      toolResult('c', 'lookup'),
-      toolResult('d', 'lookup'),
+      toolResult('first'),
+      toolResult('second'),
+      toolResult('third'),
+      toolResult('fourth'),
     ];
 
     syncBudgetDerivedFields(usage, messages, () => 0.25);
 
     expect(usage.breakdown.toolMessageTokens).toBe(1);
-    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 1 });
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ unknown_tool: 1 });
+  });
+
+  it('uses the serving provider to interpret generic message roles', () => {
+    const messages = [
+      new ChatMessage({
+        role: 'assistant',
+        content: '',
+        additional_kwargs: {
+          tool_calls: [
+            {
+              id: 'generic',
+              type: 'function',
+              function: { name: 'lookup', arguments: '{}' },
+            },
+          ],
+        },
+      }),
+    ];
+    const openAIUsage = snapshot();
+    const bedrockUsage = snapshot();
+
+    syncBudgetDerivedFields(
+      openAIUsage,
+      messages,
+      () => 10,
+      undefined,
+      'openai'
+    );
+    syncBudgetDerivedFields(
+      bedrockUsage,
+      messages,
+      () => 10,
+      undefined,
+      'bedrock'
+    );
+
+    expect(openAIUsage.breakdown.toolMessageTokens).toBe(10);
+    expect(bedrockUsage.breakdown.toolMessageTokens).toBe(0);
   });
 
   it('attributes a reused call id to the call it currently answers', () => {

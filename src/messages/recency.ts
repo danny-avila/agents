@@ -1,15 +1,17 @@
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ProviderToolCallIndex } from './toolResultTypes';
-import { getProviderSourceMessageIds } from './provenance';
+import type { ProviderName } from '@/types/llm';
 import {
   appendProviderMessageToolCalls,
   appendProviderToolCallDescriptor,
   consumeProviderToolResultPair,
   getBoundedProviderPairingArray,
+  getProviderMessageRole,
   getProviderToolCallPartDescriptor,
   getProviderToolMessageResultDescriptor,
   getProviderToolResultPartDescriptor,
 } from './toolResultTypes';
+import { getProviderSourceMessageIds } from './provenance';
 
 export const DEFAULT_RETAIN_RECENT_TURNS = 2;
 export const DEFAULT_INTRA_TURN_RETAIN_RATIO = 0.16;
@@ -19,6 +21,8 @@ export const DEFAULT_INTRA_TURN_RETAIN_RATIO = 0.16;
  * and a tail (to be preserved verbatim).
  */
 export interface RecencyWindowOptions {
+  /** Serving provider used to interpret generic `ChatMessage` roles. */
+  provider?: ProviderName;
   /**
    * Maximum number of recent user-led turns to keep in the tail. A "turn"
    * begins at a user-authored HumanMessage and includes every following
@@ -100,12 +104,13 @@ interface MessagePairingResult {
 
 function inspectMessagePairing(
   message: BaseMessage,
-  calls: ProviderToolCallIndex
+  calls: ProviderToolCallIndex,
+  provider?: ProviderName
 ): MessagePairingResult {
-  const isHuman = message.getType() === 'human';
+  const isHuman = getProviderMessageRole(message, provider) === 'user';
   const candidateCalls = isHuman ? new Map(calls) : calls;
   if (!isHuman) {
-    appendProviderMessageToolCalls(message, candidateCalls);
+    appendProviderMessageToolCalls(message, candidateCalls, provider);
   }
   const content = getBoundedProviderPairingArray(message.content);
   let completedToolCalls = 0;
@@ -142,7 +147,10 @@ function inspectMessagePairing(
     }
   }
 
-  const toolMessageResult = getProviderToolMessageResultDescriptor(message);
+  const toolMessageResult = getProviderToolMessageResultDescriptor(
+    message,
+    provider
+  );
   if (
     toolMessageResult != null &&
     consumeProviderToolResultPair(toolMessageResult, candidateCalls)
@@ -161,20 +169,25 @@ function inspectMessagePairing(
     }
   }
   return {
-    completedToolCalls: isHuman && !trustedHumanToolResult
-      ? 0
-      : completedToolCalls,
+    completedToolCalls:
+      isHuman && !trustedHumanToolResult ? 0 : completedToolCalls,
     trustedHumanToolResult,
   };
 }
 
-function findTurnStarts(messages: BaseMessage[]): number[] {
+function findTurnStarts(
+  messages: BaseMessage[],
+  provider?: ProviderName
+): number[] {
   const turnStarts: number[] = [];
   const calls: ProviderToolCallIndex = new Map();
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i] as BaseMessage;
-    const pairing = inspectMessagePairing(message, calls);
-    if (message.getType() !== 'human' || pairing.trustedHumanToolResult) {
+    const pairing = inspectMessagePairing(message, calls, provider);
+    if (
+      getProviderMessageRole(message, provider) !== 'user' ||
+      pairing.trustedHumanToolResult
+    ) {
       continue;
     }
     turnStarts.push(i);
@@ -292,7 +305,7 @@ export function splitAtRecencyBoundary(
     };
   }
 
-  const turnStarts = findTurnStarts(messages);
+  const turnStarts = findTurnStarts(messages, options.provider);
 
   if (turnStarts.length === 0) {
     return {

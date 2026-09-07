@@ -5,6 +5,7 @@ import type {
   ChatMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import type { ProviderName } from '@/types/llm';
 
 export type ProviderToolCallKind =
   | 'tool'
@@ -329,10 +330,7 @@ function isCacheControl(value: unknown): boolean {
   }
   const ttl = readDataProperty(record, 'ttl');
   return (
-    !ttl.found ||
-    ttl.value === null ||
-    ttl.value === '5m' ||
-    ttl.value === '1h'
+    !ttl.found || ttl.value === null || ttl.value === '5m' || ttl.value === '1h'
   );
 }
 
@@ -365,9 +363,7 @@ function hasValidCallerProperty(record: Record<string, unknown>): boolean {
   return !property.found || isServerToolCaller(property.value);
 }
 
-function hasValidProviderMetadata(
-  record: Record<string, unknown>
-): boolean {
+function hasValidProviderMetadata(record: Record<string, unknown>): boolean {
   const id = readDataProperty(record, 'id');
   if (id.found && !isBoundedProviderPairingString(id.value)) {
     return false;
@@ -399,8 +395,7 @@ function hasValidProviderMetadata(
   }
   const signature = readDataProperty(record, 'thoughtSignature');
   return (
-    !signature.found ||
-    isBoundedProviderPairingString(signature.value, true)
+    !signature.found || isBoundedProviderPairingString(signature.value, true)
   );
 }
 
@@ -492,9 +487,7 @@ export function hasStructurallyValidAnthropicWebSearchResultContent(
   );
 }
 
-function isGoogleCodeExecutionResult(
-  record: Record<string, unknown>
-): boolean {
+function isGoogleCodeExecutionResult(record: Record<string, unknown>): boolean {
   const nested = readDataProperty(record, 'codeExecutionResult');
   const result = nested.found ? getRecord(nested.value) : undefined;
   const outcome = result == null ? undefined : readString(result, 'outcome');
@@ -608,48 +601,42 @@ const LOCAL_RESULT_METADATA_FIELDS = [
   'agentId',
   'groupId',
 ] as const;
-const TOOL_RESULT_ENVELOPE_FIELDS: Readonly<
-  Record<string, readonly string[]>
-> = {
-  advisor_tool_result: ANTHROPIC_RESULT_FIELDS,
-  bash_code_execution_tool_result: ANTHROPIC_RESULT_FIELDS,
-  code_execution_tool_result: ANTHROPIC_RESULT_FIELDS,
-  mcp_tool_result: ANTHROPIC_GENERIC_RESULT_FIELDS,
-  text_editor_code_execution_tool_result: ANTHROPIC_RESULT_FIELDS,
-  tool_search_tool_result: ANTHROPIC_RESULT_FIELDS,
-  tool_result: ANTHROPIC_GENERIC_RESULT_FIELDS,
-  web_fetch_tool_result: ANTHROPIC_SERVER_RESULT_FIELDS,
-  web_search_tool_result: ANTHROPIC_SERVER_RESULT_FIELDS,
-  server_tool_call_result: [
-    'type',
-    'toolCallId',
-    'status',
-    'output',
-    ...LOCAL_RESULT_METADATA_FIELDS,
-  ],
-  server_tool_result: [
-    'type',
-    'tool_call_id',
-    'status',
-    'output',
-    ...LOCAL_RESULT_METADATA_FIELDS,
-  ],
-  codeExecutionResult: [
-    'type',
-    'codeExecutionResult',
-    'agentId',
-    'groupId',
-  ],
-  toolResponse: [
-    'type',
-    'toolResponse',
-    'thought',
-    'thoughtSignature',
-    'agentId',
-    'groupId',
-  ],
-  toolResult: ['type', 'toolResult', 'agentId', 'groupId'],
-};
+const TOOL_RESULT_ENVELOPE_FIELDS: Readonly<Record<string, readonly string[]>> =
+  {
+    advisor_tool_result: ANTHROPIC_RESULT_FIELDS,
+    bash_code_execution_tool_result: ANTHROPIC_RESULT_FIELDS,
+    code_execution_tool_result: ANTHROPIC_RESULT_FIELDS,
+    mcp_tool_result: ANTHROPIC_GENERIC_RESULT_FIELDS,
+    text_editor_code_execution_tool_result: ANTHROPIC_RESULT_FIELDS,
+    tool_search_tool_result: ANTHROPIC_RESULT_FIELDS,
+    tool_result: ANTHROPIC_GENERIC_RESULT_FIELDS,
+    web_fetch_tool_result: ANTHROPIC_SERVER_RESULT_FIELDS,
+    web_search_tool_result: ANTHROPIC_SERVER_RESULT_FIELDS,
+    server_tool_call_result: [
+      'type',
+      'toolCallId',
+      'status',
+      'output',
+      ...LOCAL_RESULT_METADATA_FIELDS,
+    ],
+    server_tool_result: [
+      'type',
+      'tool_call_id',
+      'status',
+      'output',
+      ...LOCAL_RESULT_METADATA_FIELDS,
+    ],
+    codeExecutionResult: ['type', 'codeExecutionResult', 'agentId', 'groupId'],
+    toolResponse: [
+      'type',
+      'toolResponse',
+      'thought',
+      'thoughtSignature',
+      'agentId',
+      'groupId',
+    ],
+    toolResult: ['type', 'toolResult', 'agentId', 'groupId'],
+  };
 
 function anthropicDescriptor(
   record: Record<string, unknown>,
@@ -658,9 +645,7 @@ function anthropicDescriptor(
 ): ProviderToolResultPartDescriptor | undefined {
   const toolCallId = readPairingString(record, 'tool_use_id');
   const content = readDataProperty(record, 'content');
-  return toolCallId != null &&
-    content.found &&
-    getRecord(content.value) != null
+  return toolCallId != null && content.found && getRecord(content.value) != null
     ? {
       type,
       toolCallId,
@@ -678,7 +663,8 @@ export function getProviderToolResultPartDescriptor(
     return undefined;
   }
   const type = readString(record, 'type');
-  const allowedFields = type == null ? undefined : TOOL_RESULT_ENVELOPE_FIELDS[type];
+  const allowedFields =
+    type == null ? undefined : TOOL_RESULT_ENVELOPE_FIELDS[type];
   if (
     type == null ||
     allowedFields == null ||
@@ -691,19 +677,14 @@ export function getProviderToolResultPartDescriptor(
   }
   const structuredToolNames = ANTHROPIC_STRUCTURED_RESULT_TOOL_NAMES[type];
   if (structuredToolNames != null) {
-    return anthropicDescriptor(
-      record,
-      type,
-      structuredToolNames
-    );
+    return anthropicDescriptor(record, type, structuredToolNames);
   }
   if (type === 'web_search_tool_result') {
     const toolCallId = readPairingString(record, 'tool_use_id');
     const content = readDataProperty(record, 'content');
     return toolCallId != null &&
       content.found &&
-      (getRecord(content.value) != null ||
-        isOpaqueBoundedArray(content.value))
+      (getRecord(content.value) != null || isOpaqueBoundedArray(content.value))
       ? {
         type,
         toolCallId,
@@ -823,10 +804,7 @@ function getAnthropicCallKind(
   if (type === 'mcp_tool_use') {
     return 'mcp';
   }
-  if (
-    type === 'server_tool_use' ||
-    isAnthropicServerToolCall(callId, name)
-  ) {
+  if (type === 'server_tool_use' || isAnthropicServerToolCall(callId, name)) {
     return 'anthropic-server';
   }
   return 'tool';
@@ -886,11 +864,7 @@ export function getProviderAIMessageToolCallDescriptor(
   const record = getRecord(toolCall);
   if (
     record == null ||
-    !hasExactCallShape(
-      record,
-      AI_TOOL_CALL_FIELDS,
-      ['id', 'name', 'args']
-    ) ||
+    !hasExactCallShape(record, AI_TOOL_CALL_FIELDS, ['id', 'name', 'args']) ||
     !hasOptionalCallType(record, 'tool_call')
   ) {
     return undefined;
@@ -926,18 +900,14 @@ export function getProviderToolCallPartDescriptor(
         ['type', 'tool_call', 'agentId', 'groupId'],
         ['tool_call']
       )
-      : hasExactCallShape(
-        record,
-        STANDARD_CALL_FIELDS,
-        ['id', 'name', 'args']
-      );
+      : hasExactCallShape(record, STANDARD_CALL_FIELDS, ['id', 'name', 'args']);
     const callIsValid = nested.found
       ? call != null &&
-        hasExactCallShape(
-          call,
-          LIBRECHAT_CALL_FIELDS,
-          ['id', 'name', 'args']
-        ) &&
+        hasExactCallShape(call, LIBRECHAT_CALL_FIELDS, [
+          'id',
+          'name',
+          'args',
+        ]) &&
         hasOptionalCallType(call, 'tool_call')
       : call != null;
     if (!outerIsValid || !callIsValid) {
@@ -997,11 +967,7 @@ export function getProviderToolCallPartDescriptor(
   }
   if (type === 'server_tool_call') {
     if (
-      !hasExactCallShape(
-        record,
-        STANDARD_CALL_FIELDS,
-        ['id', 'name', 'args']
-      )
+      !hasExactCallShape(record, STANDARD_CALL_FIELDS, ['id', 'name', 'args'])
     ) {
       return undefined;
     }
@@ -1252,7 +1218,8 @@ const GENERIC_MESSAGE_ROLES: Readonly<Record<string, ProviderMessageRole>> = {
  * generic assistant, tool and function messages the converters accept.
  */
 export function getProviderMessageRole(
-  message: BaseMessage
+  message: BaseMessage,
+  provider?: ProviderName
 ): ProviderMessageRole | undefined {
   const type = message.getType();
   switch (type) {
@@ -1267,6 +1234,9 @@ export function getProviderMessageRole(
   case 'function':
     return 'function';
   case 'generic': {
+    if (provider === 'bedrock') {
+      return 'user';
+    }
     const role = (message as Partial<ChatMessage>).role;
     return typeof role === 'string' ? GENERIC_MESSAGE_ROLES[role] : undefined;
   }
@@ -1313,9 +1283,10 @@ export function getRawToolCallDescriptor(
  */
 export function appendProviderMessageToolCalls(
   message: BaseMessage,
-  calls: ProviderToolCallIndex
+  calls: ProviderToolCallIndex,
+  provider?: ProviderName
 ): number {
-  if (getProviderMessageRole(message) !== 'assistant') {
+  if (getProviderMessageRole(message, provider) !== 'assistant') {
     return 0;
   }
   let recognized = 0;
@@ -1365,9 +1336,10 @@ export function appendProviderMessageToolCalls(
 /** Describes a whole-message tool result: a `ToolMessage`, a `FunctionMessage`,
  *  or a generic message carrying the equivalent wire role. */
 export function getProviderToolMessageResultDescriptor(
-  message: BaseMessage
+  message: BaseMessage,
+  provider?: ProviderName
 ): ProviderToolResultPartDescriptor | undefined {
-  const role = getProviderMessageRole(message);
+  const role = getProviderMessageRole(message, provider);
   if (role === 'function' && message.name != null) {
     const toolCallId = getLegacyFunctionCallId(message.name);
     return toolCallId == null
