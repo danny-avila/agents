@@ -776,7 +776,7 @@ export function isProviderToolContentPart(part: unknown): boolean {
   return (
     type != null &&
     (PROVIDER_TOOL_CALL_CONTENT_TYPES.has(type) ||
-      TOOL_RESULT_ENVELOPE_FIELDS[type] != null)
+      Object.prototype.hasOwnProperty.call(TOOL_RESULT_ENVELOPE_FIELDS, type))
   );
 }
 

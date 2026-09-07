@@ -158,7 +158,10 @@ import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { isFadingTier, isInformativeFadingTier } from '@/messages/fading';
 import { createContextPressureMeter } from '@/llm/contextPressureMeter';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
-import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
+import {
+  prepareProviderRequest,
+  usesNativeOpenAIResponses,
+} from '@/llm/prepareProviderRequest';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
 import { calculateMaxToolCallInputChars } from '@/utils/truncation';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
@@ -3674,7 +3677,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             foldToolBlocksForToollessAgent(
               before,
               config,
-              agentContext.provider
+              usesNativeOpenAIResponses(
+                (this.overrideModel ?? model) as t.ChatModel,
+                agentContext.provider,
+                config
+              )
             )
           );
           if (agentContext.useLegacyContent) {
@@ -4508,6 +4515,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   maxContextTokens: fallbackMaxContextTokens,
                   config: fallbackConfig,
                 }) => {
+                  const servingFallbackMessages =
+                    toolsForBinding == null || toolsForBinding.length === 0
+                      ? foldToolBlocksForToollessAgent(
+                        fallbackMessages,
+                        fallbackConfig,
+                        usesNativeOpenAIResponses(
+                          fallbackModel,
+                          fallbackProvider,
+                          fallbackConfig
+                        )
+                      )
+                      : fallbackMessages;
                   const fallbackToolResultChars =
                     agentContext.maxToolResultChars ??
                     calculateMaxToolResultChars(
@@ -4523,7 +4542,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       );
                   const preparedFallbackRequest = prepareProviderRequest({
                     model: fallbackModel,
-                    messages: fallbackMessages,
+                    messages: servingFallbackMessages,
                     provider: fallbackProvider,
                     context: this,
                     config: fallbackConfig,
@@ -4531,7 +4550,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     measure: (preparedMessages) =>
                       measureProviderPayload(
                         trackProviderMessageOrigins(
-                          fallbackMessages,
+                          servingFallbackMessages,
                           preparedMessages
                         ),
                         {

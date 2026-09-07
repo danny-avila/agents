@@ -13,7 +13,6 @@ import {
 } from './format';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { toLangChainContent } from './langchain';
-import { Providers } from '@/common';
 
 /** Concatenated text across a message's content (string or structured array). */
 function getTextContent(msg: {
@@ -524,10 +523,37 @@ describe('foldToolBlocksForToollessAgent', () => {
     const result = foldToolBlocksForToollessAgent(
       messages,
       undefined,
-      Providers.OPENAI
+      true
     );
 
     expect(result).toBe(messages);
+  });
+
+  test('folds authoritative Responses v0 server output for another provider', () => {
+    const messages = [
+      new AIMessage({
+        content: 'The calculation completed.',
+        response_metadata: {
+          model_provider: 'openai',
+          output: [
+            {
+              id: 'server-1',
+              type: 'code_interpreter_call',
+              status: 'completed',
+              code: 'print(2 + 2)',
+              outputs: [{ type: 'logs', logs: '4' }],
+            },
+          ],
+        },
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(result).not.toBe(messages);
+    expect(getTextContent(result[0])).toContain('server_tool_output');
+    expect(getTextContent(result[0])).toContain('code_interpreter_call');
+    expect(getTextContent(result[0])).toContain('The calculation completed.');
   });
 
   test('detects v1 standard-content tool_call blocks (no AIMessage.tool_calls)', () => {

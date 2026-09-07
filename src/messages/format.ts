@@ -3762,6 +3762,45 @@ function flushTextChunks(
   textChunks.length = 0;
 }
 
+const OPENAI_RESPONSES_SERVER_TOOL_TYPES: ReadonlySet<string> = new Set([
+  'code_interpreter_call',
+  'computer_call',
+  'file_search_call',
+  'image_generation_call',
+  'mcp_call',
+  'web_search_call',
+]);
+
+function getAuthoritativeResponsesToolOutput(
+  message: BaseMessage
+): readonly unknown[] | undefined {
+  const responseOutput = getBoundedProviderPairingArrayProperty(
+    message.response_metadata,
+    'output'
+  );
+  const toolOutputs = getBoundedProviderPairingArrayProperty(
+    message.additional_kwargs,
+    'tool_outputs'
+  );
+  const output =
+    responseOutput != null && responseOutput.length > 0
+      ? responseOutput
+      : toolOutputs;
+  if (output == null || output.length === 0) {
+    return undefined;
+  }
+  for (let index = 0; index < output.length; index++) {
+    const type = readFoldedDataProperty(output[index], 'type');
+    if (
+      typeof type === 'string' &&
+      OPENAI_RESPONSES_SERVER_TOOL_TYPES.has(type)
+    ) {
+      return output;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Appends a single message's content to the running `textChunks` / `parts`
  * accumulators. Portable image blocks are shallow-copied into `parts` so
@@ -3789,6 +3828,13 @@ function appendMessageContent(
       contentComplete =
         consumeFoldedWork(textChunks, budget) &&
         appendFoldedLine(textChunks, budget, [`${role}: `, content]);
+    }
+    const responsesOutput = getAuthoritativeResponsesToolOutput(msg);
+    if (responsesOutput != null) {
+      appendFoldedLine(textChunks, budget, [
+        'AI: [server_tool_output] ',
+        serializeFoldedValue(responsesOutput),
+      ]);
     }
     const toolCalls = appendToolCalls(msg, role, textChunks, budget);
     return budget.remainingChars < remainingCharsBefore || toolCalls.contributed
@@ -3996,6 +4042,17 @@ function appendMessageContent(
       ]);
     }
     markBlockRetained();
+  }
+
+  if (!hasToolUseBlock) {
+    const responsesOutput = getAuthoritativeResponsesToolOutput(msg);
+    if (responsesOutput != null) {
+      appendFoldedLine(textChunks, budget, [
+        'AI: [server_tool_output] ',
+        serializeFoldedValue(responsesOutput),
+      ]);
+      hasToolUseBlock = true;
+    }
   }
 
   // If content array had no tool_use blocks, fall back to tool_calls metadata
@@ -4306,7 +4363,7 @@ export function ensureThinkingBlockInMessages(
  *  `assistant(tool_calls) -> user(...)` sequence. */
 function messageHasToolContent(
   msg: BaseMessage,
-  provider?: ProviderName
+  preserveNativeOpenAIResponses = false
 ): boolean {
   if (isToolMessage(msg)) {
     return true;
@@ -4324,7 +4381,7 @@ function messageHasToolContent(
     for (const block of msg.content as ExtendedMessageContent[]) {
       const type = readFoldedDataProperty(block, 'type');
       const isNativeOpenAIServerContent =
-        provider === Providers.OPENAI &&
+        preserveNativeOpenAIResponses &&
         (type === 'server_tool_call' ||
           type === 'server_tool_call_result' ||
           type === 'server_tool_result');
@@ -4341,6 +4398,12 @@ function messageHasToolContent(
     if (hasOpenAINativeServerContent) {
       return false;
     }
+  }
+  if (
+    !preserveNativeOpenAIResponses &&
+    getAuthoritativeResponsesToolOutput(msg) != null
+  ) {
+    return true;
   }
   return false;
 }
@@ -4402,7 +4465,7 @@ function getFoldedMessageRole(msg: BaseMessage): 'AI' | 'Tool' {
 export function foldToolBlocksForToollessAgent(
   messages: BaseMessage[],
   config?: RunnableConfig,
-  provider?: ProviderName
+  preserveNativeOpenAIResponses = false
 ): BaseMessage[] {
   let result: BaseMessage[] | null = null;
   let foldedCount = 0;
@@ -4410,7 +4473,7 @@ export function foldToolBlocksForToollessAgent(
   let i = 0;
   while (i < messages.length) {
     const msg = messages[i];
-    if (!messageHasToolContent(msg, provider)) {
+    if (!messageHasToolContent(msg, preserveNativeOpenAIResponses)) {
       result?.push(msg);
       i++;
       continue;
