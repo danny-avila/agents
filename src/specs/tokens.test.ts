@@ -252,6 +252,56 @@ describe('getTokenCountForMessage', () => {
     expect(count).toBeGreaterThan(5_000);
   });
 
+  test('counts raw OpenAI tool calls when parsed tool_calls are absent', () => {
+    const message = new AIMessage('');
+    message.additional_kwargs.tool_calls = [
+      {
+        id: 'raw-call',
+        type: 'function',
+        function: {
+          name: 'raw_lookup',
+          arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+        },
+      },
+    ];
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(message.tool_calls).toHaveLength(0);
+    expect(count).toBeGreaterThan(5_000);
+  });
+
+  test('does not double-count raw OpenAI calls mirrored in parsed tool_calls', () => {
+    const parsed = new AIMessage({
+      content: '',
+      tool_calls: [
+        { id: 'mirrored-call', name: 'lookup', args: { query: 'value' } },
+      ],
+    });
+    const mirrored = new AIMessage({
+      content: '',
+      tool_calls: [
+        { id: 'mirrored-call', name: 'lookup', args: { query: 'value' } },
+      ],
+      additional_kwargs: {
+        tool_calls: [
+          {
+            id: 'mirrored-call',
+            type: 'function',
+            function: {
+              name: 'lookup',
+              arguments: '{"query":"value"}',
+            },
+          },
+        ],
+      },
+    });
+
+    expect(getTokenCountForMessage(mirrored, (text) => text.length)).toBe(
+      getTokenCountForMessage(parsed, (text) => text.length)
+    );
+  });
+
   test('keeps nested dense strings on the bounded structured path', () => {
     const callbackLengths: number[] = [];
     const payload = 'x'.repeat(4 * 1024 * 1024);

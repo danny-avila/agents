@@ -1157,6 +1157,7 @@ export function getTokenCountForMessage(
   const messageRole = (message as BaseMessage & { role?: unknown }).role;
   if (messageType === 'ai' || messageRole === 'assistant') {
     const toolCalls = (message as AIMessage).tool_calls ?? [];
+    const parsedToolCallIds = new Set<string>();
     if (isProxy(toolCalls)) {
       throw new UnsafeTokenMeasurementError({
         reason: 'metadata_proxy',
@@ -1176,6 +1177,9 @@ export function getTokenCountForMessage(
       ) {
         continue;
       }
+      if (typeof toolCall.id === 'string' && toolCall.id.length > 0) {
+        parsedToolCallIds.add(toolCall.id);
+      }
       if (typeof toolCall.name === 'string' && toolCall.name.length > 0) {
         numTokens += countText(toolCall.name);
       }
@@ -1185,6 +1189,75 @@ export function getTokenCountForMessage(
           typeof args === 'string'
             ? countText(args)
             : getBoundedStructuredTokenCount(args, countText);
+      }
+    }
+    let rawToolCalls: PropertyDescriptor | undefined;
+    try {
+      rawToolCalls =
+        additionalKwargs != null
+          ? Object.getOwnPropertyDescriptor(additionalKwargs, 'tool_calls')
+          : undefined;
+    } catch {
+      throw new UnsafeTokenMeasurementError({
+        reason: 'metadata_accessor',
+        path: 'additional_kwargs.tool_calls',
+      });
+    }
+    if (rawToolCalls != null) {
+      if (!('value' in rawToolCalls)) {
+        throw new UnsafeTokenMeasurementError({
+          reason: 'metadata_accessor',
+          path: 'additional_kwargs.tool_calls',
+        });
+      }
+      const rawCalls = rawToolCalls.value;
+      if (rawCalls != null) {
+        if (!Array.isArray(rawCalls) || isProxy(rawCalls)) {
+          throw new UnsafeTokenMeasurementError({
+            reason: 'metadata_proxy',
+            path: 'additional_kwargs.tool_calls',
+          });
+        }
+        for (let i = 0; i < rawCalls.length; i++) {
+          const rawCall = rawCalls[i];
+          if (
+            rawCall == null ||
+            typeof rawCall !== 'object' ||
+            isProxy(rawCall)
+          ) {
+            throw new UnsafeTokenMeasurementError({
+              reason: 'metadata_proxy',
+              path: `additional_kwargs.tool_calls[${i}]`,
+            });
+          }
+          let id: PropertyDescriptor | undefined;
+          try {
+            id = Object.getOwnPropertyDescriptor(rawCall, 'id');
+          } catch {
+            throw new UnsafeTokenMeasurementError({
+              reason: 'metadata_accessor',
+              path: `additional_kwargs.tool_calls[${i}].id`,
+            });
+          }
+          if (id != null && !('value' in id)) {
+            throw new UnsafeTokenMeasurementError({
+              reason: 'metadata_accessor',
+              path: `additional_kwargs.tool_calls[${i}].id`,
+            });
+          }
+          const callId = id?.value;
+          if (
+            typeof callId === 'string' &&
+            (representedToolCallIds.has(callId) ||
+              parsedToolCallIds.has(callId))
+          ) {
+            continue;
+          }
+          numTokens += getBoundedStructuredTokenCount(rawCall, countText);
+          if (typeof callId === 'string' && callId.length > 0) {
+            representedToolCallIds.add(callId);
+          }
+        }
       }
     }
     let legacyFunctionCall: PropertyDescriptor | undefined;
