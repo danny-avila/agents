@@ -212,7 +212,7 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       }
       throw error;
     }
-  });
+  }, 60000);
 
   test(`${capitalizeFirstLetter(provider)}: should generate title using completion method`, async () => {
     if (contentFilterTriggered) {
