@@ -542,9 +542,11 @@ export function createBashProgrammaticToolCallingTool(
           (error as Error).message,
           code
         );
-        throw new Error(
-          `Bash programmatic execution failed: ${messageWithReminder}`
-        );
+        const message = `Bash programmatic execution failed: ${messageWithReminder}`;
+        if (error instanceof CodeApiRequestError) {
+          throw new CodeApiRequestError(message);
+        }
+        throw new Error(message, { cause: error });
       }
     },
     {

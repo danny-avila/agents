@@ -1,4 +1,5 @@
 import fetch from 'node-fetch';
+import { Readable } from 'node:stream';
 import {
   afterEach,
   beforeEach,
@@ -26,6 +27,8 @@ import {
 } from '../ProgrammaticToolCalling';
 import { createBashProgrammaticToolCallingTool } from '../BashProgrammaticToolCalling';
 import {
+  CodeApiRequestError,
+  buildCodeApiHttpErrorMessage,
   createCodeExecutionTool,
   resolveCodeApiAuthHeaders,
 } from '../CodeExecutor';
@@ -474,6 +477,108 @@ describe('CodeAPI auth header injection', () => {
     expect((error as Error).message).not.toContain('Cannot POST');
   });
 
+  it.each([400, 409, 422, 500, 503])(
+    'classifies worker capability mismatches independently of HTTP %s',
+    async (status) => {
+      fetchMock.mockResolvedValueOnce(
+        errorResponse(
+          status,
+          JSON.stringify({
+            error: 'bridge_worker_mismatch',
+            message:
+              'Code environment does not support this execution; select a compatible worker',
+          })
+        )
+      );
+      const error = await makeRequest('https://code.example/exec', {}).catch(
+        (caught: unknown) => caught
+      );
+      expect(error).toBeInstanceOf(CodeApiRequestError);
+      expect(error).toHaveProperty('retryable', false);
+      expect((error as Error).message).toContain('stateful workspace');
+      expect((error as Error).message).toContain('Do not retry');
+      expect((error as Error).message).not.toContain('temporarily');
+    }
+  );
+
+  it.each([
+    'BRIDGE_WORKER_MISMATCH',
+    'execution_profile_mismatch',
+    'capability_mismatch',
+    'unsupported_capability',
+  ])(
+    'recognizes structured capability code %s without exposing upstream text',
+    async (code) => {
+      fetchMock.mockResolvedValueOnce(
+        errorResponse(
+          503,
+          JSON.stringify({
+            code,
+            message: 'Bearer secret-token from private.internal',
+          })
+        )
+      );
+      const error = await makeRequest('https://code.example/exec', {}).catch(
+        (caught: unknown) => caught
+      );
+      expect(error).toHaveProperty('retryable', false);
+      expect((error as Error).message).not.toContain('secret-token');
+      expect((error as Error).message).not.toContain('private.internal');
+    }
+  );
+
+  it.each([
+    ['Bash', () => createBashExecutionTool().invoke({ command: 'echo 1' })],
+    ['Code', () => createCodeExecutionTool().invoke({ lang: 'py', code: 'print(1)' })],
+    ['Python PTC', () => createProgrammaticToolCallingTool().invoke({ code: 'print(1)' }, {
+      toolCall: { toolMap: toolMap(), toolDefs },
+    } as RunnableConfig)],
+  ] as const)('preserves non-retryable errors through the %s wrapper', async (_name, invoke) => {
+    fetchMock.mockResolvedValueOnce(errorResponse(409, JSON.stringify({ error: 'bridge_worker_mismatch' })));
+    const error = await invoke().catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(CodeApiRequestError);
+    expect(error).toHaveProperty('retryable', false);
+  });
+
+  it('does not tell programmatic Bash to rerun files after a permanent mismatch', async () => {
+    fetchMock.mockResolvedValueOnce(
+      errorResponse(
+        409,
+        JSON.stringify({
+          error: 'BRIDGE_WORKER_MISMATCH',
+          message:
+            'Bridge worker personal-vm does not provide a stateful workspace',
+        })
+      )
+    );
+    const error = await createBashProgrammaticToolCallingTool()
+      .invoke({ code: 'echo result > /mnt/data/result.txt' }, {
+        toolCall: { toolMap: toolMap(), toolDefs },
+      } as RunnableConfig)
+      .catch((caught: unknown) => caught);
+    expect(error).toHaveProperty('retryable', false);
+    expect((error as Error).message).toContain(
+      'does not provide a stateful workspace'
+    );
+    expect((error as Error).message).not.toContain('personal-vm');
+    expect((error as Error).message).not.toContain('fix the error and rerun');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    'not JSON',
+    'null',
+    '{"error":"bridge_worker_offline"}',
+    '{"error":"bridge_worker_busy"}',
+  ])('keeps unavailable failures retryable for %s', async (body) => {
+    fetchMock.mockResolvedValueOnce(errorResponse(503, body));
+    const error = await makeRequest('https://code.example/exec', {}).catch(
+      (caught: unknown) => caught
+    );
+    expect(error).toHaveProperty('retryable', true);
+    expect((error as Error).message).toContain('temporarily unavailable');
+  });
+
   it.each([401, 403])(
     'reports CodeAPI HTTP %s authorization failures as non-retryable',
     async (status) => {
@@ -636,7 +741,7 @@ describe('CodeAPI auth header injection', () => {
     debugSpy.mockRestore();
   });
 
-  it('discards a body it will never read, and keeps the one it will', async () => {
+  it('releases error response bodies after bounded classification', async () => {
     const destroy = jest.fn();
     fetchMock.mockResolvedValueOnce({
       ok: false,
@@ -663,8 +768,53 @@ describe('CodeAPI auth header injection', () => {
       .invoke({ command: 'echo 1' })
       .catch((caught: unknown) => caught);
 
-    expect(rateLimitedDestroy).not.toHaveBeenCalled();
+    expect(rateLimitedDestroy).toHaveBeenCalledTimes(1);
     expect((error as Error).message).toContain('Retry after 3 seconds');
+  });
+
+  it('classifies a real streamed error envelope', async () => {
+    const body = Readable.from([
+      Buffer.from('{"error":"bridge_'),
+      Buffer.from('worker_mismatch"}'),
+    ]);
+    const message = await buildCodeApiHttpErrorMessage('POST', '', {
+      status: 409,
+      body,
+      text: async () => '',
+    });
+    expect(message).toContain('permanent capability mismatch');
+    expect(body.destroyed).toBe(true);
+  });
+
+  it('stops reading oversized error bodies', async () => {
+    const body = Readable.from([
+      Buffer.alloc(64 * 1024 + 1),
+      Buffer.from('{"error":"bridge_worker_mismatch"}'),
+    ]);
+    const message = await buildCodeApiHttpErrorMessage('POST', '', {
+      status: 503,
+      body,
+      text: async () => '',
+    });
+    expect(message).toContain('temporarily unavailable');
+    expect(body.destroyed).toBe(true);
+  });
+
+  it('bounds stalled error reads and releases the stream', async () => {
+    jest.useFakeTimers();
+    const body = new Readable({ read() {} });
+    try {
+      const pending = buildCodeApiHttpErrorMessage('POST', '', {
+        status: 503,
+        body,
+        text: async () => '',
+      });
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(await pending).toContain('temporarily unavailable');
+      expect(body.destroyed).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('logs the rejection before the response body is drained', async () => {

@@ -469,7 +469,7 @@ export async function fetchSessionFiles(
     };
 
     const proxyAgent = resolveFetchProxyAgent(filesEndpoint, proxy);
-    if (proxyAgent) {
+    if (proxyAgent != null) {
       fetchOptions.agent = proxyAgent;
     }
 
@@ -531,7 +531,7 @@ export async function makeRequest(
     };
 
     const proxyAgent = resolveFetchProxyAgent(endpoint, proxy);
-    if (proxyAgent) {
+    if (proxyAgent != null) {
       fetchOptions.agent = proxyAgent;
     }
 
@@ -689,7 +689,7 @@ type ToolInputSchemaKind = {
 function detectSchemaKind(schema: unknown): ToolInputSchemaKind {
   const kind: ToolInputSchemaKind = { object: false, string: false };
 
-  if (!schema || typeof schema !== 'object') {
+  if (schema == null || typeof schema !== 'object') {
     return kind;
   }
 
@@ -704,7 +704,7 @@ function detectSchemaKind(schema: unknown): ToolInputSchemaKind {
   }
 
   const zodDef = (schema as { _def?: unknown })._def;
-  if (!zodDef || typeof zodDef !== 'object') {
+  if (zodDef == null || typeof zodDef !== 'object') {
     return kind;
   }
 
@@ -726,7 +726,7 @@ function detectSchemaKind(schema: unknown): ToolInputSchemaKind {
         type?: unknown;
       }
     ).innerType ?? (zodDef as { schema?: unknown }).schema;
-  if (innerSchema) {
+  if (innerSchema != null) {
     const innerKind = detectSchemaKind(innerSchema);
     kind.object ||= innerKind.object;
     kind.string ||= innerKind.string;
@@ -1221,9 +1221,11 @@ export function createProgrammaticToolCallingTool(
           (error as Error).message,
           code
         );
-        throw new Error(
-          `Programmatic execution failed: ${messageWithReminder}`
-        );
+        const message = `Programmatic execution failed: ${messageWithReminder}`;
+        if (error instanceof CodeApiRequestError) {
+          throw new CodeApiRequestError(message);
+        }
+        throw new Error(message, { cause: error });
       }
     },
     {
