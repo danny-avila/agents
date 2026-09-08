@@ -101,7 +101,8 @@ export function isToolReplayResume(
   isChildReplay: boolean
 ): boolean {
   const resumeMap: object | undefined = config.configurable?.__pregel_resume_map;
-  if (interruptId != null && resumeMap != null &&
+  if (interruptId != null &&
+    resumeMap != null &&
     !Object.prototype.hasOwnProperty.call(resumeMap, interruptId)) {
     return false;
   }
@@ -111,7 +112,8 @@ export function isToolReplayResume(
   const scratchpad: { resume?: { length: number }; nullResume?: unknown } | undefined =
     config.configurable?.__pregel_scratchpad;
   return scratchpad == null ||
-    (scratchpad.resume?.length ?? 0) > 0 || scratchpad.nullResume !== undefined;
+    (scratchpad.resume?.length ?? 0) > 0 ||
+    scratchpad.nullResume !== undefined;
 }
 
 export function getToolBatchReplayOwner(
