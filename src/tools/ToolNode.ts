@@ -128,7 +128,8 @@ import {
   attachToolBatchReplayState,
   restoreToolBatchReplayState,
   getToolBatchReplayState,
-  isChildToolApprovalOwner,
+  isChildToolReplayOwner,
+  isToolReplayResume,
 } from '@/tools/toolBatchReplay';
 
 function stripToolApprovalReviewConfig(
@@ -908,19 +909,36 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           config,
           this.executingAgentId ?? this.agentId ?? ''
         );
-        const reviewEvidence = getToolApprovalReviewEvidence(config);
-        if (reviewEvidence?.owner != null && reviewEvidence.owner !== replayOwner) {
+        let reviewEvidence = getToolApprovalReviewEvidence(config);
+        const replayState = getToolBatchReplayState(config.configurable);
+        const ownsParentBatch = replayState?.records.some(
+          (record) => record.owner === replayOwner && record.batch === activeReplayKey
+        ) === true;
+        let isChildReplay = false;
+        if (ownsParentBatch) {
           const calls = this.isSendInput(input) ? [input.lg_tool_call] : assistantBatch?.message.tool_calls ?? [];
           const trustedParentCallIds = new Set(calls.filter((call) =>
             call.name === Constants.SUBAGENT &&
             (this.toolMap.get(call.name) as ReplayableSubagentTool | undefined)?.[SUBAGENT_REPLAY_CONTROLLER] != null
           ).map((call) => call.id ?? ''));
-          const ownsParentBatch = getToolBatchReplayState(config.configurable)?.records.some(
-            (record) => record.owner === replayOwner && record.batch === activeReplayKey
-          ) === true;
-          if (!ownsParentBatch || !isChildToolApprovalOwner(config, reviewEvidence.owner, trustedParentCallIds)) {
-            throw new Error('Tool approval execution owner changed before resume — failing closed');
-          }
+          isChildReplay = reviewEvidence?.owner != null
+            ? isChildToolReplayOwner(config, reviewEvidence.owner, trustedParentCallIds)
+            : replayState.records.some((record) => isChildToolReplayOwner(config, record.owner, trustedParentCallIds));
+        }
+        if ((reviewEvidence?.owner != null || replayState != null) &&
+          !isToolReplayResume(config, reviewEvidence?.interruptId ?? replayState?.interruptId, isChildReplay)) {
+          config = {
+            ...config,
+            configurable: {
+              ...config.configurable,
+              [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: undefined,
+              [TOOL_BATCH_REPLAY_KEY]: undefined,
+            },
+          };
+          reviewEvidence = undefined;
+        }
+        if (reviewEvidence?.owner != null && reviewEvidence.owner !== replayOwner && !isChildReplay) {
+          throw new Error('Tool approval execution owner changed before resume — failing closed');
         }
         const referenceReplay: { state?: ToolOutputReferenceState } = {};
         const restoredBatches = await restoreToolBatchReplayState(config, replayOwner);

@@ -4,6 +4,7 @@ import {
   TOOL_BATCH_REPLAY_KEY,
   attachToolBatchReplayState,
   getToolBatchReplayOwner,
+  isToolReplayResume,
   getToolBatchReplayState,
   restoreToolBatchReplayState,
   stripToolBatchReplayState,
@@ -26,6 +27,30 @@ const approval = {
 };
 
 describe('checkpoint-owned tool batch replay', () => {
+  it.each([
+    { interruptId: 'current', resume: [[]], isChildReplay: false, expected: true },
+    { interruptId: 'prior', resume: [[]], isChildReplay: false, expected: false },
+    { interruptId: 'current', resume: [], isChildReplay: false, expected: false },
+    { interruptId: 'current', resume: [], isChildReplay: true, expected: true },
+    { interruptId: 'prior', resume: [], isChildReplay: true, expected: false },
+  ])('scopes replay to the active interrupt and consuming task: %j', ({ interruptId, resume, isChildReplay, expected }) => {
+    expect(isToolReplayResume({ configurable: {
+      __pregel_resume_map: { current: [{ type: 'approve' }] },
+      __pregel_scratchpad: { resume },
+    } }, interruptId, isChildReplay)).toBe(expected);
+  });
+
+  it('stamps question replay state with the checkpoint-owned interrupt id', async () => {
+    const payload = await attachToolBatchReplayState(
+      { type: 'ask_user_question', question: { question: 'Continue?' } },
+      'owner', new Map([['batch', new Map()]])
+    );
+    const configurable = {};
+    restoreToolReplayConfig(configurable, 'question-interrupt', payload);
+    expect(getToolBatchReplayState(configurable)?.interruptId).toBe('question-interrupt');
+    expect(getToolBatchReplayState(payload)?.interruptId).toBeUndefined();
+  });
+
   it('does not downgrade a versioned approval with a missing owner to legacy evidence', () => {
     expect(() => restoreToolReplayConfig({}, 'interrupt', {
       ...approval, [TOOL_BATCH_REPLAY_KEY]: { version: 1, records: [] },

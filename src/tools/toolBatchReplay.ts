@@ -49,6 +49,8 @@ export interface ToolBatchReplayRecord {
 interface ToolBatchReplayState {
   version: 1;
   approvalOwner?: string;
+  /** Populated from the pending interrupt by Run, including question pauses. */
+  interruptId?: string;
   records: ToolBatchReplayRecord[];
   wrappedPayload?: boolean;
 }
@@ -80,11 +82,36 @@ export function restoreToolReplayConfig(
     throw new Error('Invalid tool approval checkpoint');
   }
   if (state != null) {
-    configurable[TOOL_BATCH_REPLAY_KEY] = state;
+    configurable[TOOL_BATCH_REPLAY_KEY] = { ...state, interruptId };
   }
   if (review != null) {
     configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY] = review;
   }
+}
+
+/**
+ * Resume maps identify the checkpointed interrupt, while the task scratchpad
+ * identifies the node that can consume it. Config survives into later graph
+ * steps, so the presence of replay evidence alone does not imply a resume.
+ * A parent replaying a checkpointed child has no local resume value.
+ */
+export function isToolReplayResume(
+  config: RunnableConfig,
+  interruptId: string | undefined,
+  isChildReplay: boolean
+): boolean {
+  const resumeMap: object | undefined = config.configurable?.__pregel_resume_map;
+  if (interruptId != null && resumeMap != null &&
+    !Object.prototype.hasOwnProperty.call(resumeMap, interruptId)) {
+    return false;
+  }
+  if (isChildReplay && resumeMap != null) {
+    return true;
+  }
+  const scratchpad: { resume?: { length: number }; nullResume?: unknown } | undefined =
+    config.configurable?.__pregel_scratchpad;
+  return scratchpad == null ||
+    (scratchpad.resume?.length ?? 0) > 0 || scratchpad.nullResume !== undefined;
 }
 
 export function getToolBatchReplayOwner(
@@ -109,8 +136,8 @@ export function getToolBatchReplayScope(
   return typeof scope === 'string' && scope.length > 0 ? scope : undefined;
 }
 
-/** Foreign approval evidence may only transit a checkpoint-proven child path. */
-export function isChildToolApprovalOwner(
+/** Foreign replay evidence may only transit a checkpoint-proven child path. */
+export function isChildToolReplayOwner(
   config: RunnableConfig,
   owner: string,
   trustedParentCallIds: ReadonlySet<string>
@@ -208,6 +235,7 @@ export function getToolBatchReplayState(
     (state.wrappedPayload != null &&
       typeof state.wrappedPayload !== 'boolean') ||
     (state.approvalOwner != null && typeof state.approvalOwner !== 'string') ||
+    (state.interruptId != null && typeof state.interruptId !== 'string') ||
     !Array.isArray(state.records) ||
     state.records.some((value: unknown) => {
       if (value == null || typeof value !== 'object') {

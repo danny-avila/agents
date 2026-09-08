@@ -116,3 +116,6 @@ export type {
   PostCompactHookOutput,
 } from './types';
 export type { ExecuteHooksOptions } from './executeHooks';
+
+/** Hosts may opt into stable generation scopes across every ToolNode interrupt type. */
+export const TOOL_APPROVAL_EXECUTION_SCOPE_CAPABLE = true;
