@@ -123,6 +123,7 @@ import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { attachRunStepResumeState } from '@/tools/runStepResume';
 import {
   TOOL_BATCH_REPLAY_KEY,
+  TOOL_REPLAY_RESUME_EXPECTED_KEY,
   getToolBatchReplayOwner,
   getToolBatchReplayScope,
   attachToolBatchReplayState,
@@ -138,13 +139,15 @@ function stripToolApprovalReviewConfig(
   if (
     configurable == null ||
     !(TOOL_APPROVAL_REVIEW_CONFIG_KEY in configurable) &&
-    !(TOOL_BATCH_REPLAY_KEY in configurable)
+    !(TOOL_BATCH_REPLAY_KEY in configurable) &&
+    !(TOOL_REPLAY_RESUME_EXPECTED_KEY in configurable)
   ) {
     return configurable;
   }
   const {
     [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: _review,
     [TOOL_BATCH_REPLAY_KEY]: _replay,
+    [TOOL_REPLAY_RESUME_EXPECTED_KEY]: _resumeExpected,
     ...rest
   } = configurable;
   return rest;

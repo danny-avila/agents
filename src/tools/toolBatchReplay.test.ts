@@ -2,6 +2,7 @@ import { ToolMessage } from '@langchain/core/messages';
 import { Command } from '@langchain/langgraph';
 import {
   TOOL_BATCH_REPLAY_KEY,
+  TOOL_REPLAY_RESUME_EXPECTED_KEY,
   attachToolBatchReplayState,
   getToolBatchReplayOwner,
   isToolReplayResume,
@@ -35,9 +36,35 @@ describe('checkpoint-owned tool batch replay', () => {
     { interruptId: 'prior', resume: [], isChildReplay: true, expected: false },
   ])('scopes replay to the active interrupt and consuming task: %j', ({ interruptId, resume, isChildReplay, expected }) => {
     expect(isToolReplayResume({ configurable: {
+      [TOOL_REPLAY_RESUME_EXPECTED_KEY]: true,
       __pregel_resume_map: { current: [{ type: 'approve' }] },
       __pregel_scratchpad: { resume },
     } }, interruptId, isChildReplay)).toBe(expected);
+  });
+
+  it.each([
+    {
+      configurable: {
+        [TOOL_REPLAY_RESUME_EXPECTED_KEY]: true,
+        __pregel_scratchpad: { resume: [[]] },
+      },
+      missing: '__pregel_resume_map',
+    },
+    {
+      configurable: {
+        [TOOL_REPLAY_RESUME_EXPECTED_KEY]: true,
+        __pregel_resume_map: { current: [{ type: 'approve' }] },
+      },
+      missing: '__pregel_scratchpad',
+    },
+  ])('fails loudly when LangGraph omits $missing', ({ configurable }) => {
+    expect(() =>
+      isToolReplayResume({ configurable }, 'current', false)
+    ).toThrow('LangGraph tool replay contract changed');
+  });
+
+  it('treats replay evidence outside an expected resume as stale', () => {
+    expect(isToolReplayResume({ configurable: {} }, 'prior', false)).toBe(false);
   });
 
   it('stamps question replay state with the checkpoint-owned interrupt id', async () => {
