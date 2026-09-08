@@ -16,17 +16,21 @@ import {
 } from '@/hooks';
 import { TOOL_APPROVAL_REVIEW_CONFIG_KEY } from '@/hitl/approvalReview';
 import { TOOL_BATCH_REPLAY_KEY } from '../toolBatchReplay';
+import { askUserQuestion } from '@/hitl';
 import { Providers } from '@/common';
 import { Run } from '@/run';
 import { ToolNode } from '../ToolNode';
 
-function createHarness(carryCheckpointConfig = false) {
+function createHarness(carryCheckpointConfig = false, question = false) {
   let carriedConfigurable: RunnableConfig['configurable'];
   const checkpointer = new MemorySaver();
   const executions: string[] = [];
   const namespaces: string[] = [];
   const echo = tool(
     async ({ value }) => {
+      if (question && value.endsWith('-0')) {
+        askUserQuestion({ question: 'Continue?' });
+      }
       executions.push(value);
       return value;
     },
@@ -39,7 +43,7 @@ function createHarness(carryCheckpointConfig = false) {
   const createRun = async (agentId: string, runId: string, cycles = 1) => {
     const hooks = new HookRegistry();
     hooks.register('PreToolUse', {
-      hooks: [async () => ({ decision: 'ask' })],
+      hooks: [async () => ({ decision: question ? 'allow' : 'ask' })],
     });
     const node = new ToolNode({
       tools: [echo],
@@ -166,6 +170,20 @@ describe('approval execution scope', () => {
       expect(new Set(namespaces).size).toBeGreaterThan(1);
     }
   );
+
+  it('continues to a new tool batch after a question resume with fresh instances', async () => {
+    const { createRun, executions } = createHarness(false, true);
+    const run = await createRun('a', 'question-run', 2);
+    const runConfig = config('question-run');
+    await run.processStream({ messages: [new HumanMessage('start')] }, runConfig);
+    expect(run.getInterrupt()?.payload).toMatchObject({ type: 'ask_user_question' });
+    expect(executions).toEqual([]);
+
+    const rebuilt = await createRun('a', 'question-run', 2);
+    await rebuilt.resume({ answer: 'yes' }, runConfig);
+    expect(executions).toEqual(['question-run-0', 'question-run-1']);
+    expect(rebuilt.getInterrupt()).toBeUndefined();
+  });
 
   it.each(['agent', 'scope'])(
     'fails closed when the %s changes during the pending resume',

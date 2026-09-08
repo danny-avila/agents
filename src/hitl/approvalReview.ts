@@ -25,31 +25,6 @@ export interface ReviewedToolApproval {
   reviewConfig: ToolApprovalReviewConfig;
 }
 
-/**
- * Resume maps identify the checkpointed interrupt, while the task scratchpad
- * identifies the node that can consume it. Config survives into later graph
- * steps, so the presence of review evidence alone does not imply a resume.
- * A parent replaying a checkpointed child has no local resume value.
- */
-export function isToolApprovalReviewResume(
-  config: RunnableConfig,
-  evidence: ToolApprovalReviewEvidence,
-  isChildApproval: boolean
-): boolean {
-  const resumeMap: object | undefined = config.configurable?.__pregel_resume_map;
-  if (resumeMap != null &&
-    !Object.prototype.hasOwnProperty.call(resumeMap, evidence.interruptId)) {
-    return false;
-  }
-  if (isChildApproval && resumeMap != null) {
-    return true;
-  }
-  const scratchpad: { resume?: { length: number }; nullResume?: unknown } | undefined =
-    config.configurable?.__pregel_scratchpad;
-  return scratchpad == null ||
-    (scratchpad.resume?.length ?? 0) > 0 || scratchpad.nullResume !== undefined;
-}
-
 const APPROVAL_DECISIONS = new Set(['approve', 'reject', 'edit', 'respond']);
 
 /** Detach approval payloads from host- or transport-owned object graphs. */

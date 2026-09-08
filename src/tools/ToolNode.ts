@@ -72,7 +72,6 @@ import {
 } from '@/utils/toolContent';
 import {
   getReviewedToolApproval,
-  isToolApprovalReviewResume,
   getToolApprovalReviewEvidence,
   toolApprovalPayloadMatches,
   toolApprovalProposalMatches,
@@ -129,7 +128,8 @@ import {
   attachToolBatchReplayState,
   restoreToolBatchReplayState,
   getToolBatchReplayState,
-  isChildToolApprovalOwner,
+  isChildToolReplayOwner,
+  isToolReplayResume,
 } from '@/tools/toolBatchReplay';
 
 function stripToolApprovalReviewConfig(
@@ -910,19 +910,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           this.executingAgentId ?? this.agentId ?? ''
         );
         let reviewEvidence = getToolApprovalReviewEvidence(config);
-        let isChildApproval = false;
-        if (reviewEvidence?.owner != null && reviewEvidence.owner !== replayOwner) {
+        const replayState = getToolBatchReplayState(config.configurable);
+        const ownsParentBatch = replayState?.records.some(
+          (record) => record.owner === replayOwner && record.batch === activeReplayKey
+        ) === true;
+        let isChildReplay = false;
+        if (ownsParentBatch) {
           const calls = this.isSendInput(input) ? [input.lg_tool_call] : assistantBatch?.message.tool_calls ?? [];
           const trustedParentCallIds = new Set(calls.filter((call) =>
             call.name === Constants.SUBAGENT &&
             (this.toolMap.get(call.name) as ReplayableSubagentTool | undefined)?.[SUBAGENT_REPLAY_CONTROLLER] != null
           ).map((call) => call.id ?? ''));
-          const ownsParentBatch = getToolBatchReplayState(config.configurable)?.records.some(
-            (record) => record.owner === replayOwner && record.batch === activeReplayKey
-          ) === true;
-          isChildApproval = ownsParentBatch && isChildToolApprovalOwner(config, reviewEvidence.owner, trustedParentCallIds);
+          isChildReplay = reviewEvidence?.owner != null
+            ? isChildToolReplayOwner(config, reviewEvidence.owner, trustedParentCallIds)
+            : replayState.records.some((record) => isChildToolReplayOwner(config, record.owner, trustedParentCallIds));
         }
-        if (reviewEvidence?.owner != null && !isToolApprovalReviewResume(config, reviewEvidence, isChildApproval)) {
+        if ((reviewEvidence?.owner != null || replayState != null) &&
+          !isToolReplayResume(config, reviewEvidence?.interruptId ?? replayState?.interruptId, isChildReplay)) {
           config = {
             ...config,
             configurable: {
@@ -933,7 +937,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           };
           reviewEvidence = undefined;
         }
-        if (reviewEvidence?.owner != null && reviewEvidence.owner !== replayOwner && !isChildApproval) {
+        if (reviewEvidence?.owner != null && reviewEvidence.owner !== replayOwner && !isChildReplay) {
           throw new Error('Tool approval execution owner changed before resume — failing closed');
         }
         const referenceReplay: { state?: ToolOutputReferenceState } = {};
