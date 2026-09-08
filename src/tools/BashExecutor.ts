@@ -279,7 +279,7 @@ function createBashExecutionTool(
         };
 
         const proxyAgent = resolveFetchProxyAgent(execEndpoint);
-        if (proxyAgent) {
+        if (proxyAgent != null) {
           fetchOptions.agent = proxyAgent;
         }
         const response = await fetch(execEndpoint, fetchOptions);
@@ -343,7 +343,7 @@ function createBashExecutionTool(
           normalizeCodeApiRequestError(error).message,
           command
         );
-        throw new Error(`Execution error:\n\n${messageWithReminder}`);
+        throw new CodeApiRequestError(`Execution error:\n\n${messageWithReminder}`);
       }
     },
     {

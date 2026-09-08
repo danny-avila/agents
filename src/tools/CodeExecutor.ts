@@ -70,6 +70,7 @@ export function appendFailedExecutionFileReminder(
   code: string
 ): string {
   if (
+    output.includes(CODE_API_CAPABILITY_ERROR_MESSAGE) ||
     !MNT_DATA_PATH_PATTERN.test(code) ||
     output.includes(FAILED_EXECUTION_FILE_REMINDER)
   ) {
@@ -157,10 +158,67 @@ const SAFE_CODE_API_EXECUTION_ERROR_DETAILS: Readonly<
   'stdout length exceeded': 'Execution output exceeded the size limit.',
 };
 
+export const CODE_API_CAPABILITY_ERROR_MESSAGE =
+  'Code execution is not supported by the selected environment.';
+const CODE_API_CAPABILITY_ERROR_GUIDANCE =
+  'This is a permanent capability mismatch. Do not retry this tool in this environment; select a compatible environment or use an available workspace tool.';
+
+const CODE_API_CAPABILITY_LIMITATIONS: Readonly<
+  Partial<Record<string, string>>
+> = {
+  bridge_worker_mismatch:
+    'The selected worker does not support the requested execution capabilities (such as the stateful workspace required by programmatic tool calling).',
+  execution_profile_mismatch:
+    'The selected environment does not provide the requested execution profile.',
+  capability_mismatch:
+    'The selected environment lacks a required execution capability.',
+  unsupported_capability:
+    'The selected environment lacks a required execution capability.',
+  stateful_workspace_unsupported:
+    'The selected worker does not provide a stateful workspace.',
+};
+
+function getCodeApiCapabilityErrorMessage(
+  responseBody: string
+): string | undefined {
+  try {
+    const parsed = JSON.parse(responseBody) as {
+      error?: string;
+      code?: string;
+      message?: string;
+    } | null;
+    const code = parsed?.code ?? parsed?.error;
+    if (typeof code !== 'string') return undefined;
+    const normalizedCode = code.toLowerCase();
+    if (!Object.hasOwn(CODE_API_CAPABILITY_LIMITATIONS, normalizedCode))
+      return undefined;
+    let limitation = CODE_API_CAPABILITY_LIMITATIONS[normalizedCode];
+    if (limitation == null) return undefined;
+    if (
+      normalizedCode === 'bridge_worker_mismatch' &&
+      typeof parsed?.message === 'string' &&
+      /^Bridge worker [A-Za-z0-9._:-]+ does not provide a stateful workspace$/.test(
+        parsed.message
+      )
+    ) {
+      limitation =
+        CODE_API_CAPABILITY_LIMITATIONS.stateful_workspace_unsupported;
+    }
+    return `${CODE_API_CAPABILITY_ERROR_MESSAGE} ${limitation} ${CODE_API_CAPABILITY_ERROR_GUIDANCE}`;
+  } catch {
+    return undefined;
+  }
+}
+
 export class CodeApiRequestError extends Error {
+  readonly retryable: boolean;
+
   constructor(message = CODE_API_UNAVAILABLE_ERROR_MESSAGE) {
     super(message);
     this.name = 'CodeApiRequestError';
+    this.retryable =
+      message.includes(CODE_API_UNAVAILABLE_ERROR_MESSAGE) ||
+      message.includes('Code execution is temporarily rate-limited.');
   }
 }
 
@@ -277,11 +335,7 @@ type CodeApiErrorResponse = {
   body?: NodeJS.ReadableStream | null;
 };
 
-/**
- * Only the 429 branch reads the body, and node-fetch keeps the stream and its
- * socket alive until something does. Repeated backend failures would otherwise
- * accumulate connections holding payloads this module deliberately discards.
- */
+/** Releases unread or incomplete error responses after bounded classification. */
 function discardResponseBody(response: CodeApiErrorResponse): void {
   const body = response.body;
   if (body == null || !('destroy' in body)) {
@@ -298,6 +352,48 @@ function discardResponseBody(response: CodeApiErrorResponse): void {
   }
 }
 
+const MAX_CODE_API_ERROR_BODY_BYTES = 64 * 1024;
+const CODE_API_ERROR_BODY_TIMEOUT_MS = 1_000;
+
+/** Reads only small error envelopes, with a deadline for stalled upstreams. */
+async function readCodeApiErrorBody(
+  response: CodeApiErrorResponse
+): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const read = async (): Promise<string> => {
+      if (response.body != null && Symbol.asyncIterator in response.body) {
+        let bytes = 0;
+        const chunks: Buffer[] = [];
+        for await (const chunk of response.body as AsyncIterable<
+          Buffer | string
+        >) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          bytes += buffer.length;
+          if (bytes > MAX_CODE_API_ERROR_BODY_BYTES) return '';
+          chunks.push(buffer);
+        }
+        return Buffer.concat(chunks).toString('utf8');
+      }
+      const body = await response.text();
+      return Buffer.byteLength(body) <= MAX_CODE_API_ERROR_BODY_BYTES
+        ? body
+        : '';
+    };
+    return await Promise.race([
+      read(),
+      new Promise<string>((resolve) => {
+        timer = setTimeout(() => resolve(''), CODE_API_ERROR_BODY_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    return '';
+  } finally {
+    clearTimeout(timer);
+    discardResponseBody(response);
+  }
+}
+
 export async function buildCodeApiHttpErrorMessage(
   method: CodeApiMethod,
   _endpoint: string,
@@ -305,8 +401,8 @@ export async function buildCodeApiHttpErrorMessage(
   options?: { recoverable?: boolean; profile?: t.CodeApiExecutionProfile }
 ): Promise<string> {
   /* Logged before the body is touched. A non-OK response can leave a chunked
-     body open, and there is no read timeout here, so draining first would
-     withhold the diagnostic indefinitely for exactly the backend it identifies.
+     body open, so logging first preserves the diagnostic even if the bounded
+     classification read times out.
      The body itself is never logged — it is upstream free text that can echo
      the header that was sent — and the endpoint is host-configured, so the
      backend is named by the profile this module chose rather than by its
@@ -325,16 +421,12 @@ export async function buildCodeApiHttpErrorMessage(
       }
     );
   }
-  if (response.status !== 429) {
-    discardResponseBody(response);
+  const responseBody = await readCodeApiErrorBody(response);
+  const capabilityError = getCodeApiCapabilityErrorMessage(responseBody);
+  if (capabilityError != null) {
+    return capabilityError;
   }
   if (response.status === 429) {
-    let responseBody = '';
-    try {
-      responseBody = await response.text();
-    } catch {
-      responseBody = '';
-    }
     const retryAfterSeconds = getRetryAfterSeconds(responseBody);
     return retryAfterSeconds != null
       ? `Code execution is temporarily rate-limited. Retry after ${retryAfterSeconds} seconds.`
@@ -543,7 +635,7 @@ function createCodeExecutionTool(
         };
 
         const proxyAgent = resolveFetchProxyAgent(execEndpoint);
-        if (proxyAgent) {
+        if (proxyAgent != null) {
           fetchOptions.agent = proxyAgent;
         }
         const response = await fetch(execEndpoint, fetchOptions);
@@ -610,7 +702,9 @@ function createCodeExecutionTool(
           normalizeCodeApiRequestError(error).message,
           code
         );
-        throw new Error(`Execution error:\n\n${messageWithReminder}`);
+        throw new CodeApiRequestError(
+          `Execution error:\n\n${messageWithReminder}`
+        );
       }
     },
     {
