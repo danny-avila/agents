@@ -72,6 +72,7 @@ import {
 } from '@/utils/toolContent';
 import {
   getReviewedToolApproval,
+  isToolApprovalReviewResume,
   getToolApprovalReviewEvidence,
   toolApprovalPayloadMatches,
   toolApprovalProposalMatches,
@@ -908,7 +909,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           config,
           this.executingAgentId ?? this.agentId ?? ''
         );
-        const reviewEvidence = getToolApprovalReviewEvidence(config);
+        let reviewEvidence = getToolApprovalReviewEvidence(config);
+        let isChildApproval = false;
         if (reviewEvidence?.owner != null && reviewEvidence.owner !== replayOwner) {
           const calls = this.isSendInput(input) ? [input.lg_tool_call] : assistantBatch?.message.tool_calls ?? [];
           const trustedParentCallIds = new Set(calls.filter((call) =>
@@ -918,9 +920,21 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           const ownsParentBatch = getToolBatchReplayState(config.configurable)?.records.some(
             (record) => record.owner === replayOwner && record.batch === activeReplayKey
           ) === true;
-          if (!ownsParentBatch || !isChildToolApprovalOwner(config, reviewEvidence.owner, trustedParentCallIds)) {
-            throw new Error('Tool approval execution owner changed before resume — failing closed');
-          }
+          isChildApproval = ownsParentBatch && isChildToolApprovalOwner(config, reviewEvidence.owner, trustedParentCallIds);
+        }
+        if (reviewEvidence?.owner != null && !isToolApprovalReviewResume(config, reviewEvidence, isChildApproval)) {
+          config = {
+            ...config,
+            configurable: {
+              ...config.configurable,
+              [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: undefined,
+              [TOOL_BATCH_REPLAY_KEY]: undefined,
+            },
+          };
+          reviewEvidence = undefined;
+        }
+        if (reviewEvidence?.owner != null && reviewEvidence.owner !== replayOwner && !isChildApproval) {
+          throw new Error('Tool approval execution owner changed before resume — failing closed');
         }
         const referenceReplay: { state?: ToolOutputReferenceState } = {};
         const restoredBatches = await restoreToolBatchReplayState(config, replayOwner);

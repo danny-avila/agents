@@ -52,6 +52,22 @@ records fail closed. The replay module has no HTTP, database or host UI dependen
 
 ## Recovery guarantees and host obligations
 
+Hosts should set `TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY` in `configurable`
+to a generation identifier. Keep it stable through every approval resume,
+including rebuilt `Run` instances, and change it for each new generation. A
+conversation id alone is insufficient; edits that reuse a response id also need
+a generation epoch. Explicit scoping removes LangGraph's changing task namespace
+from the composite owner while retaining the executing agent id.
+
+Carried evidence is active only for its resumed interrupt and consuming task.
+The interrupt id is checked against LangGraph's resume map, and the task's
+scratchpad distinguishes a resumed node from later steps of the same invocation.
+A validated parent replaying a child approval can forward that child's evidence
+without a local resume value. Stale review and settled-batch evidence are ignored
+together. An active approval with a different execution owner still fails closed;
+starting a fresh generation may select a different agent without inheriting the
+prior approval.
+
 This protocol guarantees replay of **checkpointed completed work** when resuming
 an approval pause. Rebuilding a Run/ToolNode with the same checkpointer is a
 supported operation; retaining the old hooks or instances is not required.

@@ -28,6 +28,12 @@ export const HOOK_EVENTS = [
   'PostCompact',
 ] as const;
 
+/**
+ * Host-owned generation identity, stable across every resume and rebuilt Run.
+ * A new generation must use a new scope, even when it reuses a thread or response
+ * id. Explicit scoping keeps LangGraph task namespaces out of approval owners;
+ * the executing agent id remains part of the owner and cannot change on resume.
+ */
 export const TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY =
   '__librechat_tool_approval_execution_scope';
 

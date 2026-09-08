@@ -1,5 +1,8 @@
 import { describe, expect, it } from '@jest/globals';
-import { createToolApprovalReviewEvidence } from './approvalReview';
+import {
+  createToolApprovalReviewEvidence,
+  isToolApprovalReviewResume,
+} from './approvalReview';
 
 describe('approval review evidence', () => {
   const request = {
@@ -29,6 +32,60 @@ describe('approval review evidence', () => {
       },
     });
   });
+
+  it.each([
+    {
+      interruptId: 'current',
+      resume: [[]],
+      isChildApproval: false,
+      expected: true,
+    },
+    {
+      interruptId: 'prior',
+      resume: [[]],
+      isChildApproval: false,
+      expected: false,
+    },
+    {
+      interruptId: 'current',
+      resume: [],
+      isChildApproval: false,
+      expected: false,
+    },
+    {
+      interruptId: 'current',
+      resume: [],
+      isChildApproval: true,
+      expected: true,
+    },
+    {
+      interruptId: 'prior',
+      resume: [],
+      isChildApproval: true,
+      expected: false,
+    },
+  ])(
+    'scopes evidence to the active interrupt and consuming task: %j',
+    ({ interruptId, resume, isChildApproval, expected }) => {
+      const evidence = createToolApprovalReviewEvidence(interruptId, {
+        type: 'tool_approval',
+        action_requests: [request],
+        review_configs: [reviewConfig],
+      })!;
+      expect(
+        isToolApprovalReviewResume(
+          {
+            configurable: {
+              __pregel_resume_map: { current: [{ type: 'approve' }] },
+              __pregel_scratchpad: { resume },
+            },
+          },
+          evidence,
+          isChildApproval
+        )
+      ).toBe(expected);
+    }
+  );
 
   it('preserves an empty allowlist as fail-closed review evidence', () => {
     expect(
