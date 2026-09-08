@@ -30,6 +30,10 @@ function createHarness(
   const checkpointer = new MemorySaver();
   const executions: string[] = [];
   const namespaces: string[] = [];
+  const resumeInternals: Array<{
+    resumeMap: boolean;
+    scratchpad: boolean;
+  }> = [];
   const echo = tool(
     async ({ value }) => {
       if (question && value.endsWith('-0')) {
@@ -112,6 +116,20 @@ function createHarness(
       })
       .addNode('tools', async (state, config) => {
         namespaces.push(String(config.configurable?.checkpoint_ns));
+        if (
+          config.configurable?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY] != null
+        ) {
+          resumeInternals.push({
+            resumeMap: Object.prototype.hasOwnProperty.call(
+              config.configurable,
+              '__pregel_resume_map'
+            ),
+            scratchpad: Object.prototype.hasOwnProperty.call(
+              config.configurable,
+              '__pregel_scratchpad'
+            ),
+          });
+        }
         const nodeConfig = {
           ...config,
           configurable: { ...carriedConfigurable, ...config.configurable },
@@ -157,7 +175,7 @@ function createHarness(
     run.graphRunnable = graph as typeof run.graphRunnable;
     return run;
   };
-  return { createRun, executions, namespaces };
+  return { createRun, executions, namespaces, resumeInternals };
 }
 
 function config(scope?: string): RunnableConfig & { version: 'v2' } {
@@ -202,7 +220,11 @@ describe('approval execution scope', () => {
   );
 
   it('replays a completed sibling exactly once across an approval resume', async () => {
-    const { createRun, executions } = createHarness(false, false, true);
+    const { createRun, executions, resumeInternals } = createHarness(
+      false,
+      false,
+      true
+    );
     const run = await createRun('a', 'run-1');
     const runConfig = config('run-1');
 
@@ -214,6 +236,9 @@ describe('approval execution scope', () => {
 
     await run.resume([{ type: 'approve' }], runConfig);
     expect(executions).toEqual(['run-1-sibling', 'run-1-0']);
+    expect(resumeInternals).toEqual([
+      { resumeMap: true, scratchpad: true },
+    ]);
     expect(run.getInterrupt()).toBeUndefined();
   });
 

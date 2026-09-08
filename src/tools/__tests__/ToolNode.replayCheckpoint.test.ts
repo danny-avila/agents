@@ -32,11 +32,7 @@ async function capturePause(
 }
 
 function replayConfig(payload: unknown): RunnableConfig {
-  const configurable = {
-    thread_id: 'checkpoint-replay',
-    __pregel_resume_map: { pause: true },
-    __pregel_scratchpad: { resume: [[]] },
-  };
+  const configurable = { thread_id: 'checkpoint-replay' };
   restoreToolReplayConfig(configurable, 'pause', payload);
   return { configurable };
 }

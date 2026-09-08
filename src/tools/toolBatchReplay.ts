@@ -24,8 +24,6 @@ import {
 } from '@/tools/runStepResume';
 
 export const TOOL_BATCH_REPLAY_KEY = '__librechat_tool_batch_replay';
-export const TOOL_REPLAY_RESUME_EXPECTED_KEY =
-  '__librechat_tool_replay_resume_expected';
 const TOOL_BATCH_PAYLOAD_KEY = '__librechat_tool_batch_payload';
 const TOOL_BATCH_WRAPPER_KEY = '__librechat_tool_batch_wrapper';
 
@@ -83,7 +81,6 @@ export function restoreToolReplayConfig(
     (review == null || (state != null && state.approvalOwner == null))) {
     throw new Error('Invalid tool approval checkpoint');
   }
-  configurable[TOOL_REPLAY_RESUME_EXPECTED_KEY] = true;
   if (state != null) {
     configurable[TOOL_BATCH_REPLAY_KEY] = { ...state, interruptId };
   }
@@ -103,31 +100,19 @@ export function isToolReplayResume(
   interruptId: string | undefined,
   isChildReplay: boolean
 ): boolean {
-  const configurable = config.configurable;
-  if (configurable?.[TOOL_REPLAY_RESUME_EXPECTED_KEY] !== true) {
-    return false;
-  }
-  const resumeMap: object | undefined = configurable.__pregel_resume_map;
-  if (resumeMap == null) {
-    throw new Error(
-      'LangGraph tool replay contract changed: missing __pregel_resume_map'
-    );
-  }
+  const resumeMap: object | undefined = config.configurable?.__pregel_resume_map;
   if (interruptId != null &&
+    resumeMap != null &&
     !Object.prototype.hasOwnProperty.call(resumeMap, interruptId)) {
     return false;
   }
-  if (isChildReplay) {
+  if (isChildReplay && resumeMap != null) {
     return true;
   }
   const scratchpad: { resume?: { length: number }; nullResume?: unknown } | undefined =
-    configurable.__pregel_scratchpad;
-  if (scratchpad == null) {
-    throw new Error(
-      'LangGraph tool replay contract changed: missing __pregel_scratchpad'
-    );
-  }
-  return (scratchpad.resume?.length ?? 0) > 0 ||
+    config.configurable?.__pregel_scratchpad;
+  return scratchpad == null ||
+    (scratchpad.resume?.length ?? 0) > 0 ||
     scratchpad.nullResume !== undefined;
 }
 
