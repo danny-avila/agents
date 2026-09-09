@@ -24,7 +24,8 @@ import { ToolNode } from '../ToolNode';
 function createHarness(
   carryCheckpointConfig = false,
   question = false,
-  completedSibling = false
+  completedSibling = false,
+  resumeInternalMode: 'supported' | 'missing' | 'mismatched' = 'supported'
 ) {
   let carriedConfigurable: RunnableConfig['configurable'];
   const checkpointer = new MemorySaver();
@@ -99,7 +100,7 @@ function createHarness(
                         {
                           id: `${runId}-sibling-${completed}`,
                           name: 'sibling',
-                          args: { value: `${runId}-sibling` },
+                          args: { value: `${runId}-sibling-${completed}` },
                         },
                       ]
                       : []),
@@ -130,9 +131,19 @@ function createHarness(
             ),
           });
         }
+        const configurable = { ...carriedConfigurable, ...config.configurable };
+        if (configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY] != null &&
+          resumeInternalMode !== 'supported') {
+          if (resumeInternalMode === 'missing') {
+            delete configurable.__pregel_resume_map;
+            delete configurable.__pregel_scratchpad;
+          } else {
+            configurable.__pregel_resume_map = {};
+          }
+        }
         const nodeConfig = {
           ...config,
-          configurable: { ...carriedConfigurable, ...config.configurable },
+          configurable,
         };
         if (
           carryCheckpointConfig &&
@@ -178,9 +189,10 @@ function createHarness(
   return { createRun, executions, namespaces, resumeInternals };
 }
 
-function config(scope?: string): RunnableConfig & { version: 'v2' } {
+function config(scope?: string, userId = 'user-a'): RunnableConfig & { version: 'v2' } {
   return {
     configurable: {
+      user_id: userId,
       thread_id: 'same-conversation',
       ...(scope == null
         ? {}
@@ -232,12 +244,47 @@ describe('approval execution scope', () => {
       { messages: [new HumanMessage('start')] },
       runConfig
     );
-    expect(executions).toEqual(['run-1-sibling']);
+    expect(executions).toEqual(['run-1-sibling-0']);
 
     await run.resume([{ type: 'approve' }], runConfig);
-    expect(executions).toEqual(['run-1-sibling', 'run-1-0']);
+    expect(executions).toEqual(['run-1-sibling-0', 'run-1-0']);
     expect(resumeInternals).toEqual([
       { resumeMap: true, scratchpad: true },
+    ]);
+    expect(run.getInterrupt()).toBeUndefined();
+  });
+
+  it.each(['missing', 'mismatched'] as const)(
+    'fails closed without replaying a completed mutation when resume internals are %s',
+    async (resumeInternalMode) => {
+      const { createRun, executions } = createHarness(false, false, true, resumeInternalMode);
+      const runId = `changed-internals-${resumeInternalMode}`;
+      const run = await createRun('a', runId);
+      const runConfig = config(runId);
+      await run.processStream({ messages: [new HumanMessage('start')] }, runConfig);
+      expect(executions).toEqual([`${runId}-sibling-0`]);
+
+      await expect(run.resume([{ type: 'approve' }], runConfig)).rejects.toThrow(
+        'Cannot verify the active tool approval resume'
+      );
+      expect(executions).toEqual([`${runId}-sibling-0`]);
+    }
+  );
+
+  it('preserves completed results through two consecutive approval cycles', async () => {
+    const { createRun, executions } = createHarness(true, false, true);
+    const run = await createRun('a', 'two-cycle-replay', 4);
+    const runConfig = config('two-cycle-replay');
+    await run.processStream({ messages: [new HumanMessage('start')] }, runConfig);
+    await run.resume([{ type: 'approve' }], runConfig);
+    expect(run.getInterrupt()?.payload).toMatchObject({ type: 'tool_approval' });
+    await run.resume([{ type: 'approve' }], runConfig);
+
+    expect(executions).toEqual([
+      'two-cycle-replay-sibling-0',
+      'two-cycle-replay-0',
+      'two-cycle-replay-sibling-2',
+      'two-cycle-replay-2',
     ]);
     expect(run.getInterrupt()).toBeUndefined();
   });
@@ -256,7 +303,7 @@ describe('approval execution scope', () => {
     expect(rebuilt.getInterrupt()).toBeUndefined();
   });
 
-  it.each(['agent', 'scope'])(
+  it.each(['agent', 'scope', 'principal'])(
     'fails closed when the %s changes during the pending resume',
     async (changedIdentity) => {
       const { createRun, executions } = createHarness();
@@ -272,7 +319,10 @@ describe('approval execution scope', () => {
       await expect(
         resumed.resume(
           [{ type: 'approve' }],
-          config(changedIdentity === 'scope' ? 'run-2' : 'run-1')
+          config(
+            changedIdentity === 'scope' ? 'run-2' : 'run-1',
+            changedIdentity === 'principal' ? 'user-b' : 'user-a'
+          )
         )
       ).rejects.toThrow('Tool approval execution owner changed');
       expect(executions).toEqual([]);

@@ -128,8 +128,9 @@ import {
   attachToolBatchReplayState,
   restoreToolBatchReplayState,
   getToolBatchReplayState,
+  clearStaleToolApprovalConfig,
   isChildToolReplayOwner,
-  isToolReplayResume,
+  getToolReplayResumeStatus,
 } from '@/tools/toolBatchReplay';
 
 function stripToolApprovalReviewConfig(
@@ -925,15 +926,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             ? isChildToolReplayOwner(config, reviewEvidence.owner, trustedParentCallIds)
             : replayState.records.some((record) => isChildToolReplayOwner(config, record.owner, trustedParentCallIds));
         }
-        if ((reviewEvidence?.owner != null || replayState != null) &&
-          !isToolReplayResume(config, reviewEvidence?.interruptId ?? replayState?.interruptId, isChildReplay)) {
+        const hasApprovalAuthorization =
+          reviewEvidence?.owner != null || replayState?.approvalOwner != null;
+        const replayResumeStatus = hasApprovalAuthorization || replayState != null
+          ? getToolReplayResumeStatus(
+            config,
+            reviewEvidence?.interruptId ?? replayState?.interruptId,
+            isChildReplay
+          )
+          : undefined;
+        if (replayResumeStatus === 'unverifiable' && hasApprovalAuthorization) {
+          throw new Error('Cannot verify the active tool approval resume — failing closed');
+        }
+        if (replayResumeStatus === 'stale') {
+          const configurable = { ...config.configurable };
+          clearStaleToolApprovalConfig(configurable, replayOwner, activeReplayKey);
           config = {
             ...config,
-            configurable: {
-              ...config.configurable,
-              [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: undefined,
-              [TOOL_BATCH_REPLAY_KEY]: undefined,
-            },
+            configurable,
           };
           reviewEvidence = undefined;
         }

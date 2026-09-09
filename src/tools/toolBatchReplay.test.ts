@@ -3,8 +3,9 @@ import { Command } from '@langchain/langgraph';
 import {
   TOOL_BATCH_REPLAY_KEY,
   attachToolBatchReplayState,
+  clearStaleToolApprovalConfig,
   getToolBatchReplayOwner,
-  isToolReplayResume,
+  getToolReplayResumeStatus,
   getToolBatchReplayState,
   restoreToolBatchReplayState,
   stripToolBatchReplayState,
@@ -28,16 +29,45 @@ const approval = {
 
 describe('checkpoint-owned tool batch replay', () => {
   it.each([
-    { interruptId: 'current', resume: [[]], isChildReplay: false, expected: true },
-    { interruptId: 'prior', resume: [[]], isChildReplay: false, expected: false },
-    { interruptId: 'current', resume: [], isChildReplay: false, expected: false },
-    { interruptId: 'current', resume: [], isChildReplay: true, expected: true },
-    { interruptId: 'prior', resume: [], isChildReplay: true, expected: false },
+    { interruptId: 'current', resume: [[]], isChildReplay: false, expected: 'active' },
+    { interruptId: 'prior', resume: [[]], isChildReplay: false, expected: 'unverifiable' },
+    { interruptId: 'current', resume: [], isChildReplay: false, expected: 'stale' },
+    { interruptId: 'current', resume: [], isChildReplay: true, expected: 'active' },
+    { interruptId: 'prior', resume: [], isChildReplay: true, expected: 'stale' },
   ])('scopes replay to the active interrupt and consuming task: %j', ({ interruptId, resume, isChildReplay, expected }) => {
-    expect(isToolReplayResume({ configurable: {
+    const status = getToolReplayResumeStatus({ configurable: {
       __pregel_resume_map: { current: [{ type: 'approve' }] },
       __pregel_scratchpad: { resume },
-    } }, interruptId, isChildReplay)).toBe(expected);
+    } }, interruptId, isChildReplay);
+    expect(status).toBe(expected);
+  });
+
+  it.each([
+    {},
+    { __pregel_resume_map: { current: [] } },
+    { __pregel_resume_map: { current: [] }, __pregel_scratchpad: {} },
+  ])('fails closed when resume internals are unavailable or malformed: %j', (configurable) => {
+    expect(getToolReplayResumeStatus({ configurable }, 'current', false)).toBe('unverifiable');
+  });
+
+  it('distinguishes stale execution from an unverifiable active resume', () => {
+    expect(getToolReplayResumeStatus({ configurable: {
+      __pregel_scratchpad: { resume: [] },
+    } }, 'current', false)).toBe('stale');
+    expect(getToolReplayResumeStatus({ configurable: {
+      __pregel_scratchpad: { resume: [{ type: 'approve' }] },
+    } }, 'current', false)).toBe('unverifiable');
+  });
+
+  it('accepts only an unambiguous task-local legacy resume without a restored interrupt id', () => {
+    expect(getToolReplayResumeStatus({ configurable: {
+      __pregel_resume_map: { current: [{ type: 'approve' }] },
+      __pregel_scratchpad: { resume: [[{ type: 'approve' }]] },
+    } }, undefined, false)).toBe('active');
+    expect(getToolReplayResumeStatus({ configurable: {
+      __pregel_resume_map: { first: [], second: [] },
+      __pregel_scratchpad: { resume: [[{ type: 'approve' }]] },
+    } }, undefined, false)).toBe('unverifiable');
   });
 
   it('stamps question replay state with the checkpoint-owned interrupt id', async () => {
@@ -90,6 +120,26 @@ describe('checkpoint-owned tool batch replay', () => {
     expect(getPublicToolInterruptPayload(second)).toEqual(approval);
   });
 
+  it('rebinds conversation identity only through the trusted fork adapter', async () => {
+    const owner = JSON.stringify(['source', '', 'agent', 'user', 'parent-thread']);
+    const payload = await attachToolBatchReplayState(
+      approval,
+      owner,
+      new Map([[JSON.stringify(['source', 'assistant']), new Map()]])
+    );
+
+    const rebound = rebindToolBatchReplayPayload(
+      payload,
+      'source',
+      'child',
+      'child-thread'
+    );
+
+    expect(getToolBatchReplayState(rebound)?.approvalOwner).toBe(
+      JSON.stringify(['child', '', 'agent', 'user', 'child-thread'])
+    );
+  });
+
   it('rejects corrupt reference counters instead of restarting numbering', async () => {
     const wrapped = await attachToolBatchReplayState(
       approval,
@@ -111,6 +161,53 @@ describe('checkpoint-owned tool batch replay', () => {
     expect(
       getToolBatchReplayScope({ configurable: { thread_id: scope } })
     ).toBeUndefined();
+  });
+  it('binds replay ownership to principal and conversation identity', () => {
+    const owner = (user_id: string, thread_id: string) => getToolBatchReplayOwner({ configurable: {
+      user_id,
+      thread_id,
+      __librechat_tool_approval_execution_scope: 'run',
+    } }, 'agent');
+    expect(owner('user-a', 'thread')).not.toBe(owner('user-b', 'thread'));
+    expect(owner('user', 'thread-a')).not.toBe(owner('user', 'thread-b'));
+  });
+  it('binds legacy checkpoint owners during trusted restoration', async () => {
+    const legacyOwner = JSON.stringify(['run', '', 'agent']);
+    const payload = await attachToolBatchReplayState(approval, legacyOwner, new Map([
+      ['batch', new Map([['call', {
+        proposal: { name: 'echo', args: {} },
+        output: new ToolMessage({ content: 'done', tool_call_id: 'call' }),
+        additionalContexts: [],
+      }]])],
+    ]));
+    const configurable = { user_id: 'user', thread_id: 'thread' };
+
+    restoreToolReplayConfig(configurable, 'interrupt', payload);
+
+    const owner = JSON.stringify(['run', '', 'agent', 'user', 'thread']);
+    const restored = getToolBatchReplayState(configurable);
+    expect(restored?.approvalOwner).toBe(owner);
+    expect(restored?.records[0]?.owner).toBe(owner);
+    await expect(restoreToolBatchReplayState({ configurable }, owner)).resolves.toHaveLength(1);
+  });
+  it('removes stale approval evidence without discarding settled results', async () => {
+    const output = new ToolMessage({ content: 'checkpointed mutation', tool_call_id: 'call' });
+    const payload = await attachToolBatchReplayState(approval, 'owner', new Map([
+      ['batch', new Map([['call', {
+        proposal: { name: 'echo', args: {} },
+        output,
+        additionalContexts: [],
+      }]])],
+    ]));
+    const configurable: Record<string, unknown> = {};
+    restoreToolReplayConfig(configurable, 'interrupt', payload);
+
+    clearStaleToolApprovalConfig(configurable, 'owner', 'batch');
+
+    expect(configurable).not.toHaveProperty('__librechat_tool_approval_review');
+    const restored = await restoreToolBatchReplayState({ configurable }, 'owner');
+    expect(restored).toHaveLength(1);
+    expect(restored[0].results[0][1].output).toEqual(output);
   });
   it('preserves objects resembling the primitive wrapper', async () => {
     const payload = {

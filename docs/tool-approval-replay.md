@@ -61,16 +61,22 @@ Keep it stable through every approval resume,
 including rebuilt `Run` instances, and change it for each new generation. A
 conversation id alone is insufficient; edits that reuse a response id also need
 a generation epoch. Explicit scoping removes LangGraph's changing task namespace
-from the composite owner while retaining the executing agent id.
+from the composite owner while retaining the executing agent id, principal id,
+and conversation id.
 
 Carried evidence is active only for its resumed interrupt and consuming task.
 The interrupt id is checked against LangGraph's resume map, and the task's
 scratchpad distinguishes a resumed node from later steps of the same invocation.
+Missing or malformed resume internals fail closed whenever a resume value could
+otherwise authorize execution; absence outside a consuming task is treated as
+stale evidence.
 This applies to every ToolNode interrupt, including `ask_user_question` pauses
 that have replay records but no approval-review evidence.
 A validated parent replaying a child approval can forward that child's evidence
-without a local resume value. Stale review and settled-batch evidence are ignored
-together. An active approval with a different execution owner still fails closed;
+without a local resume value. Stale authorization is removed separately from
+settled results for the active owner and batch, so clearing an old review cannot
+repeat checkpointed completed work. An active approval with a different
+execution owner still fails closed;
 starting a fresh generation may select a different agent without inheriting the
 prior approval.
 
@@ -97,6 +103,10 @@ third-party tools as exactly-once across that crash window.
   Reviewed rejection and allowlist restrictions still apply. Unreviewed direct
   siblings fail closed when their prior policy cannot be reconstructed.
 - Existing public approval payload and resume-decision shapes are unchanged.
+- Three-field owners from the preceding replay format are bound to the current
+  principal and conversation when restored through the checkpoint entry point.
+  Hosts must authorize checkpoint/thread access before calling the SDK; the SDK
+  cannot recover a principal that was never recorded in a legacy checkpoint.
 - Old SDK consumers cannot restore the new completion record. Do not route a
   paused run between SDK versions indiscriminately: drain or version-pin paused
   runs during rollout and before rollback. A durable checkpointer alone is not
