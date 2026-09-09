@@ -120,6 +120,26 @@ describe('checkpoint-owned tool batch replay', () => {
     expect(getPublicToolInterruptPayload(second)).toEqual(approval);
   });
 
+  it('rebinds conversation identity only through the trusted fork adapter', async () => {
+    const owner = JSON.stringify(['source', '', 'agent', 'user', 'parent-thread']);
+    const payload = await attachToolBatchReplayState(
+      approval,
+      owner,
+      new Map([[JSON.stringify(['source', 'assistant']), new Map()]])
+    );
+
+    const rebound = rebindToolBatchReplayPayload(
+      payload,
+      'source',
+      'child',
+      'child-thread'
+    );
+
+    expect(getToolBatchReplayState(rebound)?.approvalOwner).toBe(
+      JSON.stringify(['child', '', 'agent', 'user', 'child-thread'])
+    );
+  });
+
   it('rejects corrupt reference counters instead of restarting numbering', async () => {
     const wrapped = await attachToolBatchReplayState(
       approval,

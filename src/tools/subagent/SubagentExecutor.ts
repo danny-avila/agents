@@ -1768,7 +1768,10 @@ export class SubagentExecutor {
             channel === INTERRUPT && approvalScope != null &&
             value != null && typeof value === 'object' && 'value' in value
               ? { ...value, value: rebindToolBatchReplayPayload(
-                value.value, approvalScope.source, approvalScope.target
+                value.value,
+                approvalScope.source,
+                approvalScope.target,
+                targetThreadId
               ) }
               : value;
           writes.push([channel, reboundValue]);
@@ -2666,7 +2669,12 @@ export class SubagentExecutor {
           activeChildRun.pendingInterrupts = resumeExecution == null ? persistedInterrupts :
             persistedInterrupts.map((pending) => ({
               ...pending,
-              value: rebindToolBatchReplayPayload(pending.value, resumeExecution.approvalExecutionScope, approvalExecutionScope),
+              value: rebindToolBatchReplayPayload(
+                pending.value,
+                resumeExecution.approvalExecutionScope,
+                approvalExecutionScope,
+                childThreadId
+              ),
             }));
           execution.markStarted();
           childAlreadyStarted = true;
@@ -2709,7 +2717,8 @@ export class SubagentExecutor {
           rebindToolBatchReplayScope(
             childConfigurable,
             resumeExecution?.approvalExecutionScope ?? approvalExecutionScope,
-            approvalExecutionScope
+            approvalExecutionScope,
+            childThreadId
           );
           childInput = new Command({ resume: childResumeMap });
         } else if (recoveredInProgress) {

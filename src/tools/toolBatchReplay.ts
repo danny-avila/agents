@@ -210,14 +210,19 @@ export function isChildToolReplayOwner(
 export function rebindToolBatchReplayScope(
   configurable: Record<string, unknown>,
   sourceScope: string,
-  destinationScope: string
+  destinationScope: string,
+  destinationThreadId?: string
 ): void {
   const rebind = (key: string): string => {
     const parts: unknown = JSON.parse(key);
     if (!Array.isArray(parts) || parts[0] !== sourceScope) {
       return key;
     }
-    return JSON.stringify([destinationScope, ...parts.slice(1)]);
+    const rebound = [destinationScope, ...parts.slice(1)];
+    if (rebound.length === 5 && destinationThreadId != null) {
+      rebound[4] = destinationThreadId;
+    }
+    return JSON.stringify(rebound);
   };
   const config = { configurable };
   const review = getToolApprovalReviewEvidence(config);
@@ -246,7 +251,8 @@ export function rebindToolBatchReplayScope(
 export function rebindToolBatchReplayPayload(
   payload: unknown,
   sourceScope: string,
-  destinationScope: string
+  destinationScope: string,
+  destinationThreadId?: string
 ): unknown {
   const state = getToolBatchReplayState(payload);
   const value = stripRunStepResumeState(payload);
@@ -254,7 +260,12 @@ export function rebindToolBatchReplayPayload(
     return payload;
   }
   const configurable = { [TOOL_BATCH_REPLAY_KEY]: state };
-  rebindToolBatchReplayScope(configurable, sourceScope, destinationScope);
+  rebindToolBatchReplayScope(
+    configurable,
+    sourceScope,
+    destinationScope,
+    destinationThreadId
+  );
   const rebound = {
     ...value,
     [TOOL_BATCH_REPLAY_KEY]: configurable[TOOL_BATCH_REPLAY_KEY],
