@@ -46,6 +46,8 @@ export interface ToolBatchReplayRecord {
   referenceState?: ToolOutputReferenceState;
 }
 
+export type ToolReplayResumeStatus = 'active' | 'stale' | 'unverifiable';
+
 interface ToolBatchReplayState {
   version: 1;
   approvalOwner?: string;
@@ -95,25 +97,40 @@ export function restoreToolReplayConfig(
  * steps, so the presence of replay evidence alone does not imply a resume.
  * A parent replaying a checkpointed child has no local resume value.
  */
-export function isToolReplayResume(
+export function getToolReplayResumeStatus(
   config: RunnableConfig,
   interruptId: string | undefined,
   isChildReplay: boolean
-): boolean {
-  const resumeMap: object | undefined = config.configurable?.__pregel_resume_map;
-  if (interruptId != null &&
-    resumeMap != null &&
-    !Object.prototype.hasOwnProperty.call(resumeMap, interruptId)) {
-    return false;
+): ToolReplayResumeStatus {
+  const resumeMap: unknown = config.configurable?.__pregel_resume_map;
+  const scratchpad: unknown = config.configurable?.__pregel_scratchpad;
+  if (!isRecord(scratchpad) || !Array.isArray(scratchpad.resume)) {
+    return 'unverifiable';
   }
-  if (isChildReplay && resumeMap != null) {
-    return true;
+  /**
+   * LangGraph supports both an interrupt-id resume map and a task-local
+   * `nullResume` value. The latter is already scoped to the checkpoint task,
+   * so it remains a supported, verifiable resume without a map entry.
+   */
+  if (scratchpad.nullResume !== undefined) {
+    return 'active';
   }
-  const scratchpad: { resume?: { length: number }; nullResume?: unknown } | undefined =
-    config.configurable?.__pregel_scratchpad;
-  return scratchpad == null ||
-    (scratchpad.resume?.length ?? 0) > 0 ||
-    scratchpad.nullResume !== undefined;
+  const hasResume = scratchpad.resume.length > 0;
+  if (!isRecord(resumeMap)) {
+    return hasResume ? 'unverifiable' : 'stale';
+  }
+  if (interruptId == null) {
+    /** Legacy direct graph callers do not restore the ID into replay state. */
+    if (!hasResume) return 'stale';
+    return Object.keys(resumeMap).length === 1 ? 'active' : 'unverifiable';
+  }
+  if (!Object.prototype.hasOwnProperty.call(resumeMap, interruptId)) {
+    return hasResume ? 'unverifiable' : 'stale';
+  }
+  if (isChildReplay) {
+    return 'active';
+  }
+  return hasResume ? 'active' : 'stale';
 }
 
 export function getToolBatchReplayOwner(
@@ -126,7 +143,37 @@ export function getToolBatchReplayOwner(
       ? (config.configurable?.checkpoint_ns ?? '')
       : '',
     agentId,
+    typeof config.configurable?.user_id === 'string'
+      ? config.configurable.user_id
+      : '',
+    typeof config.configurable?.thread_id === 'string'
+      ? config.configurable.thread_id
+      : '',
   ]);
+}
+
+/** Remove stale authorization while retaining only settled results for this batch. */
+export function clearStaleToolApprovalConfig(
+  configurable: Record<string, unknown>,
+  owner: string,
+  batch: string | undefined
+): void {
+  delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+  const state = getToolBatchReplayState(configurable);
+  const records = batch == null
+    ? []
+    : (state?.records.filter(
+      (record) => record.owner === owner && record.batch === batch
+    ) ?? []);
+  if (state == null || records.length === 0) {
+    delete configurable[TOOL_BATCH_REPLAY_KEY];
+    return;
+  }
+  configurable[TOOL_BATCH_REPLAY_KEY] = {
+    version: 1,
+    records,
+    wrappedPayload: state.wrappedPayload,
+  } satisfies ToolBatchReplayState;
 }
 
 export function getToolBatchReplayScope(
@@ -147,7 +194,9 @@ export function isChildToolReplayOwner(
   const manifest = requireValidSubagentResumeManifest(config.configurable);
   if (manifest == null || trustedParentCallIds.size === 0) return false;
   const identity: unknown = JSON.parse(owner);
-  if (!Array.isArray(identity) || identity.length !== 3 || identity[1] !== '') return false;
+  if (!Array.isArray(identity) ||
+    (identity.length !== 3 && identity.length !== 5) ||
+    identity[1] !== '') return false;
   const pending = manifest.executions.filter((execution) => trustedParentCallIds.has(execution.parentToolCallId));
   while (pending.length > 0) {
     const execution = pending.pop()!;
