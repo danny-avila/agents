@@ -171,6 +171,25 @@ describe('checkpoint-owned tool batch replay', () => {
     expect(owner('user-a', 'thread')).not.toBe(owner('user-b', 'thread'));
     expect(owner('user', 'thread-a')).not.toBe(owner('user', 'thread-b'));
   });
+  it('binds legacy checkpoint owners during trusted restoration', async () => {
+    const legacyOwner = JSON.stringify(['run', '', 'agent']);
+    const payload = await attachToolBatchReplayState(approval, legacyOwner, new Map([
+      ['batch', new Map([['call', {
+        proposal: { name: 'echo', args: {} },
+        output: new ToolMessage({ content: 'done', tool_call_id: 'call' }),
+        additionalContexts: [],
+      }]])],
+    ]));
+    const configurable = { user_id: 'user', thread_id: 'thread' };
+
+    restoreToolReplayConfig(configurable, 'interrupt', payload);
+
+    const owner = JSON.stringify(['run', '', 'agent', 'user', 'thread']);
+    const restored = getToolBatchReplayState(configurable);
+    expect(restored?.approvalOwner).toBe(owner);
+    expect(restored?.records[0]?.owner).toBe(owner);
+    await expect(restoreToolBatchReplayState({ configurable }, owner)).resolves.toHaveLength(1);
+  });
   it('removes stale approval evidence without discarding settled results', async () => {
     const output = new ToolMessage({ content: 'checkpointed mutation', tool_call_id: 'call' });
     const payload = await attachToolBatchReplayState(approval, 'owner', new Map([

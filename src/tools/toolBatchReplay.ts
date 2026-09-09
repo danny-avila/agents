@@ -64,6 +64,44 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function bindLegacyReplayOwner(
+  owner: string,
+  configurable: Record<string, unknown>
+): string {
+  let identity: unknown;
+  try {
+    identity = JSON.parse(owner);
+  } catch {
+    return owner;
+  }
+  if (!Array.isArray(identity) || identity.length !== 3) {
+    return owner;
+  }
+  return JSON.stringify([
+    ...identity,
+    typeof configurable.user_id === 'string' ? configurable.user_id : '',
+    typeof configurable.thread_id === 'string' ? configurable.thread_id : '',
+  ]);
+}
+
+function bindLegacyReplayState(
+  state: ToolBatchReplayState | undefined,
+  configurable: Record<string, unknown>
+): ToolBatchReplayState | undefined {
+  if (state == null) return undefined;
+  return {
+    ...state,
+    approvalOwner:
+      state.approvalOwner == null
+        ? undefined
+        : bindLegacyReplayOwner(state.approvalOwner, configurable),
+    records: state.records.map((record) => ({
+      ...record,
+      owner: bindLegacyReplayOwner(record.owner, configurable),
+    })),
+  };
+}
+
 /** The only host-to-runtime entry point for checkpoint-owned tool replay state. */
 export function restoreToolReplayConfig(
   configurable: Record<string, unknown>,
@@ -72,7 +110,10 @@ export function restoreToolReplayConfig(
 ): void {
   delete configurable[TOOL_BATCH_REPLAY_KEY];
   delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
-  const state = getToolBatchReplayState(payload);
+  const state = bindLegacyReplayState(
+    getToolBatchReplayState(payload),
+    configurable
+  );
   const publicPayload = getPublicToolInterruptPayload(payload);
   const review = createToolApprovalReviewEvidence(
     interruptId,

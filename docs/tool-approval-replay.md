@@ -103,6 +103,10 @@ third-party tools as exactly-once across that crash window.
   Reviewed rejection and allowlist restrictions still apply. Unreviewed direct
   siblings fail closed when their prior policy cannot be reconstructed.
 - Existing public approval payload and resume-decision shapes are unchanged.
+- Three-field owners from the preceding replay format are bound to the current
+  principal and conversation when restored through the checkpoint entry point.
+  Hosts must authorize checkpoint/thread access before calling the SDK; the SDK
+  cannot recover a principal that was never recorded in a legacy checkpoint.
 - Old SDK consumers cannot restore the new completion record. Do not route a
   paused run between SDK versions indiscriminately: drain or version-pin paused
   runs during rollout and before rollback. A durable checkpointer alone is not
