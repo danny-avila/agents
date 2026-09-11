@@ -134,9 +134,17 @@ import {
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
 import {
+  prepareProviderRequest,
+  usesNativeOpenAIResponses,
+} from '@/llm/prepareProviderRequest';
+import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
+import {
+  ManualSummarizationSkippedError,
+  shouldTriggerSummarization,
+} from '@/summarization';
 import {
   getToolContentCharLength,
   serializeToolContentBounded,
@@ -150,6 +158,11 @@ import {
   PreparedSubagents,
   PreparedSubagentError,
 } from '@/tools/preparedSubagents';
+import {
+  createRemoveAllMessage,
+  messagesStateReducer,
+} from '@/messages/reducer';
+import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
@@ -157,29 +170,16 @@ import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { isFadingTier, isInformativeFadingTier } from '@/messages/fading';
 import { createContextPressureMeter } from '@/llm/contextPressureMeter';
-import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
-import {
-  prepareProviderRequest,
-  usesNativeOpenAIResponses,
-} from '@/llm/prepareProviderRequest';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
 import { calculateMaxToolCallInputChars } from '@/utils/truncation';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { initializeLangfuseTracing } from '@/instrumentation';
-import {
-  ManualSummarizationSkippedError,
-  shouldTriggerSummarization,
-} from '@/summarization';
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
-import {
-  createRemoveAllMessage,
-  messagesStateReducer,
-} from '@/messages/reducer';
 import { getTruncationStopReason } from '@/llm/truncation';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
@@ -1356,7 +1356,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /** See {@link t.StandardGraphInput.subagentTasks}. */
   subagentTasks: t.SubagentTaskConfig | undefined;
   /** See {@link t.StandardGraphInput.subagentExecutionContext}. */
-  private readonly subagentExecutionContext?: t.SubagentExecutionContext;
+  readonly subagentExecutionContext?: t.SubagentExecutionContext;
+  private readonly subagentContext?: t.SubagentContextAdapter;
   /** See {@link t.StandardGraphInput.preemption}. */
   preemption?: t.StreamPreemption;
   /**
@@ -1534,6 +1535,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       subagentTasks,
       subagentScope,
       subagentExecutionContext,
+      subagentContext,
       preemption,
       streamLimits,
       toolExecution,
@@ -1560,6 +1562,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.subagentTasks = subagentTasks;
     this.subagentScope = subagentScope === true;
     this.subagentExecutionContext = subagentExecutionContext;
+    this.subagentContext = subagentContext;
     this.preemption = preemption;
     this.streamLimits = resolveStreamLimits(streamLimits);
     this.toolExecution = toolExecution;
@@ -2881,6 +2884,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         // run_id); `executingAgentId` always identifies the owning agent.
         agentId: this.subagentScope ? agentContext?.agentId : undefined,
         executingAgentId: agentContext?.agentId,
+        executionContext: this.subagentExecutionContext,
         executingAgentName: agentContext?.name,
         rootAgentId: this.defaultAgentId,
         rootAgentName: this.agentContexts.get(this.defaultAgentId)?.name,
@@ -2965,6 +2969,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       // hooks can attribute the batch even at the top level.
       agentId: this.subagentScope ? agentContext?.agentId : undefined,
       executingAgentId: agentContext?.agentId,
+      executionContext: this.subagentExecutionContext,
       executingAgentName: agentContext?.name,
       rootAgentId: this.defaultAgentId,
       rootAgentName: this.agentContexts.get(this.defaultAgentId)?.name,
@@ -4627,7 +4632,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       fallbackProvider,
                       fallbackClientOptions
                     );
-                    let projection: ReturnType<typeof measureProviderPayload> | undefined;
+                    let projection:
+                      | ReturnType<typeof measureProviderPayload>
+                      | undefined;
                     const request = prepareProviderRequest({
                       model: fallbackModel,
                       messages: cached,
@@ -4644,7 +4651,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       },
                     });
                     if (projection == null) {
-                      throw new Error('Fallback preparation did not measure its payload');
+                      throw new Error(
+                        'Fallback preparation did not measure its payload'
+                      );
                     }
                     return { request, projection };
                   };
@@ -4664,8 +4673,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   if (!projection.fits) {
                     const compacted = compactSyntheticProviderContext(
                       servingFallbackMessages,
-                      (candidate) =>
-                        prepareFallback(candidate).projection
+                      (candidate) => prepareFallback(candidate).projection
                     );
                     if (compacted !== servingFallbackMessages) {
                       preparedFallbackRequest = prepareFallback(compacted);
@@ -5025,6 +5033,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         runId,
         threadId: configurable?.thread_id as string | undefined,
         agentId: this.subagentScope ? agentId : undefined,
+        executionContext: this.subagentExecutionContext,
         executingAgentId: agentId,
         sealCount: this.preemptSealCount,
       },
@@ -5247,6 +5256,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           tokenCounter: agentContext.tokenCounter,
           usageSink: this.subagentUsageSink,
           taskConfig: this.subagentTasks,
+          subagentContext: this.subagentContext,
           streamLimits: this.streamLimits,
           humanInTheLoop: this.humanInTheLoop,
           checkpointer: this.compileOptions?.checkpointer,

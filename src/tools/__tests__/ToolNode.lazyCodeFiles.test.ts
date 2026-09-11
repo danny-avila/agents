@@ -1,0 +1,283 @@
+import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
+import { AIMessage } from '@langchain/core/messages';
+import { describe, it, expect, jest, afterEach } from '@jest/globals';
+import type * as t from '@/types';
+import { Constants, GraphEvents } from '@/common';
+import * as events from '@/utils/events';
+import { ToolNode } from '../ToolNode';
+
+const inputs: t.CodeEnvFile[] = [
+  {
+    id: 'order',
+    name: 'order.pdf',
+    resource_id: 'user',
+    storage_session_id: 'user-storage',
+    kind: 'user',
+  },
+  {
+    id: 'discounts',
+    name: 'discounts.csv',
+    resource_id: 'worker',
+    storage_session_id: 'agent-storage',
+    kind: 'agent',
+  },
+];
+
+const firstResults = [
+  {
+    label: 'HTTP-success execution with stderr and no output files',
+    result: {
+      status: 'success',
+      artifact: { session_id: 'first-exec', files: [] },
+    },
+  },
+  {
+    label: 'execution without an artifact files field',
+    result: { status: 'success', artifact: { session_id: 'first-exec' } },
+  },
+  {
+    label: 'execution without an artifact',
+    result: { status: 'success' },
+  },
+  {
+    label: 'tool error without an artifact',
+    result: { status: 'error', errorMessage: 'Code API unavailable' },
+  },
+  {
+    label: 'tool error carrying unusable output files',
+    result: {
+      status: 'error',
+      errorMessage: 'Code execution failed',
+      artifact: {
+        session_id: 'failed-exec',
+        files: [{ id: 'failed-output', name: 'failed.csv' }],
+      },
+    },
+  },
+] satisfies Array<{
+  label: string;
+  result: Pick<t.ToolExecuteResult, 'status' | 'artifact' | 'errorMessage'>;
+}>;
+
+describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
+  '%s lazy input retention',
+  (toolName) => {
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it.each(firstResults)(
+      'preserves inputs after $label',
+      async ({ result }) => {
+        const sessions: t.ToolSessionMap = new Map([
+          [
+            'other-agent',
+            {
+              session_id: 'foreign-exec',
+              files: [{ id: 'foreign', name: 'foreign.txt' }],
+              lastUpdated: 1,
+            },
+          ],
+        ]);
+        const requests: t.ToolCallRequest[] = [];
+        jest
+          .spyOn(events, 'safeDispatchCustomEvent')
+          .mockImplementation(async (event, data) => {
+            if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+            const batch = data as t.ToolExecuteBatchRequest;
+            const request = batch.toolCalls[0];
+            requests.push(structuredClone(request));
+            if (requests.length === 1) {
+              request.codeSessionContext = {
+                session_id: 'input-context',
+                files: structuredClone(inputs),
+              };
+            }
+            batch.resolve([
+              {
+                toolCallId: request.id,
+                content: 'stderr: missing optional Python package',
+                ...(requests.length === 1
+                  ? result
+                  : { status: 'success' as const }),
+              },
+            ]);
+          });
+        const node = new ToolNode({
+          tools: [
+            tool(async () => 'unused', {
+              name: toolName,
+              description: 'Code tool',
+              schema: z.object({}),
+            }),
+          ],
+          sessions,
+          codeSessionKey: 'child-agent',
+          eventDrivenMode: true,
+        });
+        for (const id of ['first', 'retry']) {
+          await node.invoke({
+            messages: [
+              new AIMessage({
+                content: '',
+                tool_calls: [{ id, name: toolName, args: {} }],
+              }),
+            ],
+          });
+        }
+
+        expect(requests[0].codeSessionContext).toBeUndefined();
+        expect(requests[1].codeSessionContext?.files).toEqual(inputs);
+        expect(sessions.get('child-agent')?.files).toEqual(inputs);
+        expect(sessions.get('other-agent')).toEqual({
+          session_id: 'foreign-exec',
+          files: [{ id: 'foreign', name: 'foreign.txt' }],
+          lastUpdated: 1,
+        });
+        if (result.status === 'error') {
+          expect(sessions.get('child-agent')?.session_id).toBe('input-context');
+        }
+      }
+    );
+
+    it('keeps successful replacements when a later batch result carries older input refs', async () => {
+      const sessions: t.ToolSessionMap = new Map();
+      const updated: t.FileRef = {
+        id: 'updated-discounts',
+        name: 'discounts.csv',
+        storage_session_id: 'output-storage',
+      };
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+          const batch = data as t.ToolExecuteBatchRequest;
+          for (const request of batch.toolCalls) {
+            request.codeSessionContext = {
+              session_id: 'input-context',
+              files: structuredClone(inputs),
+            };
+          }
+          batch.resolve(
+            batch.toolCalls.map((request, index) => ({
+              toolCallId: request.id,
+              status: 'success',
+              content: '',
+              artifact: {
+                session_id: `exec-${index}`,
+                files: index === 0 ? [updated] : [],
+              },
+            }))
+          );
+        });
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+      });
+
+      await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: ['write', 'read'].map((id) => ({
+              id,
+              name: toolName,
+              args: {},
+            })),
+          }),
+        ],
+      });
+
+      expect(sessions.get('child-agent')?.files).toEqual([inputs[0], updated]);
+      expect(sessions.get('child-agent')?.session_id).toBe('exec-1');
+    });
+
+    it('retains files provisioned into the actual eager request before its result settles', async () => {
+      const sessions: t.ToolSessionMap = new Map();
+      const request: t.ToolCallRequest = {
+        id: 'first',
+        name: toolName,
+        args: {},
+      };
+      const eagerExecutions = new Map<string, t.EagerEventToolExecution>([
+        [
+          request.id,
+          {
+            toolCallId: request.id,
+            toolName,
+            args: {},
+            request,
+            promise: Promise.resolve().then(() => {
+              request.codeSessionContext = {
+                session_id: 'input-context',
+                files: structuredClone(inputs),
+              };
+              return {
+                results: [
+                  {
+                    toolCallId: request.id,
+                    status: 'success',
+                    content: '',
+                    artifact: { session_id: 'first-exec', files: [] },
+                  },
+                ],
+              };
+            }),
+          },
+        ],
+      ]);
+      const captured: t.ToolCallRequest[] = [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+          const batch = data as t.ToolExecuteBatchRequest;
+          captured.push(...batch.toolCalls);
+          batch.resolve(
+            batch.toolCalls.map((tc) => ({
+              toolCallId: tc.id,
+              status: 'success',
+              content: '',
+            }))
+          );
+        });
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+        eagerEventToolExecution: { enabled: true },
+        eagerEventToolExecutions: eagerExecutions,
+      });
+      for (const id of ['first', 'retry']) {
+        await node.invoke({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id, name: toolName, args: {} }],
+            }),
+          ],
+        });
+      }
+
+      expect(captured).toHaveLength(1);
+      expect(captured[0].id).toBe('retry');
+      expect(captured[0].codeSessionContext?.files).toEqual(inputs);
+    });
+  }
+);

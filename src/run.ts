@@ -38,11 +38,6 @@ import {
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
 import {
-  requireValidSubagentResumeManifest,
-  SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
-  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
-} from '@/tools/subagent/SubagentReplay';
-import {
   ACTIVITY_PHASE_LABEL_PROMPT,
   ACTIVITY_LABEL_PROMPT,
   buildActivityLabelPrompt,
@@ -58,11 +53,22 @@ import {
   withLangfuseAttributes,
 } from '@/langfuse';
 import {
+  requireValidSubagentResumeManifest,
+  SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
+  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
+} from '@/tools/subagent/SubagentReplay';
+import {
   REASONING_LABEL_PROMPT,
   buildReasoningLabelTraceSeed,
   buildReasoningLabelPrompt,
   normalizeReasoningLabel,
 } from '@/prompts/reasoningLabel';
+import {
+  TOOL_BATCH_REPLAY_KEY,
+  restoreToolReplayConfig,
+  stripToolBatchReplayState,
+  getPublicToolInterruptPayload,
+} from '@/tools/toolBatchReplay';
 import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
@@ -72,12 +78,6 @@ import {
   cloneToolApprovalInterruptPayload,
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
 } from '@/hitl/approvalReview';
-import {
-  TOOL_BATCH_REPLAY_KEY,
-  restoreToolReplayConfig,
-  stripToolBatchReplayState,
-  getPublicToolInterruptPayload,
-} from '@/tools/toolBatchReplay';
 import {
   resolveLangfuseDestinationKey,
   resolveLangfuseTraceAnchorParent,
@@ -474,6 +474,7 @@ export class Run<_T extends t.BaseGraphState> {
   private maxStopContinuations: number;
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
+  private subagentContext?: t.SubagentContextAdapter;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
   fadingTier?: t.FadingTier;
@@ -556,6 +557,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.toolExecution = config.toolExecution;
     this.subagentUsageSink = config.subagentUsageSink;
     this.subagentTasks = config.subagentTasks;
+    this.subagentContext = config.subagentContext;
     this.preemption = config.preemption;
     this.maxStopContinuations = resolveMaxStopContinuations(
       config.maxStopContinuations
@@ -654,6 +656,7 @@ export class Run<_T extends t.BaseGraphState> {
         fadingTiers: this.fadingTiers,
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
+        subagentContext: this.subagentContext,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         toolExecution: this.toolExecution,
@@ -696,6 +699,7 @@ export class Run<_T extends t.BaseGraphState> {
         fadingTiers: this.fadingTiers,
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
+        subagentContext: this.subagentContext,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         toolExecution: this.toolExecution,
@@ -1283,7 +1287,11 @@ export class Run<_T extends t.BaseGraphState> {
       );
       const publicPayload = stripRunStepResumeState(this._interrupt?.payload);
       if (config.configurable != null) {
-        restoreToolReplayConfig(config.configurable, this._interrupt?.interruptId, publicPayload);
+        restoreToolReplayConfig(
+          config.configurable,
+          this._interrupt?.interruptId,
+          publicPayload
+        );
       }
       if (graph.getStopContinuationExecutionId() === '') {
         graph.startStopContinuationExecution(nanoid());
@@ -2015,8 +2023,11 @@ export class Run<_T extends t.BaseGraphState> {
     await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
     const interrupt = this._interrupt;
     const replayPayload = stripRunStepResumeState(interrupt?.payload);
-    const resumeManifest = requireValidSubagentResumeManifest(replayPayload) ??
-      requireValidSubagentResumeManifest(stripToolBatchReplayState(replayPayload));
+    const resumeManifest =
+      requireValidSubagentResumeManifest(replayPayload) ??
+      requireValidSubagentResumeManifest(
+        stripToolBatchReplayState(replayPayload)
+      );
     const resumeConfigurable = { ...callerConfig.configurable };
     delete resumeConfigurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     delete resumeConfigurable[TOOL_BATCH_REPLAY_KEY];
@@ -2027,7 +2038,11 @@ export class Run<_T extends t.BaseGraphState> {
       resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] = resumeManifest;
     }
     const publicPayload = stripRunStepResumeState(interrupt?.payload);
-    restoreToolReplayConfig(resumeConfigurable, interrupt?.interruptId, publicPayload);
+    restoreToolReplayConfig(
+      resumeConfigurable,
+      interrupt?.interruptId,
+      publicPayload
+    );
     const manifestConfig = {
       ...callerConfig,
       configurable: resumeConfigurable,

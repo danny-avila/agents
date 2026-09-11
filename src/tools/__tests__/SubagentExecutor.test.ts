@@ -600,15 +600,13 @@ describe('SubagentExecutor', () => {
     const invoke = jest.fn(() => invocation);
     const clearHeavyState = jest.fn();
     let detachedGraph: StandardGraph | undefined;
-    const createDetachedChildGraphFactory = jest.fn(
-      () => (): StandardGraph => {
-        detachedGraph = {
-          createWorkflow: () => ({ invoke }),
-          clearHeavyState,
-        } as unknown as StandardGraph;
-        return detachedGraph;
-      }
-    );
+    const createDetachedChildGraphFactory = jest.fn(() => (): StandardGraph => {
+      detachedGraph = {
+        createWorkflow: () => ({ invoke }),
+        clearHeavyState,
+      } as unknown as StandardGraph;
+      return detachedGraph;
+    });
     const fallbackFactory = jest.fn(
       (): StandardGraph =>
         ({
@@ -3221,7 +3219,14 @@ describe('SubagentExecutor', () => {
         string,
         unknown
       >;
-      expect(Object.keys(configurable)).toEqual(['thread_id']);
+      expect(Object.keys(configurable)).toEqual([
+        'executionContext',
+        'thread_id',
+      ]);
+      expect(configurable.executionContext).toMatchObject({
+        rootRunId: 'test-run',
+        depth: 1,
+      });
     });
   });
 

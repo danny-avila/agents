@@ -52,6 +52,10 @@ import type {
   ResolvedSubagentConfig,
   ResolvedSubagentConfigEntry,
   SubagentExecutionContext,
+  SubagentContextAdapter,
+  SubagentContextInput,
+  SubagentContextResult,
+  PreparedSubagentContext,
   SubagentTaskConfig,
   SubagentTaskRuntime,
   SubagentResolveConfigurable,
@@ -88,11 +92,6 @@ import type {
   ToolApprovalReplaySnapshot,
 } from '@/hooks';
 import type { GraphFactory } from '@/graphs/graphFactory';
-import {
-  rebindToolBatchReplayScope,
-  rebindToolBatchReplayPayload,
-  restoreToolReplayConfig,
-} from '@/tools/toolBatchReplay';
 import type { StandardGraph } from '@/graphs/Graph';
 import {
   getSubagentApprovalExecutionScope,
@@ -108,6 +107,11 @@ import {
   SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from './SubagentReplay';
+import {
+  rebindToolBatchReplayScope,
+  rebindToolBatchReplayPayload,
+  restoreToolReplayConfig,
+} from '@/tools/toolBatchReplay';
 import {
   executeHooks,
   HookRegistry,
@@ -831,9 +835,7 @@ export type SubagentExecuteParams = {
   initialMessages?: BaseMessage[];
 };
 
-export type SubagentExecuteResult = {
-  content: string;
-  messages: BaseMessage[];
+export type SubagentExecuteResult = SubagentContextResult & {
   /** Tagged internal failure; foreground callers retain the legacy content. */
   error?: string;
 };
@@ -931,6 +933,7 @@ export type SubagentExecutorOptions = {
   usageSink?: SubagentUsageSink;
   /** Host-owned process-local task namespace for detached execution. */
   taskConfig?: SubagentTaskConfig;
+  subagentContext?: SubagentContextAdapter;
 };
 
 type DurableExecutionRecord = SubagentExecutionRecord<
@@ -968,6 +971,7 @@ export class SubagentExecutor {
   ) => GraphFactory;
   private readonly usageSink?: SubagentUsageSink;
   private readonly taskConfig?: SubagentTaskConfig;
+  private readonly subagentContext?: SubagentContextAdapter;
   private readonly executions: SubagentExecutionRegistry<
     SubagentExecuteResult,
     ResolvedSubagentConfig,
@@ -1012,6 +1016,7 @@ export class SubagentExecutor {
       options.createDetachedChildGraphFactory;
     this.usageSink = options.usageSink;
     this.taskConfig = options.taskConfig;
+    this.subagentContext = options.subagentContext;
     const rawRegistry = options.parentHandlerRegistry;
     if (typeof rawRegistry === 'function') {
       this.resolveParentHandlerRegistry = rawRegistry;
@@ -1257,6 +1262,7 @@ export class SubagentExecutor {
       langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
       usageSink: this.usageSink,
+      subagentContext: this.subagentContext,
       streamLimits: this.streamLimits,
       maxDepth: this.maxDepth,
       createChildGraph:
@@ -1454,7 +1460,10 @@ export class SubagentExecutor {
         resumeExecution.checkpoints,
         branchChildThreadId,
         lease,
-        { source: resumeExecution.approvalExecutionScope, target: approvalExecutionScope }
+        {
+          source: resumeExecution.approvalExecutionScope,
+          target: approvalExecutionScope,
+        }
       );
       let previousApprovals: ToolApprovalReplaySnapshot[] = [];
       let approvalsMutated = false;
@@ -1765,14 +1774,20 @@ export class SubagentExecutor {
           }
           /** Repeated unconsumed forks must persist their current owner. */
           const reboundValue =
-            channel === INTERRUPT && approvalScope != null &&
-            value != null && typeof value === 'object' && 'value' in value
-              ? { ...value, value: rebindToolBatchReplayPayload(
-                value.value,
-                approvalScope.source,
-                approvalScope.target,
-                targetThreadId
-              ) }
+            channel === INTERRUPT &&
+            approvalScope != null &&
+            value != null &&
+            typeof value === 'object' &&
+            'value' in value
+              ? {
+                ...value,
+                value: rebindToolBatchReplayPayload(
+                  value.value,
+                  approvalScope.source,
+                  approvalScope.target,
+                  targetThreadId
+                ),
+              }
               : value;
           writes.push([channel, reboundValue]);
         }
@@ -2386,11 +2401,6 @@ export class SubagentExecutor {
     if (!bound) {
       return createSubagentFailure(SUBAGENT_CONFIG_CHANGED_MESSAGE);
     }
-    const completedChildResult = execution.completedResult;
-    if (completedChildResult != null) {
-      return completedChildResult;
-    }
-
     let config: ResolvedSubagentConfigEntry;
     try {
       config = await this.resolveExecutionConfig(executableConfig, execution, {
@@ -2450,6 +2460,44 @@ export class SubagentExecutor {
         },
       ],
     };
+    const hostContextInput: SubagentContextInput = {
+      executionContext: childExecutionContext,
+      parentThreadId: threadId,
+      memberAgentIds: childPlan.agents.map((agent) => agent.agentId),
+      signal: childSignal,
+      resumed: execution.started || resumeExecution != null,
+    };
+    let preparedContext: PreparedSubagentContext | undefined;
+    try {
+      preparedContext = await this.subagentContext?.prepare(hostContextInput);
+      execution.assertUsable(childSignal);
+      for (const [agentId, sessions] of Object.entries(
+        preparedContext?.agentSessions ?? {}
+      )) {
+        const member = childPlan.memberInputs.get(agentId);
+        if (member == null) throw new Error('Unknown subagent context member.');
+        const activeMember =
+          execution.activeRun?.graph.agentContexts.get(agentId);
+        if (
+          activeMember != null &&
+          activeMember.codeSessionKey !== sessions.codeSessionKey
+        ) {
+          throw new Error(
+            'Subagent session partition changed during execution.'
+          );
+        }
+        member.codeSessionKey = sessions.codeSessionKey;
+        member.initialSessions = sessions.initialSessions;
+      }
+    } catch {
+      return createSubagentFailure(
+        'Subagent context is unavailable or access was denied.'
+      );
+    }
+    const completedChildResult = execution.completedResult;
+    if (completedChildResult != null) {
+      return this.completeHostContext(hostContextInput, completedChildResult);
+    }
     const maxTurns = config.maxTurns ?? DEFAULT_SUBAGENT_MAX_TURNS;
     const memberRecursionLimit = maxTurns * SUBAGENT_RECURSION_MULTIPLIER;
     const recursionLimit =
@@ -2476,6 +2524,7 @@ export class SubagentExecutor {
       streamLimits: this.streamLimits,
       subagentScope: true,
       subagentExecutionContext: childExecutionContext,
+      subagentContext: this.subagentContext,
       ...(resumeExecution?.graphState.fadingTier == null
         ? {}
         : { fadingTier: resumeExecution.graphState.fadingTier }),
@@ -2626,6 +2675,8 @@ export class SubagentExecutor {
       }
       const childConfigurable: Record<string, unknown> = {
         ...inheritedConfigurable,
+        ...sanitizePreparedConfigurable(preparedContext?.configurable),
+        executionContext: childExecutionContext,
       };
       if (this.humanInTheLoop?.enabled === true) {
         childConfigurable[TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY] =
@@ -2666,16 +2717,18 @@ export class SubagentExecutor {
         }
         const persistedInterrupts = getPersistedInterrupts(persistedState);
         if (persistedInterrupts.length > 0) {
-          activeChildRun.pendingInterrupts = resumeExecution == null ? persistedInterrupts :
-            persistedInterrupts.map((pending) => ({
-              ...pending,
-              value: rebindToolBatchReplayPayload(
-                pending.value,
-                resumeExecution.approvalExecutionScope,
-                approvalExecutionScope,
-                childThreadId
-              ),
-            }));
+          activeChildRun.pendingInterrupts =
+            resumeExecution == null
+              ? persistedInterrupts
+              : persistedInterrupts.map((pending) => ({
+                ...pending,
+                value: rebindToolBatchReplayPayload(
+                  pending.value,
+                  resumeExecution.approvalExecutionScope,
+                  approvalExecutionScope,
+                  childThreadId
+                ),
+              }));
           execution.markStarted();
           childAlreadyStarted = true;
         } else if (persistedState.next.length > 0) {
@@ -2710,9 +2763,12 @@ export class SubagentExecutor {
         }
         let childInput: BaseGraphState | Command | null;
         if (childResumeMap != null) {
-          const pending = activeChildRun.pendingInterrupts.find((entry) =>
-            entry.id != null && Object.prototype.hasOwnProperty.call(childResumeMap, entry.id)
-          ) ?? activeChildRun.pendingInterrupts[0];
+          const pending =
+            activeChildRun.pendingInterrupts.find(
+              (entry) =>
+                entry.id != null &&
+                Object.prototype.hasOwnProperty.call(childResumeMap, entry.id)
+            ) ?? activeChildRun.pendingInterrupts[0];
           restoreToolReplayConfig(childConfigurable, pending.id, pending.value);
           rebindToolBatchReplayScope(
             childConfigurable,
@@ -2734,6 +2790,7 @@ export class SubagentExecutor {
                   [SUBAGENT_RUN_ID_KEY]: childRunId,
                 },
               }),
+              ...(preparedContext?.messages ?? []),
             ],
           };
         }
@@ -2749,6 +2806,7 @@ export class SubagentExecutor {
             registry: this.hookRegistry,
             input: {
               hook_event_name: 'SubagentStart',
+              executionContext: childExecutionContext,
               runId: currentHookSessionId,
               threadId,
               parentAgentId: this.parentAgentId,
@@ -2955,6 +3013,7 @@ export class SubagentExecutor {
         registry: this.hookRegistry,
         input: {
           hook_event_name: 'SubagentStop',
+          executionContext: childExecutionContext,
           runId: currentHookSessionId,
           threadId,
           agentId: childAgentId,
@@ -2997,12 +3056,27 @@ export class SubagentExecutor {
 
     this.clearChildGraph(childGraph);
 
-    const completedResult = {
+    const completedResult: SubagentExecuteResult = {
       content: filteredContent,
       messages: result.messages,
     };
     execution.markCompleted(completedResult);
-    return completedResult;
+    return this.completeHostContext(hostContextInput, completedResult);
+  }
+
+  private async completeHostContext(
+    input: SubagentContextInput,
+    result: SubagentExecuteResult
+  ): Promise<SubagentExecuteResult> {
+    if (this.subagentContext?.complete == null) return result;
+    try {
+      input.signal.throwIfAborted();
+      const completed = await this.subagentContext.complete(input, result);
+      input.signal.throwIfAborted();
+      return { ...result, content: completed.content };
+    } catch {
+      return createSubagentFailure('Subagent result delivery failed.');
+    }
   }
 
   /**
@@ -3533,6 +3607,17 @@ function sanitizeChildConfigurable(
       ([key]) => !isLangGraphRuntimeConfigKey(key)
     )
   );
+}
+
+function sanitizePreparedConfigurable(
+  configurable: RunnableConfig['configurable']
+): Record<string, unknown> {
+  const prepared = sanitizeChildConfigurable(configurable);
+  delete prepared.run_id;
+  delete prepared.parent_run_id;
+  delete prepared.thread_id;
+  delete prepared.executionContext;
+  return prepared;
 }
 
 function isLangGraphRuntimeConfigKey(key: string): boolean {

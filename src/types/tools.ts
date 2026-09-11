@@ -11,10 +11,10 @@ import type {
   ToolErrorData,
 } from './stream';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { LangfuseConfig, SubagentExecutionContext } from './graph';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { HumanInTheLoopConfig } from './hitl';
-import type { LangfuseConfig } from './graph';
 import type { HookRegistry } from '@/hooks';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
@@ -156,6 +156,8 @@ export type ToolNodeOptions = {
   /** ID of the agent that owns this tool node, surfaced to hooks as `executingAgentId`
    * so a batch can be attributed to a specific agent even where `agentId` is undefined. */
   executingAgentId?: string;
+  /** SDK-owned identity of the child execution, independent of reusable agent IDs. */
+  executionContext?: SubagentExecutionContext;
   /** Name of the agent that owns this tool node, used for active Langfuse attribution. */
   executingAgentName?: string;
   /** Root graph-agent identity retained alongside the currently executing tool owner. */
@@ -596,6 +598,8 @@ export type CallerCapabilityProjectionSnapshot = {
 
 /** Batch request containing ALL tool calls for a graph step */
 export type ToolExecuteBatchRequest = {
+  /** SDK-owned child lineage. Unset for tools in the root graph. */
+  executionContext?: SubagentExecutionContext;
   /** All tool calls from the AIMessage */
   toolCalls: ToolCallRequest[];
   /** User ID for context */

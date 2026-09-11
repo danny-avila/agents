@@ -395,6 +395,8 @@ export type StandardGraphInput = {
    * do not inherit it, keeping background nesting disabled for the MVP.
    */
   subagentTasks?: SubagentTaskConfig;
+  /** Host-owned context and result projection for each isolated child execution. */
+  subagentContext?: SubagentContextAdapter;
   /**
    * True when this graph IS a subagent child run (set by `SubagentExecutor`
    * when it constructs the child graph). Drives the hook-input `agentId`
@@ -667,6 +669,41 @@ export interface SubagentExecutionContext {
   readonly hookSessionId: string;
   readonly depth: number;
   readonly ancestry: readonly SubagentAncestryEntry[];
+}
+
+/** Trusted identity supplied before a child can access host-owned resources. */
+export interface SubagentContextInput {
+  executionContext: SubagentExecutionContext;
+  parentThreadId?: string;
+  memberAgentIds: readonly string[];
+  signal: AbortSignal;
+  resumed: boolean;
+}
+
+export interface PreparedSubagentContext {
+  /** Added to the initial child input; checkpoint recovery does not add them again. */
+  messages?: BaseMessage[];
+  /** Host configuration; SDK execution and checkpoint identities remain authoritative. */
+  configurable?: RunnableConfig['configurable'];
+  /** Each entry replaces that member's inherited code partition and initial sessions. */
+  agentSessions?: Readonly<
+    Record<string, Pick<AgentInputs, 'codeSessionKey' | 'initialSessions'>>
+  >;
+}
+
+export interface SubagentContextResult {
+  content: string;
+  messages: BaseMessage[];
+}
+
+export interface SubagentContextAdapter {
+  /** Reauthorizes reconstructed executions; durable work must be idempotent by child run ID. */
+  prepare(input: SubagentContextInput): Promise<PreparedSubagentContext>;
+  /** Projects durable references into the result returned to the parent. */
+  complete?(
+    input: SubagentContextInput,
+    result: SubagentContextResult
+  ): Promise<Pick<SubagentContextResult, 'content'>>;
 }
 
 /**
