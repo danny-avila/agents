@@ -1296,15 +1296,18 @@ export class SubagentExecutor {
         }
         return result;
       };
-      let deliveryRetries = 0;
+      let deliveryAttempts = 1;
       let result = await executeAttempt();
-      while (result.retryableDelivery === true) {
-        if (deliveryRetries > 0) {
+      while (
+        result.retryableDelivery === true &&
+        deliveryAttempts < 3
+      ) {
+        if (deliveryAttempts > 1) {
           await sleep(
-            Math.min(100 * 2 ** Math.min(deliveryRetries - 1, 6), 5_000)
+            Math.min(100 * 2 ** Math.min(deliveryAttempts - 2, 6), 5_000)
           );
         }
-        deliveryRetries += 1;
+        deliveryAttempts += 1;
         result = await executeAttempt();
       }
       if (result.error != null) {

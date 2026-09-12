@@ -718,6 +718,43 @@ describe('SubagentExecutor', () => {
     ).toMatchObject({ status: 'completed', result: 'detached result delivered' });
   });
 
+  it('bounds detached result delivery retries', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const invoke = jest.fn().mockResolvedValue({
+      messages: [new AIMessage('detached result')],
+    });
+    const complete = jest.fn(async () => {
+      throw new Error('Persistent delivery failure');
+    });
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      subagentContext: { prepare: async () => ({}), complete },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Research independently.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_delivery_failure',
+      })
+    ) as { background_task_id: string };
+    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledTimes(3);
+    expect(
+      store.get('owner:conversation', response.background_task_id)
+    ).toMatchObject({
+      status: 'error',
+      error: 'Subagent result delivery failed.',
+    });
+  });
+
   it('replaces the ambient parent run config for detached child execution', async () => {
     const store = new InMemorySubagentTaskStore();
     const parentController = new AbortController();

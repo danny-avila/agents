@@ -3136,6 +3136,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     if (!this.sessions) {
       return;
     }
+    const existing = this.sessions.get(this.codeSessionKey) as
+      | t.CodeSessionContext
+      | undefined;
+    const baselineIdentityByName = new Map(
+      (existing?.files ?? []).map((file) => [
+        file.name,
+        fileIdentityKey(file),
+      ])
+    );
+    const refreshedByName = new Map<string, t.CodeEnvFile>();
+    let sessionId: string | undefined;
     for (const request of requests) {
       if (
         request.name === '' ||
@@ -3144,12 +3155,22 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ) {
         continue;
       }
-      retainCodeSessionInputs(
-        this.sessions,
-        this.codeSessionKey,
-        request.codeSessionContext
-      );
+      const context = request.codeSessionContext;
+      if (context?.session_id == null || context.session_id === '') continue;
+      sessionId ??= context.session_id;
+      for (const file of context.files ?? []) {
+        if (!file.id || !file.name || !file.storage_session_id) continue;
+        if (baselineIdentityByName.get(file.name) === fileIdentityKey(file)) {
+          continue;
+        }
+        refreshedByName.set(file.name, file);
+      }
     }
+    if (sessionId == null || refreshedByName.size === 0) return;
+    retainCodeSessionInputs(this.sessions, this.codeSessionKey, {
+      session_id: sessionId,
+      files: [...refreshedByName.values()],
+    });
   }
 
   /**

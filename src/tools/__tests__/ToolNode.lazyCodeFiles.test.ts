@@ -335,6 +335,68 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
       expect(sessions.get('child-agent')?.files).toEqual([refreshed]);
     });
 
+    it('ignores a later request carrying the original batch snapshot', async () => {
+      const stale = inputs[0];
+      const refreshed = {
+        ...stale,
+        id: 'order-refreshed',
+        resource_id: 'user-refreshed',
+        storage_session_id: 'refreshed-storage',
+      };
+      const sessions: t.ToolSessionMap = new Map([
+        [
+          'child-agent',
+          {
+            session_id: 'old-exec',
+            files: structuredClone(inputs),
+            lastUpdated: 1,
+          },
+        ],
+      ]);
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+          const batch = data as t.ToolExecuteBatchRequest;
+          batch.toolCalls[0].codeSessionContext = {
+            session_id: 'input-context',
+            files: [refreshed, inputs[1]],
+          };
+          batch.reject(new Error('transport failed'));
+        });
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+      });
+
+      await expect(
+        node.invoke({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: ['refresh', 'stale'].map((id) => ({
+                id,
+                name: toolName,
+                args: {},
+              })),
+            }),
+          ],
+        })
+      ).rejects.toThrow('transport failed');
+      expect(sessions.get('child-agent')?.files).toEqual([
+        refreshed,
+        inputs[1],
+      ]);
+    });
+
     it('retains lazily provisioned inputs when an event batch rejects', async () => {
       const sessions: t.ToolSessionMap = new Map();
       let attempt = 0;
