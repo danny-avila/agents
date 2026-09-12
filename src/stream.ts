@@ -878,6 +878,12 @@ function startEagerToolExecutions(args: {
       toolName: entry.toolName,
       args: entry.coercedArgs,
       request: entry.request,
+      codeSessionBaselineByName: new Map(
+        (entry.request.codeSessionContext?.files ?? []).map((file) => [
+          file.name,
+          `${file.storage_session_id}\0${file.id}`,
+        ])
+      ),
       promise,
     };
     records.push(record);

@@ -3093,7 +3093,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private storeCodeSessionFromResults(
     results: t.ToolExecuteResult[],
     requestMap: Map<string, t.ToolCallRequest>,
-    baselineIdentityByName: ReadonlyMap<string, string>
+    baselineByRequestId: ReadonlyMap<
+      string,
+      ReadonlyMap<string, string>
+    >
   ): void {
     if (!this.sessions) {
       return;
@@ -3101,7 +3104,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     this.retainCodeSessionInputsFromRequests(
       requestMap.values(),
-      baselineIdentityByName
+      baselineByRequestId
     );
     for (let i = 0; i < results.length; i++) {
       const result = results[i];
@@ -3136,7 +3139,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
   private retainCodeSessionInputsFromRequests(
     requests: Iterable<t.ToolCallRequest>,
-    baselineIdentityByName: ReadonlyMap<string, string>
+    baselineByRequestId: ReadonlyMap<
+      string,
+      ReadonlyMap<string, string>
+    >
   ): void {
     if (!this.sessions) {
       return;
@@ -3155,9 +3161,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const context = request.codeSessionContext;
       if (context?.session_id == null || context.session_id === '') continue;
       sessionId ??= context.session_id;
+      const baselineIdentityByName = baselineByRequestId.get(request.id);
       for (const file of context.files ?? []) {
         if (!file.id || !file.name || !file.storage_session_id) continue;
-        if (baselineIdentityByName.get(file.name) === fileIdentityKey(file)) {
+        if (baselineIdentityByName?.get(file.name) === fileIdentityKey(file)) {
           continue;
         }
         refreshedByName.set(file.name, file);
@@ -4100,6 +4107,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           )?.files ?? []
         ).map((file) => [file.name, fileIdentityKey(file)])
       );
+      const codeSessionBaselineByRequestId = new Map<
+        string,
+        ReadonlyMap<string, string>
+      >(
+        plan.allRequests.map((request) => [
+          request.id,
+          codeSessionBaselineByName,
+        ])
+      );
       const eagerExecutions: Array<{
         request: t.ToolCallRequest;
         execution: t.EagerEventToolExecution;
@@ -4110,6 +4126,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const eagerExecution = this.takeMatchingEagerEventExecution(request);
         if (eagerExecution != null) {
           eagerExecutions.push({ request, execution: eagerExecution });
+          if (eagerExecution.codeSessionBaselineByName != null) {
+            codeSessionBaselineByRequestId.set(
+              request.id,
+              eagerExecution.codeSessionBaselineByName
+            );
+          }
         } else {
           dispatchRequests.push(request);
         }
@@ -4262,14 +4284,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (eagerOutcome.status === 'rejected') {
         this.retainCodeSessionInputsFromRequests(
           requestMap.values(),
-          codeSessionBaselineByName
+          codeSessionBaselineByRequestId
         );
         throw eagerOutcome.reason;
       }
       if (dispatchedOutcome.status === 'rejected') {
         this.retainCodeSessionInputsFromRequests(
           requestMap.values(),
-          codeSessionBaselineByName
+          codeSessionBaselineByRequestId
         );
         throw dispatchedOutcome.reason;
       }
@@ -4295,7 +4317,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       this.storeCodeSessionFromResults(
         results,
         requestMap,
-        codeSessionBaselineByName
+        codeSessionBaselineByRequestId
       );
 
       for (const result of results) {

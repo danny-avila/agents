@@ -75,6 +75,7 @@ export type EagerEventToolExecution = {
   toolName: string;
   args: Record<string, unknown>;
   request: ToolCallRequest;
+  codeSessionBaselineByName?: ReadonlyMap<string, string>;
   promise: Promise<EagerEventToolExecutionOutcome>;
   /**
    * True when the streaming eager path already emitted the user-visible
