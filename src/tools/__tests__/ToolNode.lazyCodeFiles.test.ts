@@ -397,6 +397,131 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
       ]);
     });
 
+    it('uses the pre-dispatch baseline across concurrent batches', async () => {
+      const stale = inputs[0];
+      const refreshed = {
+        ...stale,
+        id: 'order-refreshed',
+        storage_session_id: 'refreshed-storage',
+      };
+      const sessions: t.ToolSessionMap = new Map([
+        [
+          'child-agent',
+          { session_id: 'old-exec', files: [stale], lastUpdated: 1 },
+        ],
+      ]);
+      let finishStale = (): void => undefined;
+      const staleGate = new Promise<void>((resolve) => {
+        finishStale = resolve;
+      });
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+          const batch = data as t.ToolExecuteBatchRequest;
+          const request = batch.toolCalls[0];
+          if (request.id === 'stale') {
+            await staleGate;
+          } else {
+            request.codeSessionContext = {
+              session_id: 'input-context',
+              files: [refreshed],
+            };
+          }
+          batch.resolve([
+            { toolCallId: request.id, status: 'success', content: '' },
+          ]);
+        });
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+      });
+      const invoke = (id: string) =>
+        node.invoke({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id, name: toolName, args: {} }],
+            }),
+          ],
+        });
+
+      const staleBatch = invoke('stale');
+      await invoke('refreshed');
+      finishStale();
+      await staleBatch;
+
+      expect(sessions.get('child-agent')?.files).toEqual([refreshed]);
+    });
+
+    it('retains refreshed inputs from read_file requests', async () => {
+      const stale = inputs[0];
+      const refreshed = {
+        ...stale,
+        id: 'order-refreshed',
+        storage_session_id: 'refreshed-storage',
+      };
+      const sessions: t.ToolSessionMap = new Map([
+        [
+          'child-agent',
+          { session_id: 'old-exec', files: [stale], lastUpdated: 1 },
+        ],
+      ]);
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+          const batch = data as t.ToolExecuteBatchRequest;
+          const request = batch.toolCalls[0];
+          if (request.name === Constants.READ_FILE) {
+            request.codeSessionContext = {
+              session_id: 'input-context',
+              files: [refreshed],
+            };
+          } else {
+            expect(request.codeSessionContext?.files).toEqual([refreshed]);
+          }
+          batch.resolve([
+            { toolCallId: request.id, status: 'success', content: '' },
+          ]);
+        });
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+          tool(async () => 'unused', {
+            name: Constants.READ_FILE,
+            description: 'Read file',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+      });
+      for (const [id, name] of [
+        ['read', Constants.READ_FILE],
+        ['execute', toolName],
+      ]) {
+        await node.invoke({
+          messages: [
+            new AIMessage({ content: '', tool_calls: [{ id, name, args: {} }] }),
+          ],
+        });
+      }
+    });
+
     it('retains lazily provisioned inputs when an event batch rejects', async () => {
       const sessions: t.ToolSessionMap = new Map();
       let attempt = 0;

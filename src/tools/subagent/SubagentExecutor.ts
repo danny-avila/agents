@@ -173,6 +173,31 @@ function seedChildGraphSessions(
   seedAgentInitialSessions(childGraph.sessions, agents);
 }
 
+async function awaitWithAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal
+): Promise<T> {
+  signal.throwIfAborted();
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = (): void => {
+      reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new Error('Detached subagent task cancelled.')
+      );
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    if (onAbort != null) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
 async function dispatchObservationalSubagentUpdate(
   handler: EventHandler,
   event: SubagentUpdateEvent
@@ -3092,7 +3117,10 @@ export class SubagentExecutor {
     if (this.subagentContext?.complete == null) return result;
     try {
       input.signal.throwIfAborted();
-      const completed = await this.subagentContext.complete(input, result);
+      const completed = await awaitWithAbort(
+        this.subagentContext.complete(input, result),
+        input.signal
+      );
       input.signal.throwIfAborted();
       return { ...result, content: completed.content };
     } catch {

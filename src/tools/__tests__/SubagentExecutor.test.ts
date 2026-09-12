@@ -755,6 +755,46 @@ describe('SubagentExecutor', () => {
     });
   });
 
+  it('releases detached state when result delivery hangs past task timeout', async () => {
+    const store = new InMemorySubagentTaskStore({ taskTimeoutMs: 20 });
+    const clearHeavyState = jest.fn();
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      subagentContext: {
+        prepare: async () => ({}),
+        complete: () => new Promise(() => undefined),
+      },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({
+            invoke: jest.fn().mockResolvedValue({
+              messages: [new AIMessage('detached result')],
+            }),
+          }),
+          clearHeavyState,
+        }) as unknown as StandardGraph,
+    });
+
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Research independently.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_delivery_timeout',
+      })
+    ) as { background_task_id: string };
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'error'
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(clearHeavyState).toHaveBeenCalled();
+    expect(
+      store.get('owner:conversation', response.background_task_id)
+    ).toMatchObject({ status: 'error', error: 'Detached subagent task timed out.' });
+  });
+
   it('replaces the ambient parent run config for detached child execution', async () => {
     const store = new InMemorySubagentTaskStore();
     const parentController = new AbortController();
