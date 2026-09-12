@@ -373,9 +373,16 @@ describe('host-owned subagent context', () => {
   });
 
   it('retains completed work when result delivery needs retry', async () => {
+    let preparations = 0;
     let attempts = 0;
     const adapter: SubagentContextAdapter = {
-      prepare: async () => ({}),
+      prepare: async () => {
+        preparations++;
+        if (preparations === 2) {
+          throw new Error('Transient reauthorization failure');
+        }
+        return {};
+      },
       complete: async (_input, result) => {
         attempts++;
         if (attempts === 1) throw new Error('Transient publication failure');
@@ -384,7 +391,10 @@ describe('host-owned subagent context', () => {
     };
     const harness = createHarness({ adapter });
     expect((await harness.execute()).error).toContain('delivery failed');
+    expect((await harness.execute()).error).toContain('access was denied');
     expect((await harness.execute()).content).toContain('durable-id');
+    expect(preparations).toBe(3);
+    expect(attempts).toBe(2);
     expect(harness.batches).toHaveLength(1);
     expect(harness.graphs).toHaveLength(1);
   });

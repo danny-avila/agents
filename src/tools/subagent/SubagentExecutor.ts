@@ -2552,6 +2552,14 @@ export class SubagentExecutor {
           ? childSignal.reason
           : error;
       }
+      if (execution.completedResult != null) {
+        return {
+          ...createSubagentFailure(
+            'Subagent context is unavailable or access was denied.'
+          ),
+          retryableDelivery: true,
+        };
+      }
       return createSubagentFailure(
         'Subagent context is unavailable or access was denied.'
       );

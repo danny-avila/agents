@@ -545,6 +545,66 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
       });
     });
 
+    it('prefers an explicit session refresh over a sibling file session', async () => {
+      const refreshed = {
+        ...inputs[0],
+        id: 'order-refreshed',
+        storage_session_id: 'refreshed-storage',
+      };
+      const sessions: t.ToolSessionMap = new Map([
+        [
+          'child-agent',
+          { session_id: 'old-exec', files: inputs, lastUpdated: 1 },
+        ],
+      ]);
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+          const batch = data as t.ToolExecuteBatchRequest;
+          batch.toolCalls[0].codeSessionContext = {
+            session_id: 'refreshed-exec',
+            files: structuredClone(inputs),
+          };
+          batch.toolCalls[1].codeSessionContext = {
+            session_id: 'old-exec',
+            files: [refreshed, inputs[1]],
+          };
+          batch.reject(new Error('transport failed'));
+        });
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+      });
+
+      await expect(
+        node.invoke({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: ['session', 'file'].map((id) => ({
+                id,
+                name: toolName,
+                args: {},
+              })),
+            }),
+          ],
+        })
+      ).rejects.toThrow('transport failed');
+      expect(sessions.get('child-agent')).toMatchObject({
+        session_id: 'refreshed-exec',
+        files: [refreshed, inputs[1]],
+      });
+    });
+
     it('ignores a later request carrying the original batch snapshot', async () => {
       const stale = inputs[0];
       const refreshed = {
