@@ -350,8 +350,9 @@ describe('host-owned subagent context', () => {
       controller.abort();
       return { messages: [new HumanMessage('Must never reach a model')] };
     };
-    const aborted = await harness.execute('aborted', controller.signal);
-    expect(aborted.error).toBeDefined();
+    await expect(
+      harness.execute('aborted', controller.signal)
+    ).rejects.toThrow();
     expect(harness.graphs).toHaveLength(0);
   });
 
@@ -367,9 +368,7 @@ describe('host-owned subagent context', () => {
     }
     controller.abort(new Error('cancelled'));
 
-    await expect(result).resolves.toMatchObject({
-      error: expect.stringContaining('access was denied'),
-    });
+    await expect(result).rejects.toThrow('cancelled');
     expect(harness.graphs).toHaveLength(0);
   });
 

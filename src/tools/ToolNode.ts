@@ -758,7 +758,7 @@ function retainCodeSessionInputs(
   }
   if (!changed) return;
   sessions.set(sessionKey, {
-    session_id: existing?.session_id ?? context.session_id,
+    session_id: context.session_id,
     files,
     lastUpdated: Date.now(),
   });
@@ -3154,19 +3154,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         request.name === '' ||
         (!this.participatesInCodeSession(request.name) &&
           request.name !== Constants.SKILL_TOOL &&
-          request.name !== Constants.READ_FILE)
+          request.name !== Constants.READ_FILE &&
+          request.retainCodeSessionInputs !== true)
       ) {
         continue;
       }
       const context = request.codeSessionContext;
       if (context?.session_id == null || context.session_id === '') continue;
-      sessionId ??= context.session_id;
       const baselineIdentityByName = baselineByRequestId.get(request.id);
       for (const file of context.files ?? []) {
         if (!file.id || !file.name || !file.storage_session_id) continue;
         if (baselineIdentityByName?.get(file.name) === fileIdentityKey(file)) {
           continue;
         }
+        sessionId = context.session_id;
         refreshedByName.set(file.name, file);
       }
     }
@@ -4596,29 +4597,40 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       // effects) every round.
       this.eagerEventToolSuppressions?.add(request.name);
       this.eagerEventToolSuppressions?.add(execution.toolName);
+      if (
+        this.participatesInCodeSession(execution.toolName) ||
+        execution.toolName === Constants.SKILL_TOOL ||
+        execution.toolName === Constants.READ_FILE
+      ) {
+        request.retainCodeSessionInputs = true;
+      }
       // eslint-disable-next-line no-console
       console.warn(
         '[ToolNode] eager prestart args diverged from the final request for ' +
           `tool "${request.name}" (toolCallId=${request.id}); suppressing ` +
           'eager prestart for this tool for the rest of the run'
       );
+      const createMismatchOutcome = (): t.EagerEventToolExecutionOutcome => ({
+        results: [
+          {
+            toolCallId: request.id,
+            status: 'error',
+            content: '',
+            errorMessage:
+              'Tool call changed after eager execution started; refusing to re-run the tool to avoid duplicate side effects.',
+          },
+        ],
+      });
       return {
         toolCallId: request.id,
         toolName: request.name,
         args: request.args,
         request: execution.request,
         codeSessionBaselineByName: execution.codeSessionBaselineByName,
-        promise: Promise.resolve({
-          results: [
-            {
-              toolCallId: request.id,
-              status: 'error',
-              content: '',
-              errorMessage:
-                'Tool call changed after eager execution started; refusing to re-run the tool to avoid duplicate side effects.',
-            },
-          ],
-        }),
+        promise: execution.promise.then(
+          createMismatchOutcome,
+          createMismatchOutcome
+        ),
       };
     }
 

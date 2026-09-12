@@ -359,10 +359,7 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
         id: 'order-refreshed',
         storage_session_id: 'refreshed-storage',
       };
-      const finalToolName =
-        toolName === Constants.EXECUTE_CODE
-          ? Constants.BASH_TOOL
-          : Constants.EXECUTE_CODE;
+      const finalToolName = 'weather';
       const sessions: t.ToolSessionMap = new Map([
         [
           'child-agent',
@@ -374,10 +371,17 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
         name: toolName,
         args: {},
         codeSessionContext: {
-          session_id: 'input-context',
-          files: [refreshed],
+          session_id: 'old-exec',
+          files: [stale],
         },
       };
+      let finishEager = (_outcome: t.EagerEventToolExecutionOutcome): void =>
+        undefined;
+      const eagerPromise = new Promise<t.EagerEventToolExecutionOutcome>(
+        (resolve) => {
+          finishEager = resolve;
+        }
+      );
       const eagerExecutions = new Map<string, t.EagerEventToolExecution>([
         [
           request.id,
@@ -389,7 +393,7 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
             codeSessionBaselineByName: new Map([
               [stale.name, `${stale.storage_session_id}\0${stale.id}`],
             ]),
-            promise: Promise.resolve({ results: [] }),
+            promise: eagerPromise,
           },
         ],
       ]);
@@ -413,7 +417,7 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
         eagerEventToolExecutions: eagerExecutions,
       });
 
-      await node.invoke({
+      const result = node.invoke({
         messages: [
           new AIMessage({
             content: '',
@@ -421,8 +425,16 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
           }),
         ],
       });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      request.codeSessionContext = {
+        session_id: 'input-context',
+        files: [refreshed],
+      };
+      finishEager({ results: [] });
+      await result;
 
       expect(sessions.get('child-agent')?.files).toEqual([refreshed]);
+      expect(sessions.get('child-agent')?.session_id).toBe('input-context');
     });
 
     it('replaces a stale same-name session file with a refreshed input', async () => {
@@ -478,6 +490,7 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
         })
       ).rejects.toThrow('transport failed');
       expect(sessions.get('child-agent')?.files).toEqual([refreshed]);
+      expect(sessions.get('child-agent')?.session_id).toBe('input-context');
     });
 
     it('ignores a later request carrying the original batch snapshot', async () => {

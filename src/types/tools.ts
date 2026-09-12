@@ -576,6 +576,8 @@ export type ToolCallRequest = {
     session_id: string;
     files?: CodeEnvFile[];
   };
+  /** Preserve request-provisioned code inputs after an eager identity mismatch. */
+  retainCodeSessionInputs?: true;
   /**
    * Stable runtime session hint for stateful sandbox sessions. Orthogonal to
    * `codeSessionContext` (which threads the transient exec-session for file

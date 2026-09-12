@@ -2543,7 +2543,12 @@ export class SubagentExecutor {
         member.codeSessionKey = sessions.codeSessionKey;
         member.initialSessions = sessions.initialSessions;
       }
-    } catch {
+    } catch (error) {
+      if (childSignal.aborted) {
+        throw childSignal.reason instanceof Error
+          ? childSignal.reason
+          : error;
+      }
       return createSubagentFailure(
         'Subagent context is unavailable or access was denied.'
       );
