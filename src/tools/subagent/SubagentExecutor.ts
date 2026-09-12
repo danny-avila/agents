@@ -2141,6 +2141,9 @@ export class SubagentExecutor {
       parentToolCallId,
       parentConfigurable,
     });
+    if (execution.completedResult != null && settled.output.status === 'error') {
+      return;
+    }
     const { resumeExecution } = execution;
     const resolvedSubagentType = getSubagentTypeFromArgs(settled.resolvedArgs);
     const resolvedDescription = getSubagentDescriptionFromArgs(

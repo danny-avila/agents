@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { HumanMessage } from '@langchain/core/messages';
+import { MemorySaver } from '@langchain/langgraph';
+import { HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
@@ -64,15 +65,18 @@ function createHarness({
   adapter,
   childConfig = config(),
   toolCalls,
+  durable = false,
 }: {
   adapter: SubagentContextAdapter;
   childConfig?: ResolvedSubagentConfig | GraphSubagentConfig;
   toolCalls?: (input: StandardGraphInput) => ToolCall[];
+  durable?: boolean;
 }) {
   const batches: ToolExecuteBatchRequest[] = [];
   const hookContexts: SubagentExecutionContext[] = [];
   const graphs: StandardGraph[] = [];
   const graphInputs: StandardGraphInput[] = [];
+  const checkpointer = durable ? new MemorySaver() : undefined;
   const registry = new HandlerRegistry();
   const hooks = new HookRegistry();
   hooks.register('PreToolUse', {
@@ -101,6 +105,9 @@ function createHarness({
     graph: StandardGraph,
     input: StandardGraphInput
   ): StandardGraph => {
+    if (checkpointer != null) {
+      graph.compileOptions = { checkpointer };
+    }
     graph.hookRegistry = hooks;
     graph.handlerRegistry = registry;
     graph.eventToolExecutionAvailable = true;
@@ -141,6 +148,10 @@ function createHarness({
     hookRegistry: hooks,
     maxDepth: 3,
     subagentContext: adapter,
+    ...(checkpointer != null && {
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+    }),
     createChildGraph: (input) =>
       configureGraph(new StandardGraph(input), input),
     createChildGraphByKind: (request) =>
@@ -358,6 +369,55 @@ describe('host-owned subagent context', () => {
     expect((await harness.execute()).error).toContain('delivery failed');
     expect((await harness.execute()).content).toContain('durable-id');
     expect(harness.batches).toHaveLength(1);
+    expect(harness.graphs).toHaveLength(1);
+  });
+
+  it('does not settle a retryable delivery failure', async () => {
+    let attempts = 0;
+    const harness = createHarness({
+      durable: true,
+      adapter: {
+        prepare: async () => ({}),
+        complete: async (_input, result) => {
+          attempts++;
+          if (attempts === 1) throw new Error('Transient publication failure');
+          return { content: `${result.content}\nPublished after retry` };
+        },
+      },
+    });
+    const call = {
+      id: 'spawn-call',
+      name: Constants.SUBAGENT,
+      args: {
+        description: 'Analyze the attached PDF',
+        subagent_type: 'worker',
+      },
+      type: 'tool_call' as const,
+    };
+    const runnableConfig = {
+      configurable: { run_id: 'root-run', thread_id: 'conversation' },
+    };
+
+    const failed = await harness.execute();
+    expect(failed.error).toContain('delivery failed');
+    await harness.executor.persistSettledToolOutput(call, runnableConfig, {
+      output: new ToolMessage({
+        status: 'error',
+        content: failed.content,
+        name: call.name,
+        tool_call_id: call.id,
+      }),
+      additionalContexts: [],
+      resolvedArgs: call.args,
+    });
+    await expect(
+      harness.executor.getSettledToolOutput(call, runnableConfig)
+    ).resolves.toBeUndefined();
+
+    await expect(harness.execute()).resolves.toMatchObject({
+      content: expect.stringContaining('Published after retry'),
+    });
+    expect(attempts).toBe(2);
     expect(harness.graphs).toHaveLength(1);
   });
 

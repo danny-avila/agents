@@ -279,5 +279,113 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
       expect(captured[0].id).toBe('retry');
       expect(captured[0].codeSessionContext?.files).toEqual(inputs);
     });
+
+    it('retains lazily provisioned inputs when an event batch rejects', async () => {
+      const sessions: t.ToolSessionMap = new Map();
+      let attempt = 0;
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+          const batch = data as t.ToolExecuteBatchRequest;
+          const request = batch.toolCalls[0];
+          if (attempt++ === 0) {
+            request.codeSessionContext = {
+              session_id: 'input-context',
+              files: structuredClone(inputs),
+            };
+            batch.reject(new Error('transport failed'));
+            return;
+          }
+          expect(request.codeSessionContext?.files).toEqual(inputs);
+          batch.resolve([
+            { toolCallId: request.id, status: 'success', content: '' },
+          ]);
+        });
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+      });
+
+      await expect(
+        node.invoke({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id: 'first', name: toolName, args: {} }],
+            }),
+          ],
+        })
+      ).rejects.toThrow('transport failed');
+      await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'retry', name: toolName, args: {} }],
+          }),
+        ],
+      });
+    });
+
+    it('retains lazily provisioned inputs when eager execution rejects', async () => {
+      const sessions: t.ToolSessionMap = new Map();
+      const request: t.ToolCallRequest = {
+        id: 'first',
+        name: toolName,
+        args: {},
+      };
+      const eagerExecutions = new Map<string, t.EagerEventToolExecution>([
+        [
+          request.id,
+          {
+            toolCallId: request.id,
+            toolName,
+            args: {},
+            request,
+            promise: Promise.resolve().then(() => {
+              request.codeSessionContext = {
+                session_id: 'input-context',
+                files: structuredClone(inputs),
+              };
+              return { error: new Error('eager failed') };
+            }),
+          },
+        ],
+      ]);
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+        eagerEventToolExecution: { enabled: true },
+        eagerEventToolExecutions: eagerExecutions,
+      });
+
+      await expect(
+        node.invoke({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id: 'first', name: toolName, args: {} }],
+            }),
+          ],
+        })
+      ).rejects.toThrow('eager failed');
+      expect(sessions.get('child-agent')?.files).toEqual(inputs);
+    });
   }
 );

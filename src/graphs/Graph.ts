@@ -5537,6 +5537,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             },
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
+            getSubagentExecutionContext: () => this.subagentExecutionContext,
             hookRegistry: this.hookRegistry,
             getToolsForBinding: (
               provider: t.ProviderName,

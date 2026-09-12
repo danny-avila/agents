@@ -3126,6 +3126,28 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
   }
 
+  private retainCodeSessionInputsFromRequests(
+    requests: Iterable<t.ToolCallRequest>
+  ): void {
+    if (!this.sessions) {
+      return;
+    }
+    for (const request of requests) {
+      if (
+        request.name === '' ||
+        (!this.participatesInCodeSession(request.name) &&
+          request.name !== Constants.SKILL_TOOL)
+      ) {
+        continue;
+      }
+      retainCodeSessionInputs(
+        this.sessions,
+        this.codeSessionKey,
+        request.codeSessionContext
+      );
+    }
+  }
+
   /**
    * Post-processes standard runTool outputs: dispatches ON_RUN_STEP_COMPLETED
    * and stores code session context. Mirrors the completion handling in
@@ -4182,27 +4204,37 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
       const eagerResultsPromise = Promise.all(
         eagerExecutions.map(async ({ request, execution }) => {
-          const results = await this.resolveEagerEventExecution(
-            request,
-            execution
-          );
-          if (execution.request.codeSessionContext != null) {
-            request.codeSessionContext = execution.request.codeSessionContext;
+          try {
+            const results = await this.resolveEagerEventExecution(
+              request,
+              execution
+            );
+            return {
+              results,
+              completionDispatched:
+                execution.completionDispatched === true &&
+                execution.request.turn === request.turn,
+              toolCallId: request.id,
+            };
+          } finally {
+            if (execution.request.codeSessionContext != null) {
+              request.codeSessionContext = execution.request.codeSessionContext;
+            }
           }
-          return {
-            results,
-            completionDispatched:
-              execution.completionDispatched === true &&
-              execution.request.turn === request.turn,
-            toolCallId: request.id,
-          };
         })
       );
 
-      const [eagerResults, dispatchedResults] = await Promise.all([
-        eagerResultsPromise,
-        dispatchPromise,
-      ]);
+      let eagerResults: Awaited<typeof eagerResultsPromise>;
+      let dispatchedResults: Awaited<typeof dispatchPromise>;
+      try {
+        [eagerResults, dispatchedResults] = await Promise.all([
+          eagerResultsPromise,
+          dispatchPromise,
+        ]);
+      } catch (error) {
+        this.retainCodeSessionInputsFromRequests(requestMap.values());
+        throw error;
+      }
       // Settle in-flight early completion dispatches before the batch loop
       // below decides which completions still need emitting.
       await Promise.allSettled(earlyCompletionDispatches);
