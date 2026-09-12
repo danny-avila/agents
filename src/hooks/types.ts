@@ -1,5 +1,6 @@
 // src/hooks/types.ts
 import type { BaseMessage } from '@langchain/core/messages';
+import type { SubagentExecutionContext } from '@/types/graph';
 import type { InjectedMessage } from '@/types/tools';
 
 /**
@@ -57,6 +58,8 @@ export type StopDecision = 'continue' | 'block';
  *   hook to a specific agent regardless of subagent scope.
  */
 export interface BaseHookInput {
+  /** SDK-owned child lineage, including distinct identities for concurrent self-spawns. */
+  executionContext?: SubagentExecutionContext;
   runId: string;
   threadId?: string;
   agentId?: string;

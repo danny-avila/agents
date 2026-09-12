@@ -481,6 +481,9 @@ describe('SubagentExecutionRegistry', () => {
     record.activate({ graphId: 'heavy-graph' });
     record.markStarted();
     record.markCompleted({ content: 'heavy execution result' });
+    expect(record.snapshot.resolvedConfig).toEqual({
+      agentId: 'heavy-agent-config',
+    });
 
     const first = record.settle(settlement, settledOutput, persist);
     const duplicate = record.settle(settlement, settledOutput, persist);

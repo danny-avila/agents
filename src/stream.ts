@@ -805,6 +805,21 @@ function startEagerToolExecutions(args: {
     return;
   }
 
+  const codeSessionBaselineById = new Map(
+    entries.map((entry) => [
+      entry.id,
+      new Map(
+        (entry.request.codeSessionContext?.files ?? []).map((file) => [
+          file.name,
+          `${file.storage_session_id}\0${file.id}`,
+        ])
+      ),
+    ])
+  );
+  for (const entry of entries) {
+    entry.request.codeSessionBaselineId =
+      entry.request.codeSessionContext?.session_id;
+  }
   const records: t.EagerEventToolExecution[] = [];
   const promise: Promise<t.EagerEventToolExecutionOutcome> = new Promise<
     t.ToolExecuteResult[]
@@ -818,6 +833,7 @@ function startEagerToolExecutions(args: {
       }
     };
     const batchRequest: t.ToolExecuteBatchRequest = {
+      executionContext: graph.subagentExecutionContext,
       toolCalls: entries.map((entry) => entry.request),
       userId: graph.config?.configurable?.user_id as string | undefined,
       agentId: agentContext?.agentId,
@@ -826,10 +842,14 @@ function startEagerToolExecutions(args: {
           | Partial<Pick<AgentContext, 'getCallerCapabilityProjectionSnapshot'>>
           | undefined
       )?.getCallerCapabilityProjectionSnapshot?.(),
-      configurable: graph.config?.configurable as
-        | Record<string, unknown>
-        | undefined,
-      metadata,
+      configurable: {
+        ...graph.config?.configurable,
+        executionContext: graph.subagentExecutionContext,
+      },
+      metadata: {
+        ...metadata,
+        executionContext: graph.subagentExecutionContext,
+      },
       signal: composeAbortSignals(
         graph.config?.signal,
         graph.breakerAbort.signal
@@ -873,6 +893,7 @@ function startEagerToolExecutions(args: {
       toolName: entry.toolName,
       args: entry.coercedArgs,
       request: entry.request,
+      codeSessionBaselineByName: codeSessionBaselineById.get(entry.id),
       promise,
     };
     records.push(record);
@@ -1653,7 +1674,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
       if (
         eventBreaker != null &&
         eventBreaker.signal.aborted &&
-        (eventBreaker.signal.reason instanceof StreamLimitExceededError || eventBreaker.signal.reason instanceof PreparedSubagentError)
+        (eventBreaker.signal.reason instanceof StreamLimitExceededError ||
+          eventBreaker.signal.reason instanceof PreparedSubagentError)
       ) {
         throw eventBreaker.signal.reason;
       }

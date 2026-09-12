@@ -291,6 +291,8 @@ export type RunConfig = {
    * Omit to preserve foreground-only subagent behavior.
    */
   subagentTasks?: SubagentTaskConfig;
+  /** Authorizes and supplies host-owned context to isolated child runs. */
+  subagentContext?: g.SubagentContextAdapter;
   /**
    * Pre-constructed hook registry for this run. Hooks fire at lifecycle
    * points in `processStream` (RunStart, UserPromptSubmit, Stop,

@@ -600,15 +600,13 @@ describe('SubagentExecutor', () => {
     const invoke = jest.fn(() => invocation);
     const clearHeavyState = jest.fn();
     let detachedGraph: StandardGraph | undefined;
-    const createDetachedChildGraphFactory = jest.fn(
-      () => (): StandardGraph => {
-        detachedGraph = {
-          createWorkflow: () => ({ invoke }),
-          clearHeavyState,
-        } as unknown as StandardGraph;
-        return detachedGraph;
-      }
-    );
+    const createDetachedChildGraphFactory = jest.fn(() => (): StandardGraph => {
+      detachedGraph = {
+        createWorkflow: () => ({ invoke }),
+        clearHeavyState,
+      } as unknown as StandardGraph;
+      return detachedGraph;
+    });
     const fallbackFactory = jest.fn(
       (): StandardGraph =>
         ({
@@ -670,6 +668,131 @@ describe('SubagentExecutor', () => {
     expect(fallbackFactory).not.toHaveBeenCalled();
     expect(clearHeavyState).toHaveBeenCalled();
     expect(hookRegistry.hasHookFor('PreToolUse', 'test-run')).toBe(false);
+  });
+
+  it('retries detached result delivery without rerunning the child', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const invoke = jest.fn().mockResolvedValue({
+      messages: [new AIMessage('detached result')],
+    });
+    let deliveryAttempts = 0;
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      subagentContext: {
+        prepare: async () => ({}),
+        complete: async (_input, result) => {
+          deliveryAttempts += 1;
+          if (deliveryAttempts === 1) {
+            throw new Error('Transient delivery failure');
+          }
+          return { content: `${result.content} delivered` };
+        },
+      },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Research independently.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_delivery_retry',
+      })
+    ) as { background_task_id: string };
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'completed'
+    );
+
+    expect(
+      store.get('owner:conversation', response.background_task_id)
+    ).toMatchObject({ status: 'completed' });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(deliveryAttempts).toBe(2);
+    expect(
+      store.claim('owner:conversation', response.background_task_id)
+    ).toMatchObject({ status: 'completed', result: 'detached result delivered' });
+  });
+
+  it('bounds detached result delivery retries', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const invoke = jest.fn().mockResolvedValue({
+      messages: [new AIMessage('detached result')],
+    });
+    const complete = jest.fn(async () => {
+      throw new Error('Persistent delivery failure');
+    });
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      subagentContext: { prepare: async () => ({}), complete },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Research independently.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_delivery_failure',
+      })
+    ) as { background_task_id: string };
+    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledTimes(3);
+    expect(
+      store.get('owner:conversation', response.background_task_id)
+    ).toMatchObject({
+      status: 'error',
+      error: 'Subagent result delivery failed.',
+    });
+  });
+
+  it('releases detached state when result delivery hangs past task timeout', async () => {
+    const store = new InMemorySubagentTaskStore({ taskTimeoutMs: 20 });
+    const clearHeavyState = jest.fn();
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      subagentContext: {
+        prepare: async () => ({}),
+        complete: () => new Promise(() => undefined),
+      },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({
+            invoke: jest.fn().mockResolvedValue({
+              messages: [new AIMessage('detached result')],
+            }),
+          }),
+          clearHeavyState,
+        }) as unknown as StandardGraph,
+    });
+
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Research independently.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_delivery_timeout',
+      })
+    ) as { background_task_id: string };
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'error'
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(clearHeavyState).toHaveBeenCalled();
+    expect(
+      store.get('owner:conversation', response.background_task_id)
+    ).toMatchObject({ status: 'error', error: 'Detached subagent task timed out.' });
   });
 
   it('replaces the ambient parent run config for detached child execution', async () => {
@@ -3221,7 +3344,14 @@ describe('SubagentExecutor', () => {
         string,
         unknown
       >;
-      expect(Object.keys(configurable)).toEqual(['thread_id']);
+      expect(Object.keys(configurable)).toEqual([
+        'executionContext',
+        'thread_id',
+      ]);
+      expect(configurable.executionContext).toMatchObject({
+        rootRunId: 'test-run',
+        depth: 1,
+      });
     });
   });
 

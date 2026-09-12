@@ -1,3 +1,6 @@
+/** Host context preparation and trusted subagent execution identity are supported. */
+export const SUBAGENT_CONTEXT_VERSION = 1;
+
 /**
  * Anthropic direct API tool schema overhead multiplier.
  * Empirically calibrated against real MCP tool sets (29 tools).

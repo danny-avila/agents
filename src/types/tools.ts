@@ -11,10 +11,10 @@ import type {
   ToolErrorData,
 } from './stream';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { LangfuseConfig, SubagentExecutionContext } from './graph';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { HumanInTheLoopConfig } from './hitl';
-import type { LangfuseConfig } from './graph';
 import type { HookRegistry } from '@/hooks';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
@@ -75,6 +75,7 @@ export type EagerEventToolExecution = {
   toolName: string;
   args: Record<string, unknown>;
   request: ToolCallRequest;
+  codeSessionBaselineByName?: ReadonlyMap<string, string>;
   promise: Promise<EagerEventToolExecutionOutcome>;
   /**
    * True when the streaming eager path already emitted the user-visible
@@ -156,6 +157,8 @@ export type ToolNodeOptions = {
   /** ID of the agent that owns this tool node, surfaced to hooks as `executingAgentId`
    * so a batch can be attributed to a specific agent even where `agentId` is undefined. */
   executingAgentId?: string;
+  /** SDK-owned identity of the child execution, independent of reusable agent IDs. */
+  executionContext?: SubagentExecutionContext;
   /** Name of the agent that owns this tool node, used for active Langfuse attribution. */
   executingAgentName?: string;
   /** Root graph-agent identity retained alongside the currently executing tool owner. */
@@ -573,6 +576,10 @@ export type ToolCallRequest = {
     session_id: string;
     files?: CodeEnvFile[];
   };
+  /** Request-time execution session used to detect host session refreshes. */
+  codeSessionBaselineId?: string;
+  /** Preserve request-provisioned code inputs after an eager identity mismatch. */
+  retainCodeSessionInputs?: true;
   /**
    * Stable runtime session hint for stateful sandbox sessions. Orthogonal to
    * `codeSessionContext` (which threads the transient exec-session for file
@@ -596,6 +603,8 @@ export type CallerCapabilityProjectionSnapshot = {
 
 /** Batch request containing ALL tool calls for a graph step */
 export type ToolExecuteBatchRequest = {
+  /** SDK-owned child lineage. Unset for tools in the root graph. */
+  executionContext?: SubagentExecutionContext;
   /** All tool calls from the AIMessage */
   toolCalls: ToolCallRequest[];
   /** User ID for context */
@@ -1227,6 +1236,7 @@ export type ProgrammaticHookContext = {
   runId: string;
   threadId?: string;
   agentId?: string;
+  executionContext?: SubagentExecutionContext;
   executingAgentId?: string;
 };
 

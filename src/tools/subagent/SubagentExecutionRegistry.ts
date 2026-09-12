@@ -783,7 +783,6 @@ export class SubagentExecutionRecord<
     this.transitionTo('completed', ['active']);
     this.completedValue = true;
     this.completedResultValue = result;
-    this.resolvedConfigValue = undefined;
   }
 
   releaseActiveRun(): TActiveRun | undefined {

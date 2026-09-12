@@ -924,6 +924,7 @@ async function dispatchCompletionEvents(params: {
         runId: sessionId,
         threadId,
         agentId,
+        executionContext: graph.getSubagentExecutionContext?.(),
         summary: summaryText,
         messagesAfterCount,
       },
@@ -948,6 +949,7 @@ interface CreateSummarizeNodeParams {
     config?: RunnableConfig;
     runId?: string;
     isMultiAgent: boolean;
+    getSubagentExecutionContext?: () => t.SubagentExecutionContext | undefined;
     hookRegistry?: HookRegistry;
     getToolsForBinding?: (
       provider: t.ProviderName,
@@ -1331,6 +1333,7 @@ export function createSummarizeNode({
           runId: sessionId,
           threadId,
           agentId: request.agentId,
+          executionContext: graph.getSubagentExecutionContext?.(),
           messagesBeforeCount: messagesToRefine.length,
           trigger:
             request.reason === 'manual'

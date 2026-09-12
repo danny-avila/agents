@@ -24,6 +24,21 @@ const callerConfig = {
   version: 'v2' as const,
 };
 
+const childExecutionContext: t.SubagentExecutionContext = {
+  rootRunId: 'root-run',
+  hookSessionId: 'compact-run',
+  depth: 1,
+  ancestry: [
+    {
+      subagentRunId: 'child-run',
+      subagentType: 'worker',
+      subagentKind: 'agent',
+      subagentAgentId: 'worker',
+      parentRunId: 'root-run',
+    },
+  ],
+};
+
 let getChatModelClassSpy: jest.SpyInstance;
 const originalGetChatModelClass = providers.getChatModelClass;
 
@@ -143,6 +158,29 @@ describe('Compaction hook integration', () => {
       expect(captured!.trigger).toBe('default');
       expect(captured!.agentId).toBeDefined();
     });
+  });
+
+  it('carries child execution identity through compact hooks', async () => {
+    const registry = new HookRegistry();
+    let pre: PreCompactHookInput | undefined;
+    let post: PostCompactHookInput | undefined;
+    registry.register('PreCompact', {
+      hooks: [async (input) => ((pre = input), {})],
+    });
+    registry.register('PostCompact', {
+      hooks: [async (input) => ((post = input), {})],
+    });
+    const run = await createCompactingRun(tokenCounter, registry);
+    Object.defineProperty(run.Graph, 'subagentExecutionContext', {
+      value: childExecutionContext,
+    });
+    expect(run.Graph?.subagentExecutionContext).toEqual(childExecutionContext);
+    run.Graph!.overrideTestModel(['Final answer after compaction.']);
+
+    await run.processStream(buildConversation(), callerConfig);
+
+    expect(pre?.executionContext).toEqual(childExecutionContext);
+    expect(post?.executionContext).toEqual(childExecutionContext);
   });
 
   describe('PostCompact', () => {

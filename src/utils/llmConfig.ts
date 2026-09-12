@@ -71,7 +71,6 @@ export const llmConfigs: Record<string, t.BuiltInLLMConfig | undefined> = {
   } as or.ChatOpenRouterCallOptions & t.BuiltInLLMConfig,
   [Providers.AZURE]: {
     provider: Providers.AZURE,
-    temperature: 0.7,
     streaming: true,
     streamUsage: true,
     azureOpenAIApiKey: process.env.AZURE_OPENAI_API_KEY,
