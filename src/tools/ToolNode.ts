@@ -716,8 +716,7 @@ function updateCodeSession(
   });
 }
 
-/** Retains host-provisioned inputs even when execution returns no usable artifact.
- * Existing session versions win over older request snapshots from the same batch. */
+/** Retains host-provisioned inputs even when execution returns no usable artifact. */
 function retainCodeSessionInputs(
   sessions: t.ToolSessionMap,
   sessionKey: string,
@@ -732,23 +731,32 @@ function retainCodeSessionInputs(
     return;
   const existing = sessions.get(sessionKey) as t.CodeSessionContext | undefined;
   const existingFiles = existing?.files ?? [];
-  const identities = new Set<string>();
-  const names = new Set<string>();
-  for (const file of existingFiles) {
-    identities.add(fileIdentityKey(file));
-    names.add(file.name);
+  const files = [...existingFiles];
+  const indexByIdentity = new Map<string, number>();
+  const indexByName = new Map<string, number>();
+  for (let i = 0; i < files.length; i++) {
+    indexByIdentity.set(fileIdentityKey(files[i]), i);
+    indexByName.set(files[i].name, i);
   }
-  let files: t.FileRefs | undefined;
+  let changed = false;
   for (const file of context.files) {
     if (!file.id || !file.name || !file.storage_session_id) continue;
     const identity = fileIdentityKey(file);
-    if (identities.has(identity) || names.has(file.name)) continue;
-    identities.add(identity);
-    names.add(file.name);
-    files ??= [...existingFiles];
+    if (indexByIdentity.has(identity)) continue;
+    const replacementIndex = indexByName.get(file.name);
+    if (replacementIndex !== undefined) {
+      indexByIdentity.delete(fileIdentityKey(files[replacementIndex]));
+      files[replacementIndex] = { ...file };
+      indexByIdentity.set(identity, replacementIndex);
+      changed = true;
+      continue;
+    }
+    indexByIdentity.set(identity, files.length);
+    indexByName.set(file.name, files.length);
     files.push({ ...file });
+    changed = true;
   }
-  if (!files) return;
+  if (!changed) return;
   sessions.set(sessionKey, {
     session_id: existing?.session_id ?? context.session_id,
     files,
@@ -3090,6 +3098,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return;
     }
 
+    this.retainCodeSessionInputsFromRequests(requestMap.values());
     for (let i = 0; i < results.length; i++) {
       const result = results[i];
       const request = requestMap.get(result.toolCallId);
@@ -3102,11 +3111,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         continue;
       }
 
-      retainCodeSessionInputs(
-        this.sessions,
-        this.codeSessionKey,
-        request.codeSessionContext
-      );
       if (result.status !== 'success' || result.artifact == null) {
         continue;
       }

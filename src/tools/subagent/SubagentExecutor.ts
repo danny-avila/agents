@@ -142,6 +142,7 @@ import { stableStringify } from '@/tools/eagerEventExecution';
 import { convertInjectedMessages } from '@/messages/injected';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { composeAbortSignals } from '@/utils/misc';
+import { sleep } from '@/utils/run';
 import { HandlerRegistry } from '@/events';
 
 export {
@@ -1276,21 +1277,35 @@ export class SubagentExecutor {
         detachedGraphFactory ?? this.createChildGraphByKind,
     });
     try {
-      const result = await detached.execute({
-        ...params,
-        signal: undefined,
-        breaker: undefined,
-        hookSessionId: taskHookSessionId,
-        taskRuntime: runtime,
-        parentConfigurable: {
-          ...params.parentConfigurable,
-          run_id: taskHookSessionId,
-        },
-      });
-      if (runtime.signal.aborted) {
-        throw runtime.signal.reason instanceof Error
-          ? runtime.signal.reason
-          : new Error('Detached subagent task cancelled.');
+      const executeAttempt = async (): Promise<SubagentExecuteResult> => {
+        const result = await detached.execute({
+          ...params,
+          signal: undefined,
+          breaker: undefined,
+          hookSessionId: taskHookSessionId,
+          taskRuntime: runtime,
+          parentConfigurable: {
+            ...params.parentConfigurable,
+            run_id: taskHookSessionId,
+          },
+        });
+        if (runtime.signal.aborted) {
+          throw runtime.signal.reason instanceof Error
+            ? runtime.signal.reason
+            : new Error('Detached subagent task cancelled.');
+        }
+        return result;
+      };
+      let deliveryRetries = 0;
+      let result = await executeAttempt();
+      while (result.retryableDelivery === true) {
+        if (deliveryRetries > 0) {
+          await sleep(
+            Math.min(100 * 2 ** Math.min(deliveryRetries - 1, 6), 5_000)
+          );
+        }
+        deliveryRetries += 1;
+        result = await executeAttempt();
       }
       if (result.error != null) {
         throw new Error(result.error);
