@@ -805,6 +805,17 @@ function startEagerToolExecutions(args: {
     return;
   }
 
+  const codeSessionBaselineById = new Map(
+    entries.map((entry) => [
+      entry.id,
+      new Map(
+        (entry.request.codeSessionContext?.files ?? []).map((file) => [
+          file.name,
+          `${file.storage_session_id}\0${file.id}`,
+        ])
+      ),
+    ])
+  );
   const records: t.EagerEventToolExecution[] = [];
   const promise: Promise<t.EagerEventToolExecutionOutcome> = new Promise<
     t.ToolExecuteResult[]
@@ -878,12 +889,7 @@ function startEagerToolExecutions(args: {
       toolName: entry.toolName,
       args: entry.coercedArgs,
       request: entry.request,
-      codeSessionBaselineByName: new Map(
-        (entry.request.codeSessionContext?.files ?? []).map((file) => [
-          file.name,
-          `${file.storage_session_id}\0${file.id}`,
-        ])
-      ),
+      codeSessionBaselineByName: codeSessionBaselineById.get(entry.id),
       promise,
     };
     records.push(record);

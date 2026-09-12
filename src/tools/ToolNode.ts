@@ -4098,22 +4098,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       const requestMap = new Map(plan.allRequests.map((r) => [r.id, r]));
-      const codeSessionBaselineByName = new Map(
-        (
-          (
-            this.sessions?.get(this.codeSessionKey) as
-              | t.CodeSessionContext
-              | undefined
-          )?.files ?? []
-        ).map((file) => [file.name, fileIdentityKey(file)])
-      );
       const codeSessionBaselineByRequestId = new Map<
         string,
         ReadonlyMap<string, string>
       >(
         plan.allRequests.map((request) => [
           request.id,
-          codeSessionBaselineByName,
+          new Map(
+            (request.codeSessionContext?.files ?? []).map((file) => [
+              file.name,
+              fileIdentityKey(file),
+            ])
+          ),
         ])
       );
       const eagerExecutions: Array<{

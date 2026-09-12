@@ -238,6 +238,83 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.toolCallStepIds.has('call_weather')).toBe(true);
   });
 
+  it('captures normalized code-session identity before eager dispatch', async () => {
+    const graph = createGraph({
+      sessions: new Map([
+        [
+          Constants.EXECUTE_CODE,
+          {
+            session_id: 'exec-session',
+            files: [{ id: 'old-file', name: 'report.csv' }],
+            lastUpdated: 1,
+          },
+        ],
+      ]),
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.ANTHROPIC,
+          toolDefinitions: [{ name: Constants.EXECUTE_CODE }],
+          graphTools: [],
+          agentId: 'agent_1',
+          codeSessionKey: Constants.EXECUTE_CODE,
+          getCallerCapabilityProjectionSnapshot: jest.fn(() => ({
+            version: 1 as const,
+            directToolNames: [],
+            codeExecutionToolNames: [Constants.EXECUTE_CODE],
+            directOnlyToolNames: [],
+            codeExecutionOnlyToolNames: [Constants.EXECUTE_CODE],
+          })),
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+        const batch = data as t.ToolExecuteBatchRequest;
+        batch.toolCalls[0].codeSessionContext = {
+          session_id: 'new-session',
+          files: [
+            {
+              id: 'new-file',
+              resource_id: 'new-file',
+              name: 'report.csv',
+              storage_session_id: 'new-storage',
+              kind: 'user',
+            },
+          ],
+        };
+        batch.resolve([
+          {
+            toolCallId: 'call_code',
+            status: 'success',
+            content: '',
+          },
+        ]);
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            { id: 'call_code', name: Constants.EXECUTE_CODE, args: {} },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    const record = graph.eagerEventToolExecutions.get('call_code');
+    expect(record?.codeSessionBaselineByName?.get('report.csv')).toBe(
+      'exec-session\0old-file'
+    );
+    expect(record?.request.codeSessionContext?.files?.[0].id).toBe('new-file');
+  });
+
   it('prestarts when subagent callback forwarding can execute tools without a handler registry', async () => {
     const graph = createGraph({
       handlerRegistry: undefined,
