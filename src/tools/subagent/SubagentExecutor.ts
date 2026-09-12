@@ -2177,6 +2177,9 @@ export class SubagentExecutor {
     ) {
       return;
     }
+    if (settled.output.status === 'error' && config.signal?.aborted === true) {
+      return;
+    }
     const parentConfigurable = config.configurable as
       | Record<string, unknown>
       | undefined;

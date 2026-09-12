@@ -816,6 +816,10 @@ function startEagerToolExecutions(args: {
       ),
     ])
   );
+  for (const entry of entries) {
+    entry.request.codeSessionBaselineId =
+      entry.request.codeSessionContext?.session_id;
+  }
   const records: t.EagerEventToolExecution[] = [];
   const promise: Promise<t.EagerEventToolExecutionOutcome> = new Promise<
     t.ToolExecuteResult[]

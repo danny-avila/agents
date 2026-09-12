@@ -29,6 +29,9 @@ The SDK calls preparation again when a completed execution is retried and when a
 host rebuilds a paused execution, allowing the host to reauthorize access. Make
 authorization idempotent for the execution identity. Throwing or aborting during
 preparation prevents child execution and produces a generic failure result.
+Cancellation is different: aborting the supplied signal rejects preparation
+and propagates as an execution error, so callers must handle it as cancellation
+rather than as a normal subagent result.
 
 `complete(input, result)` runs after successful child work. It returns the text
 delivered to the parent and can append durable file references. The SDK retains

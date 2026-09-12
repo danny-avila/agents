@@ -576,6 +576,8 @@ export type ToolCallRequest = {
     session_id: string;
     files?: CodeEnvFile[];
   };
+  /** Request-time execution session used to detect host session refreshes. */
+  codeSessionBaselineId?: string;
   /** Preserve request-provisioned code inputs after an eager identity mismatch. */
   retainCodeSessionInputs?: true;
   /**

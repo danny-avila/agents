@@ -725,8 +725,7 @@ function retainCodeSessionInputs(
   if (
     context?.session_id == null ||
     context.session_id === '' ||
-    context.files == null ||
-    context.files.length === 0
+    context.files == null
   )
     return;
   const existing = sessions.get(sessionKey) as t.CodeSessionContext | undefined;
@@ -738,7 +737,7 @@ function retainCodeSessionInputs(
     indexByIdentity.set(fileIdentityKey(files[i]), i);
     indexByName.set(files[i].name, i);
   }
-  let changed = false;
+  let changed = existing?.session_id !== context.session_id;
   for (const file of context.files) {
     if (!file.id || !file.name || !file.storage_session_id) continue;
     const identity = fileIdentityKey(file);
@@ -3161,6 +3160,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
       const context = request.codeSessionContext;
       if (context?.session_id == null || context.session_id === '') continue;
+      if (context.session_id !== request.codeSessionBaselineId) {
+        sessionId = context.session_id;
+      }
       const baselineIdentityByName = baselineByRequestId.get(request.id);
       for (const file of context.files ?? []) {
         if (!file.id || !file.name || !file.storage_session_id) continue;
@@ -3171,7 +3173,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         refreshedByName.set(file.name, file);
       }
     }
-    if (sessionId == null || refreshedByName.size === 0) return;
+    if (sessionId == null) return;
     retainCodeSessionInputs(this.sessions, this.codeSessionKey, {
       session_id: sessionId,
       files: [...refreshedByName.values()],
@@ -4099,6 +4101,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       const requestMap = new Map(plan.allRequests.map((r) => [r.id, r]));
+      for (const request of plan.allRequests) {
+        request.codeSessionBaselineId = request.codeSessionContext?.session_id;
+      }
       const codeSessionBaselineByRequestId = new Map<
         string,
         ReadonlyMap<string, string>
@@ -4129,6 +4134,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               eagerExecution.codeSessionBaselineByName
             );
           }
+          request.codeSessionBaselineId =
+            eagerExecution.request.codeSessionBaselineId;
         } else {
           dispatchRequests.push(request);
         }

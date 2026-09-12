@@ -493,6 +493,58 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
       expect(sessions.get('child-agent')?.session_id).toBe('input-context');
     });
 
+    it('retains an execution session refresh without file changes', async () => {
+      const sessions: t.ToolSessionMap = new Map([
+        [
+          'child-agent',
+          { session_id: 'old-exec', files: inputs, lastUpdated: 1 },
+        ],
+      ]);
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+          const batch = data as t.ToolExecuteBatchRequest;
+          batch.toolCalls[0].codeSessionContext = {
+            session_id: 'refreshed-exec',
+            files: structuredClone(inputs),
+          };
+          batch.resolve([
+            {
+              toolCallId: batch.toolCalls[0].id,
+              status: 'success',
+              content: '',
+            },
+          ]);
+        });
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+      });
+
+      await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'refresh-session', name: toolName, args: {} }],
+          }),
+        ],
+      });
+
+      expect(sessions.get('child-agent')).toMatchObject({
+        session_id: 'refreshed-exec',
+        files: inputs,
+      });
+    });
+
     it('ignores a later request carrying the original batch snapshot', async () => {
       const stale = inputs[0];
       const refreshed = {
