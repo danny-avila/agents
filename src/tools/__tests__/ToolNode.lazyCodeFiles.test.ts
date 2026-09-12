@@ -352,6 +352,79 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
       expect(sessions.get('child-agent')?.files).toEqual([refreshed]);
     });
 
+    it('retains refreshed eager inputs when the final tool identity differs', async () => {
+      const stale = inputs[0];
+      const refreshed = {
+        ...stale,
+        id: 'order-refreshed',
+        storage_session_id: 'refreshed-storage',
+      };
+      const finalToolName =
+        toolName === Constants.EXECUTE_CODE
+          ? Constants.BASH_TOOL
+          : Constants.EXECUTE_CODE;
+      const sessions: t.ToolSessionMap = new Map([
+        [
+          'child-agent',
+          { session_id: 'old-exec', files: [stale], lastUpdated: 1 },
+        ],
+      ]);
+      const request: t.ToolCallRequest = {
+        id: 'eager',
+        name: toolName,
+        args: {},
+        codeSessionContext: {
+          session_id: 'input-context',
+          files: [refreshed],
+        },
+      };
+      const eagerExecutions = new Map<string, t.EagerEventToolExecution>([
+        [
+          request.id,
+          {
+            toolCallId: request.id,
+            toolName,
+            args: {},
+            request,
+            codeSessionBaselineByName: new Map([
+              [stale.name, `${stale.storage_session_id}\0${stale.id}`],
+            ]),
+            promise: Promise.resolve({ results: [] }),
+          },
+        ],
+      ]);
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+          tool(async () => 'unused', {
+            name: finalToolName,
+            description: 'Final code tool',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+        eagerEventToolExecution: { enabled: true },
+        eagerEventToolExecutions: eagerExecutions,
+      });
+
+      await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: request.id, name: finalToolName, args: {} }],
+          }),
+        ],
+      });
+
+      expect(sessions.get('child-agent')?.files).toEqual([refreshed]);
+    });
+
     it('replaces a stale same-name session file with a refreshed input', async () => {
       const stale = inputs[0];
       const refreshed = {

@@ -355,6 +355,24 @@ describe('host-owned subagent context', () => {
     expect(harness.graphs).toHaveLength(0);
   });
 
+  it('unwinds when preparation ignores cancellation', async () => {
+    const controller = new AbortController();
+    const prepare = jest.fn(() => new Promise<PreparedSubagentContext>(() => undefined));
+    const harness = createHarness({
+      adapter: { prepare },
+    });
+    const result = harness.execute('cancelled', controller.signal);
+    while (prepare.mock.calls.length === 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    controller.abort(new Error('cancelled'));
+
+    await expect(result).resolves.toMatchObject({
+      error: expect.stringContaining('access was denied'),
+    });
+    expect(harness.graphs).toHaveLength(0);
+  });
+
   it('retains completed work when result delivery needs retry', async () => {
     let attempts = 0;
     const adapter: SubagentContextAdapter = {

@@ -2517,7 +2517,13 @@ export class SubagentExecutor {
     };
     let preparedContext: PreparedSubagentContext | undefined;
     try {
-      preparedContext = await this.subagentContext?.prepare(hostContextInput);
+      preparedContext =
+        this.subagentContext?.prepare == null
+          ? undefined
+          : await awaitWithAbort(
+            Promise.resolve(this.subagentContext.prepare(hostContextInput)),
+            childSignal
+          );
       execution.assertUsable(childSignal);
       for (const [agentId, sessions] of Object.entries(
         preparedContext?.agentSessions ?? {}

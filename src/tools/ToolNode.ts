@@ -4606,7 +4606,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         toolCallId: request.id,
         toolName: request.name,
         args: request.args,
-        request,
+        request: execution.request,
+        codeSessionBaselineByName: execution.codeSessionBaselineByName,
         promise: Promise.resolve({
           results: [
             {
