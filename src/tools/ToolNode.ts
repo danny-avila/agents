@@ -4224,17 +4224,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         })
       );
 
-      let eagerResults: Awaited<typeof eagerResultsPromise>;
-      let dispatchedResults: Awaited<typeof dispatchPromise>;
-      try {
-        [eagerResults, dispatchedResults] = await Promise.all([
-          eagerResultsPromise,
-          dispatchPromise,
-        ]);
-      } catch (error) {
+      const [eagerOutcome, dispatchedOutcome] = await Promise.allSettled([
+        eagerResultsPromise,
+        dispatchPromise,
+      ]);
+      if (eagerOutcome.status === 'rejected') {
         this.retainCodeSessionInputsFromRequests(requestMap.values());
-        throw error;
+        throw eagerOutcome.reason;
       }
+      if (dispatchedOutcome.status === 'rejected') {
+        this.retainCodeSessionInputsFromRequests(requestMap.values());
+        throw dispatchedOutcome.reason;
+      }
+      const eagerResults = eagerOutcome.value;
+      const dispatchedResults = dispatchedOutcome.value;
       // Settle in-flight early completion dispatches before the batch loop
       // below decides which completions still need emitting.
       await Promise.allSettled(earlyCompletionDispatches);

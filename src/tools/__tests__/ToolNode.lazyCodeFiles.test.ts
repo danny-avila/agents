@@ -387,5 +387,73 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
       ).rejects.toThrow('eager failed');
       expect(sessions.get('child-agent')?.files).toEqual(inputs);
     });
+
+    it('waits for peer execution input provisioning before retaining a rejected batch', async () => {
+      const sessions: t.ToolSessionMap = new Map();
+      const eagerRequest: t.ToolCallRequest = {
+        id: 'eager',
+        name: toolName,
+        args: {},
+      };
+      const eagerExecutions = new Map<string, t.EagerEventToolExecution>([
+        [
+          eagerRequest.id,
+          {
+            toolCallId: eagerRequest.id,
+            toolName,
+            args: {},
+            request: eagerRequest,
+            promise: Promise.resolve({ error: new Error('eager failed') }),
+          },
+        ],
+      ]);
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+          const batch = data as t.ToolExecuteBatchRequest;
+          await Promise.resolve();
+          batch.toolCalls[0].codeSessionContext = {
+            session_id: 'input-context',
+            files: structuredClone(inputs),
+          };
+          batch.resolve([
+            {
+              toolCallId: batch.toolCalls[0].id,
+              status: 'success',
+              content: '',
+            },
+          ]);
+        });
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+        eagerEventToolExecution: { enabled: true },
+        eagerEventToolExecutions: eagerExecutions,
+      });
+
+      await expect(
+        node.invoke({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: 'eager', name: toolName, args: {} },
+                { id: 'dispatched', name: toolName, args: {} },
+              ],
+            }),
+          ],
+        })
+      ).rejects.toThrow('eager failed');
+      expect(sessions.get('child-agent')?.files).toEqual(inputs);
+    });
   }
 );

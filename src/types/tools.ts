@@ -1231,6 +1231,7 @@ export type ProgrammaticHookContext = {
   runId: string;
   threadId?: string;
   agentId?: string;
+  executionContext?: SubagentExecutionContext;
   executingAgentId?: string;
 };
 

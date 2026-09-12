@@ -1611,27 +1611,41 @@ for member in team:
       expect(gate.denyReason).toContain('no writes from bridge');
     });
 
-    it('threads executingAgentId from the hook context to bridge PreToolUse hooks', async () => {
+    it('threads agent identity from the hook context to bridge PreToolUse hooks', async () => {
       const { HookRegistry } = await import('@/hooks');
 
       const ptcMod = require('../local/LocalProgrammaticToolCalling');
       const registry = new HookRegistry();
       let seen: string | undefined = 'UNSET';
+      let seenContext: t.SubagentExecutionContext | undefined;
+      const executionContext: t.SubagentExecutionContext = {
+        rootRunId: 'root-run',
+        hookSessionId: 'r1',
+        depth: 1,
+        ancestry: [],
+      };
       registry.register('PreToolUse', {
         hooks: [
           async (input) => {
             seen = input.executingAgentId;
+            seenContext = input.executionContext;
             return { decision: 'allow' };
           },
         ],
       });
       await ptcMod.applyPreToolUseHooksForBridge(
-        { registry, runId: 'r1', executingAgentId: 'repo_investigator' },
+        {
+          registry,
+          runId: 'r1',
+          executingAgentId: 'repo_investigator',
+          executionContext,
+        },
         'write_file',
         'call_1',
         { path: '/tmp/x' }
       );
       expect(seen).toBe('repo_investigator');
+      expect(seenContext).toEqual(executionContext);
     });
 
     it('passes through when no hook denies (allow path)', async () => {

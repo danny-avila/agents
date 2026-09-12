@@ -838,6 +838,8 @@ export type SubagentExecuteParams = {
 export type SubagentExecuteResult = SubagentContextResult & {
   /** Tagged internal failure; foreground callers retain the legacy content. */
   error?: string;
+  /** Completed child work whose host projection must be retried without re-execution. */
+  retryableDelivery?: true;
 };
 
 function createSubagentFailure(
@@ -2574,9 +2576,7 @@ export class SubagentExecutor {
     if (params.taskRuntime != null) {
       childGraph.hookRegistry = this.hookRegistry;
     }
-    if (cachedChildRun == null) {
-      seedChildGraphSessions(childGraph, childPlan.agents);
-    }
+    seedChildGraphSessions(childGraph, childPlan.agents);
     let forwarding: ForwarderCallback | undefined;
     if (forwardingEnabled) {
       forwarding = this.createForwarderCallback({
@@ -3078,7 +3078,10 @@ export class SubagentExecutor {
       input.signal.throwIfAborted();
       return { ...result, content: completed.content };
     } catch {
-      return createSubagentFailure('Subagent result delivery failed.');
+      return {
+        ...createSubagentFailure('Subagent result delivery failed.'),
+        retryableDelivery: true,
+      };
     }
   }
 

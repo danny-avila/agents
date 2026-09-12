@@ -5353,6 +5353,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               });
             }
             const result = await executor.execute(executeParams);
+            if (result.retryableDelivery === true) {
+              throw new Error(result.content);
+            }
             return result.content;
           },
           buildSubagentToolParams(executableConfigs, {
